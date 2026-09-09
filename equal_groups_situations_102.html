@@ -1,0 +1,1736 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+function tone({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.18 }) {
+  if (!ctx) return;
+  const t0 = ctx.currentTime + at;
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+  g.gain.setValueAtTime(gain, t0);
+  g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+const SOUNDS = {
+  // ascending arpeggio, Eric's canonical "correct"
+  correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09 })),
+  // soft descending slide, kept gentle on purpose
+  wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+  // four-note fanfare for the end screen
+  complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16 })),
+  // streak tier hit
+  tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle" })),
+  tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+  throw: () => tone({ freq: 720, to: 260, type: "sawtooth", dur: 0.25, gain: 0.06 }),
+  tick: () => tone({ freq: 440, dur: 0.04, gain: 0.05, type: "triangle" }),
+  click: () => [880, 1320].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.07, gain: 0.07 }))
+};
+const HINT_SCALE = [0, 2, 4, 7, 9, 12];
+function playHint(kind, step) {
+  if (!ctx) return;
+  if (kind === "group") {
+    tone({ freq: 196 * 2 ** (step * 2 / 12), type: "triangle", dur: 0.18, gain: 0.12 });
+    return;
+  }
+  const freq = 262 * 2 ** (HINT_SCALE[Math.min(step, HINT_SCALE.length - 1)] / 12);
+  tone({ freq, type: "triangle", dur: 0.14, gain: 0.055 });
+}
+function play(name) {
+  const fn = SOUNDS[name];
+  if (fn && ctx) fn();
+}
+const CONFETTI_COLORS = ["#ffd93d", "#2ed573", "#6bcbff", "#b28dff", "#ff8fab", "#ff9f43"];
+function confetti(root, count = 24) {
+  for (let i = 0; i < count; i += 1) {
+    const p = document.createElement("i");
+    p.className = "mg-confetti";
+    p.style.left = `${Math.random() * 100}%`;
+    p.style.background = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
+    p.style.animationDelay = `${Math.random() * 0.4}s`;
+    p.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    p.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.appendChild(p);
+    p.addEventListener("animationend", () => p.remove());
+  }
+}
+function flyEmoji(root, from, emoji = "⭐", count = 5) {
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const e = document.createElement("span");
+    e.className = "mg-fly";
+    e.textContent = emoji;
+    e.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    e.style.top = `${r.top - base.top + r.height / 2}px`;
+    e.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    e.style.animationDelay = `${i * 0.05}s`;
+    root.appendChild(e);
+    e.addEventListener("animationend", () => e.remove());
+  }
+}
+function shake(el2) {
+  el2.classList.remove("mg-shake");
+  void el2.offsetWidth;
+  el2.classList.add("mg-shake");
+  el2.addEventListener("animationend", () => el2.classList.remove("mg-shake"), { once: true });
+}
+function toast(root, text, kind = "good", { removeAfterMs } = {}) {
+  const t = document.createElement("div");
+  t.className = `mg-toast mg-toast-${kind}`;
+  t.textContent = text;
+  root.appendChild(t);
+  let removalTimer = null;
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
+    if (removalTimer != null) clearTimeout(removalTimer);
+    removalTimer = null;
+    t.remove();
+  };
+  t.addEventListener("animationend", remove, { once: true });
+  if (Number.isFinite(removeAfterMs) && removeAfterMs >= 0) {
+    removalTimer = setTimeout(remove, removeAfterMs);
+  }
+}
+const PRAISE = ["NICE!", "YES!", "GOT IT!", "NO CAP!", "GOATED!", "W!", "SLAY!", "BOOM!"];
+const GROWTH = [
+  "Almost! Try again!",
+  "Great effort! Keep going!",
+  "Mistakes help your brain grow!",
+  "Look again. You got this!",
+  "So close! One more try!"
+];
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+const END_TITLE = "You're a Mathematician!";
+const TRY_AGAIN = "TRY AGAIN";
+function checkGenerator(game2, { count = 500, seed = 1, choiceCounts = [3, 4] } = {}) {
+  const rng = createRng(seed);
+  const errors = [];
+  const seenParams = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i += 1) {
+    let params;
+    let problem;
+    try {
+      params = game2.generate(rng);
+      problem = game2.build(params, rng);
+    } catch (e) {
+      errors.push(`#${i}: threw ${e.message}`);
+      continue;
+    }
+    const tag = `#${i} ${JSON.stringify(params)}`;
+    if (JSON.stringify(JSON.parse(JSON.stringify(params))) !== JSON.stringify(params)) errors.push(`${tag}: params must be JSON-safe`);
+    if (!problem || typeof problem !== "object") {
+      errors.push(`${tag}: build returned nothing`);
+      continue;
+    }
+    if (JSON.stringify(problem.params) !== JSON.stringify(params)) errors.push(`${tag}: problem.params must equal the input params`);
+    const validateStep = (step, label, requireValue = false) => {
+      if (typeof step?.prompt !== "string" || !step.prompt.trim()) errors.push(`${tag}: ${label} prompt must be non-empty text`);
+      const choices = step?.choices;
+      if (!Array.isArray(choices) || !choiceCounts.includes(choices.length)) errors.push(`${tag}: ${label} expected ${choiceCounts.join(" or ")} choices, got ${choices && choices.length}`);
+      else {
+        const ids = choices.map((c) => c && c.id);
+        const labels = choices.map((c) => c && String(c.label));
+        if (new Set(ids).size !== ids.length) errors.push(`${tag}: ${label} choice ids must be unique`);
+        if (new Set(labels).size !== labels.length) errors.push(`${tag}: ${label} choice labels must be unique (${labels.join(" | ")})`);
+        if (!ids.includes(step.answer)) errors.push(`${tag}: ${label} answer ${step.answer} is not a choice id`);
+        if (choices.some((c) => !c || c.label == null)) errors.push(`${tag}: ${label} every choice needs a label`);
+        if (requireValue && choices.some((c) => typeof c?.value !== "number" || !Number.isFinite(c.value))) errors.push(`${tag}: ${label} every choice needs a finite numeric value`);
+      }
+    };
+    if (problem.steps) {
+      if (!Array.isArray(problem.steps) || problem.steps.length === 0) errors.push(`${tag}: steps must be a non-empty array`);
+      else {
+        const keys = problem.steps.map((step) => step && step.key);
+        if (keys.some((key) => typeof key !== "string" || !key)) errors.push(`${tag}: every step needs a key`);
+        if (new Set(keys).size !== keys.length) errors.push(`${tag}: step keys must be unique`);
+        problem.steps.forEach((step, index) => validateStep(step, `step ${index + 1}`, true));
+      }
+    } else {
+      validateStep(problem, "problem");
+    }
+    if (game2.ranges) {
+      for (const [k, [min, max]] of Object.entries(game2.ranges)) {
+        const v = params[k];
+        if (typeof v !== "number" || v < min || v > max) errors.push(`${tag}: ${k}=${v} outside [${min}, ${max}]`);
+      }
+    }
+    if (typeof game2.check === "function") {
+      for (const msg of game2.check(problem) || []) errors.push(`${tag}: ${msg}`);
+    }
+    const again = game2.build(JSON.parse(JSON.stringify(params)), createRng(seed + i));
+    const answerLabels = (p) => (p.steps || [p]).map((step) => step.choices.find((c) => c.id === step.answer)?.label);
+    if (JSON.stringify(answerLabels(again)) !== JSON.stringify(answerLabels(problem))) errors.push(`${tag}: rebuilding from params changed the correct answer`);
+    seenParams.add(JSON.stringify(params));
+  }
+  return { count, distinct: seenParams.size, errors };
+}
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const DEFAULTS = {
+  basePoints: 10,
+  streakBonus: true,
+  hotStreak: 5,
+  questions: 12,
+  // null = endless
+  retryDelayMs: 450,
+  nextDelayMs: 900,
+  tierToastDurationMs: null,
+  autoSaveInterval: 3,
+  startButton: "LET'S GO!",
+  playAgain: "PLAY AGAIN"
+};
+function startSession(root, game2, options = {}) {
+  const opt = { ...DEFAULTS, ...options };
+  if (!opt.gameFile) throw new Error("startSession: options.gameFile is required (must equal the output filename)");
+  const rng = createRng(opt.seed);
+  let generateRound = game2.createSessionGenerator?.(rng, opt.seed);
+  const tracker = connectTracker({ gameFile: opt.gameFile, interval: opt.autoSaveInterval });
+  const meta = game2.meta;
+  const state = { score: 0, streak: 0, bestStreak: 0, questionsAnswered: 0, problem: null, isReplay: false, canAnswer: false, firstTry: true, wrongAttempts: 0, stepIndex: 0 };
+  const sync = () => tracker.publish(state);
+  if (opt.theme) for (const [k, v] of Object.entries(opt.theme)) root.style.setProperty(`--mg-${k}`, v);
+  root.classList.add("mg-root");
+  if (game2.layout === "standard") root.classList.add("mg-shell-standard");
+  if (opt.rootClass) root.classList.add(opt.rootClass);
+  root.replaceChildren();
+  const fx = el("div", "mg-fx");
+  const start = el("div", "mg-screen");
+  const hud = el("div", "mg-hud");
+  const progress = el("div", "mg-progress");
+  const stage = el("div", "mg-stage");
+  const end = el("div", "mg-screen mg-hidden");
+  root.append(start, hud, progress, stage, end, fx);
+  const startCard = el("div", "mg-card");
+  startCard.append(el("div", "mg-emoji", meta.emoji), el("h1", "mg-title", meta.title), el("p", "mg-subtitle", meta.subtitle));
+  if (meta.tag) startCard.append(el("p", "mg-tag", meta.tag));
+  const example = el("div", "mg-example");
+  if (game2.renderExample) game2.renderExample(example, { rng: createRng(7) });
+  else example.remove();
+  const startBtn = el("button", "mg-big-btn", opt.startButton);
+  startCard.append(example, startBtn);
+  start.append(startCard);
+  const hudTitle = el("div", "mg-hud-title", meta.title);
+  const chips = el("div", "mg-chips");
+  const scoreChip = el("div", "mg-chip mg-chip-score", "Score 0");
+  const streakChip = el("div", "mg-chip mg-chip-streak", "0🔥");
+  chips.append(scoreChip, streakChip);
+  hud.append(hudTitle, chips);
+  const view = hudTitle.ownerDocument?.defaultView;
+  const overflows = () => hudTitle.scrollWidth > hudTitle.clientWidth + 0.5;
+  function fitHudTitle() {
+    if (typeof view?.getComputedStyle !== "function") return;
+    const style = view.getComputedStyle(hudTitle);
+    const max = parseFloat(style.getPropertyValue("--mg-hud-title-max")) || 40;
+    const min = parseFloat(style.getPropertyValue("--mg-hud-title-min")) || 15;
+    delete hudTitle.dataset.hudTitleLines;
+    let size = max;
+    hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+    if (overflows()) {
+      const room = hudTitle.clientWidth / hudTitle.scrollWidth;
+      size = Math.max(min, Math.min(max, Math.floor(size * room * 10) / 10));
+      hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      while (size > min && overflows()) {
+        size = Math.max(min, size - 0.5);
+        hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      }
+      if (overflows()) hudTitle.dataset.hudTitleLines = "2";
+    }
+  }
+  let fittedWidth = -1;
+  const refitHudTitle = () => {
+    const width = hud.clientWidth;
+    if (width === fittedWidth) return;
+    fittedWidth = width;
+    fitHudTitle();
+  };
+  refitHudTitle();
+  if (typeof view?.ResizeObserver === "function") new view.ResizeObserver(refitHudTitle).observe(hud);
+  else view?.addEventListener?.("resize", refitHudTitle);
+  document.fonts?.ready?.then(fitHudTitle);
+  const bar = el("i");
+  progress.append(bar);
+  if (!opt.questions) progress.classList.add("mg-hidden");
+  const prompt = el("div", "mg-prompt");
+  const visual = el("div", "mg-visual");
+  const tiles = el("div", "mg-tiles");
+  if (game2.keyboardAnswersFirst) stage.append(prompt, tiles, visual);
+  else stage.append(prompt, visual, tiles);
+  const renderHud = () => {
+    scoreChip.textContent = `Score ${state.score}`;
+    streakChip.textContent = `${state.streak}🔥`;
+    streakChip.classList.toggle("mg-hot", state.streak >= opt.hotStreak);
+    fitHudTitle();
+    if (opt.questions) bar.style.width = `${Math.min(100, state.questionsAnswered / opt.questions * 100)}%`;
+    sync();
+  };
+  function nextProblem() {
+    const missed = generateRound ? null : tracker.getMissedProblem();
+    state.isReplay = Boolean(missed);
+    const params = missed || (generateRound ? generateRound() : game2.generate(rng));
+    state.problem = game2.build(params, rng);
+    state.firstTry = true;
+    state.wrongAttempts = 0;
+    state.stepIndex = 0;
+    visual.replaceChildren();
+    if (game2.renderProblem) game2.renderProblem(visual, state.problem);
+    renderStep();
+  }
+  function activeStep() {
+    return state.problem.steps ? state.problem.steps[state.stepIndex] : state.problem;
+  }
+  function renderStep() {
+    const p = state.problem;
+    const step = activeStep();
+    if (game2.renderPrompt) game2.renderPrompt(prompt, p, step, state.stepIndex);
+    else prompt.textContent = step.prompt;
+    tiles.replaceChildren();
+    tiles.dataset.count = String(step.choices.length);
+    for (const c of step.choices) {
+      const b = el("button", "mg-tile");
+      if (game2.renderChoice) game2.renderChoice(b, c, p, step, state.stepIndex);
+      else b.textContent = String(c.label);
+      b.addEventListener("click", () => answer(c, b));
+      tiles.append(b);
+    }
+    state.canAnswer = true;
+  }
+  function answer(choice2, tile) {
+    if (!state.canAnswer) return;
+    state.canAnswer = false;
+    const p = state.problem;
+    const step = activeStep();
+    const correct = choice2.id === step.answer;
+    tracker.recordQuestion({
+      question: step.prompt,
+      params: p.params,
+      answer: String(choice2.label),
+      correctAnswer: String(step.choices.find((c) => c.id === step.answer).label),
+      correct,
+      firstTry: state.firstTry,
+      replay: state.isReplay
+    });
+    if (!correct) onWrong(tile, step);
+    else if (p.steps && state.stepIndex < p.steps.length - 1) onStepCorrect(tile, step);
+    else onCorrect(tile);
+  }
+  function onStepCorrect(tile, step) {
+    play("correct");
+    tile.classList.add("mg-right");
+    for (const b of tiles.children) b.disabled = true;
+    const hook = game2.onStepCorrect?.({ state, problem: state.problem, step, tile, fx });
+    setTimeout(() => {
+      state.stepIndex += 1;
+      state.wrongAttempts = 0;
+      renderStep();
+    }, hook?.delayMs ?? 450);
+  }
+  function onCorrect(tile) {
+    const p = state.problem;
+    play("correct");
+    tile.classList.add("mg-right");
+    for (const b of tiles.children) b.disabled = true;
+    if (state.isReplay || generateRound) tracker.markCorrected(p.params);
+    state.streak += 1;
+    state.bestStreak = Math.max(state.bestStreak, state.streak);
+    state.score += opt.basePoints + (opt.streakBonus ? state.streak : 0);
+    state.questionsAnswered += 1;
+    renderHud();
+    tracker.checkAutoSave();
+    toast(fx, rng.pick(PRAISE));
+    flyEmoji(fx, tile, meta.emoji, 4);
+    const tier = STREAK_TIERS.find((t) => t.at === state.streak);
+    if (tier) {
+      play("tier");
+      confetti(fx, tier.burst);
+      setTimeout(() => toast(fx, tier.word, "tier", { removeAfterMs: opt.tierToastDurationMs }), 250);
+    }
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
+      if (opt.questions && state.questionsAnswered >= opt.questions) showEnd();
+      else nextProblem();
+    };
+    const hook = game2.onCorrect ? game2.onCorrect({ state, tile, fx, continue: advance, tier }) : null;
+    if (hook?.continueElement) {
+      hook.continueElement.addEventListener("pointerdown", advance, { once: true });
+      hook.continueElement.addEventListener("click", advance, { once: true });
+    }
+    setTimeout(advance, hook?.delayMs ?? opt.nextDelayMs + (tier ? 500 : 0));
+  }
+  function onWrong(tile, step = activeStep()) {
+    play("wrong");
+    tile.classList.add("mg-wrong");
+    state.streak = 0;
+    state.firstTry = false;
+    state.wrongAttempts += 1;
+    tracker.markMissed(state.problem.params);
+    renderHud();
+    const wrongEffect = game2.onWrong ? game2.onWrong({ state, tile, fx, step }) : null;
+    if (wrongEffect?.showToast !== false) toast(fx, `${TRY_AGAIN}  ${rng.pick(GROWTH)}`, "warm");
+    if (wrongEffect?.shakeStage !== false) shake(stage);
+    const retry = () => {
+      tile.classList.remove("mg-wrong");
+      state.canAnswer = true;
+      wrongEffect?.onRetry?.();
+      tile.focus();
+    };
+    if (wrongEffect?.retryElement) {
+      wrongEffect.retryElement.addEventListener("click", retry, { once: true });
+      wrongEffect.retryElement.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          retry();
+        }
+      });
+    } else {
+      setTimeout(retry, opt.retryDelayMs);
+    }
+  }
+  function showEnd() {
+    play("complete");
+    fx.replaceChildren();
+    end.replaceChildren();
+    const card = el("div", "mg-card");
+    card.append(el("div", "mg-emoji", "🎓"), el("h1", "mg-title", END_TITLE));
+    const stats = el("div", "mg-stats");
+    for (const [label, v] of [["Score", state.score], ["Best Streak", state.bestStreak], ["Solved", state.questionsAnswered]]) {
+      const s = el("div", "mg-stat", label);
+      s.prepend(el("b", null, String(v)));
+      stats.append(s);
+    }
+    if (game2.renderEnd) game2.renderEnd(card, state);
+    const again = el("button", "mg-big-btn", opt.playAgain);
+    again.addEventListener("click", () => {
+      play("tap");
+      end.classList.add("mg-hidden");
+      reset();
+      nextProblem();
+    });
+    card.append(stats, again);
+    end.append(card);
+    end.classList.remove("mg-hidden");
+  }
+  function reset() {
+    generateRound = game2.createSessionGenerator?.(rng, opt.seed);
+    Object.assign(state, { score: 0, streak: 0, bestStreak: 0, questionsAnswered: 0 });
+    renderHud();
+  }
+  startBtn.addEventListener("click", () => {
+    initAudio();
+    play("tap");
+    start.classList.add("mg-hidden");
+    renderHud();
+    nextProblem();
+  });
+  const onKey = (e) => {
+    if (e.ctrlKey && e.key.toLowerCase() === "t") {
+      e.preventDefault();
+      const r = checkGenerator(game2, { count: 500 });
+      console.log(`[${opt.gameFile}] generator check: ${r.count} problems, ${r.distinct} distinct, ${r.errors.length} errors`, r.errors.slice(0, 20));
+    }
+  };
+  window.addEventListener("keydown", onKey);
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  renderHud();
+  return {
+    state,
+    tracker,
+    destroy() {
+      window.removeEventListener("keydown", onKey);
+      game2.onDestroy?.({ state, root, fx });
+      root.replaceChildren();
+      root.classList.remove("mg-root");
+      root.classList.remove("mg-shell-standard");
+      if (opt.rootClass) root.classList.remove(opt.rootClass);
+    }
+  };
+}
+function makeChoices(rng, { correct, distractors, count = 4, key = (c) => String(c.label) }) {
+  if (!correct || correct.id == null) throw new Error("makeChoices: correct needs an id");
+  const seen = /* @__PURE__ */ new Set([key(correct)]);
+  const picked = [];
+  for (const d of distractors) {
+    const k = key(d);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    picked.push({ ...d, id: d.id ?? `d${picked.length}` });
+    if (picked.length === count - 1) break;
+  }
+  if (picked.length < count - 1) {
+    throw new Error(`makeChoices: needed ${count - 1} distinct distractors, got ${picked.length}`);
+  }
+  const choices = rng.shuffle([correct, ...picked]);
+  return { choices, answer: correct.id };
+}
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+function mountGame(element, game2, options = {}) {
+  return startSession(element, game2, { questions: game2.meta.questions ?? void 0, ...options });
+}
+const OBJECT_WORD = "critters";
+const ranges = { g: [2, 6], n: [2, 6] };
+function generate(rng) {
+  return {
+    g: rng.int(...ranges.g),
+    n: rng.int(...ranges.n),
+    order: rng.chance(0.5) ? "groups-first" : "each-first"
+  };
+}
+const choice = (g, n, id) => ({ id, label: `${g} x ${n}`, g, n });
+const nearby = (value, count, used = /* @__PURE__ */ new Set()) => {
+  const candidates = [value + 1, value + 2, value - 1, value - 2];
+  return candidates.filter((item) => item >= 2 && item <= 6 && !used.has(item)).slice(0, count);
+};
+function build(params, rng) {
+  const { g, n, order } = params;
+  const groupSentence = `There are ${g} bushes.`;
+  const eachSentence = `Each bush has ${n} ${OBJECT_WORD}.`;
+  const prompt = order === "groups-first" ? `${groupSentence} ${eachSentence}` : `${eachSentence} ${groupSentence}`;
+  const wrongEach = nearby(n, g === n ? 2 : 1, /* @__PURE__ */ new Set([n]));
+  const wrongGroups = nearby(g, 1, /* @__PURE__ */ new Set([g]));
+  const distractors = g === n ? [...wrongEach.map((item) => choice(g, item)), choice(wrongGroups[0], n)] : [choice(n, g), choice(g, wrongEach[0]), choice(wrongGroups[0], n)];
+  const { choices, answer } = makeChoices(rng, {
+    correct: choice(g, n, "correct"),
+    distractors,
+    key: (item) => item.label
+  });
+  return { params, prompt, choices, answer };
+}
+function check(problem) {
+  const errors = [];
+  const answer = problem.choices.find((item) => item.id === problem.answer);
+  if (!answer) return ["answer choice is missing"];
+  const distractors = problem.choices.filter((item) => item.id !== problem.answer);
+  for (const item of problem.choices) {
+    if (item.g < 1 || item.g > 8 || item.n < 1 || item.n > 8) {
+      errors.push(`choice ${item.label} is outside the drawable range`);
+    }
+    if (item.label !== `${item.g} x ${item.n}`) errors.push(`choice ${item.id} has the wrong label`);
+  }
+  for (const item of distractors) {
+    if (item.g === answer.g && item.n === answer.n) errors.push(`distractor ${item.id} matches the answer`);
+  }
+  const swapped = distractors.filter((item) => item.g === answer.n && item.n === answer.g);
+  const wrongEach = distractors.filter((item) => item.g === answer.g && item.n !== answer.n);
+  const wrongGroups = distractors.filter((item) => item.g !== answer.g && item.n === answer.n);
+  if (answer.g !== answer.n) {
+    if (swapped.length !== 1) errors.push("unequal pairs need exactly one swapped distractor");
+    if (wrongEach.length !== 1) errors.push("unequal pairs need exactly one wrong in-each distractor");
+    if (wrongGroups.length !== 1) errors.push("unequal pairs need exactly one wrong-groups distractor");
+  } else {
+    if (swapped.length !== 0) errors.push("equal pairs must not include a swapped distractor");
+    if (wrongEach.length !== 2) errors.push("equal pairs need two wrong in-each distractors");
+    if (wrongGroups.length !== 1) errors.push("equal pairs need one wrong-groups distractor");
+  }
+  return errors;
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  build,
+  check,
+  generate,
+  ranges
+}, Symbol.toStringTag, { value: "Module" }));
+const BUSH = { w: 120, h: 84 };
+const BUSH_GAP = 10;
+const PATCH_PAD = 4;
+const MAX_PER_BUSH = 9;
+const CRITTER_SET_OFFSET_Y = 2;
+const SAFE = { x: 18, y: 20, w: 84, h: 48 };
+const critterSize = (n) => n <= 3 ? 20 : n <= 6 ? 15 : 12;
+function gridFor(count, cols) {
+  const rows = Math.ceil(count / cols);
+  return { cols, rows };
+}
+function patchSize(g, cols) {
+  const { rows } = gridFor(g, cols);
+  return {
+    w: cols * BUSH.w + (cols - 1) * BUSH_GAP + 2 * PATCH_PAD,
+    h: rows * BUSH.h + (rows - 1) * BUSH_GAP + 2 * PATCH_PAD
+  };
+}
+function chooseColumns(g, width, height) {
+  let best = { cols: 1, scale: -1 };
+  for (let cols = 1; cols <= g; cols += 1) {
+    const size = patchSize(g, cols);
+    const scale = Math.min(width / size.w, height / size.h);
+    if (scale > best.scale + 1e-9) best = { cols, scale };
+  }
+  return best.cols;
+}
+function bushOrigins(g, cols) {
+  const { rows } = gridFor(g, cols);
+  const { w } = patchSize(g, cols);
+  const origins = [];
+  for (let row = 0; row < rows; row += 1) {
+    const inRow = Math.min(cols, g - row * cols);
+    const rowWidth = inRow * BUSH.w + (inRow - 1) * BUSH_GAP;
+    const left = (w - rowWidth) / 2;
+    for (let col = 0; col < inRow; col += 1) {
+      origins.push({ x: left + col * (BUSH.w + BUSH_GAP), y: PATCH_PAD + row * (BUSH.h + BUSH_GAP) });
+    }
+  }
+  return origins;
+}
+function critterCenters(n) {
+  if (n < 1 || n > MAX_PER_BUSH) throw new Error(`critterCenters: ${n} is outside 1..${MAX_PER_BUSH}`);
+  const d = critterSize(n);
+  if (n === 4) return [
+    { x: 44, y: 33.5, d },
+    { x: 75, y: 33.5, d },
+    { x: 53, y: 54.5, d },
+    { x: 84, y: 54.5, d }
+  ];
+  const cols = Math.min(3, n);
+  const rows = Math.ceil(n / cols);
+  const safeHeight = n > 6 ? SAFE.h - CRITTER_SET_OFFSET_Y : SAFE.h;
+  const stepX = (SAFE.w - cols * d) / (cols + 1) + d;
+  const stepY = (safeHeight - rows * d) / (rows + 1) + d;
+  const firstY = SAFE.y + (safeHeight - (rows - 1) * stepY) / 2;
+  const centers = [];
+  for (let row = 0; row < rows; row += 1) {
+    const inRow = Math.min(cols, n - row * cols);
+    const firstX = SAFE.x + (SAFE.w - (inRow - 1) * stepX) / 2;
+    for (let col = 0; col < inRow; col += 1) {
+      centers.push({ x: firstX + col * stepX, y: firstY + row * stepY, d });
+    }
+  }
+  return centers;
+}
+const BUSH_PATH = "M16 66 C3 64 1 46 13 41 C7 27 22 16 36 22 C42 6 66 4 76 18 C92 10 110 22 105 38 C119 43 119 62 106 66 C102 80 80 84 70 74 C60 84 40 84 32 74 C24 80 12 78 16 66 Z";
+const BUSH_SHADE = "M20 62 C30 74 44 74 52 66 C60 74 78 74 88 62 C96 68 104 62 104 56 C100 72 78 80 66 72 C56 80 36 80 28 70 C22 72 16 68 20 62 Z";
+function bushMarkup(n, origin, animation = null) {
+  const critters = critterCenters(n).map(({ x, y, d }, critterIndex) => {
+    const r = d / 2;
+    const critter = `<g class="cc-critter" transform="translate(${x} ${y})"><ellipse rx="${r}" ry="${(r * 1.06).toFixed(2)}" fill="#1a1a2e"/><circle cx="${-(r * 0.4).toFixed(2)}" cy="${-(r * 0.18).toFixed(2)}" r="${(r * 0.19).toFixed(2)}" fill="#fff4d6"/><circle cx="${(r * 0.4).toFixed(2)}" cy="${-(r * 0.18).toFixed(2)}" r="${(r * 0.19).toFixed(2)}" fill="#fff4d6"/></g>`;
+    if (!animation || animation.animateCritters === false) return critter;
+    const critterClass = animation.critterClass || "cc-hint-critter";
+    const critterStep = animation.critterStep ?? 220;
+    return `<g class="${critterClass}" style="--cc-hint-delay:${animation.crittersAt + critterIndex * critterStep}ms">${critter}</g>`;
+  }).join("");
+  const bush = `<g class="cc-bush" transform="translate(${origin.x} ${origin.y})"><path class="cc-bush-leaf" d="${BUSH_PATH}"/><path class="cc-bush-shade" d="${BUSH_SHADE}"/><g class="cc-critter-set" transform="translate(0 ${CRITTER_SET_OFFSET_Y})">${critters}</g></g>`;
+  if (!animation || animation.animateBushes === false) return bush;
+  const bushClass = animation.bushClass || "cc-hint-bush";
+  const bushStart = animation.bushStart ?? 400;
+  const bushStep = animation.bushStep ?? 240;
+  return `<g class="${bushClass}" style="--cc-hint-delay:${bushStart + animation.bushIndex * bushStep}ms">${bush}</g>`;
+}
+function patchSvg(g, n, cols = defaultColumns(g)) {
+  const { w, h } = patchSize(g, cols);
+  const bushes = bushOrigins(g, cols).map((origin) => bushMarkup(n, origin)).join("");
+  return `<svg class="cc-patch" data-groups="${g}" data-count="${n}" data-columns="${cols}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false">${bushes}</svg>`;
+}
+function hintPatchSvg(g, n, cols = defaultColumns(g), options = {}) {
+  const { w, h } = patchSize(g, cols);
+  const settings = {
+    animateBushes: true,
+    animateCritters: true,
+    bushStart: 400,
+    bushStep: 240,
+    crittersAt: 400 + g * 240 + 600,
+    critterStep: 220,
+    ...options || {}
+  };
+  const bushes = bushOrigins(g, cols).map((origin, bushIndex) => bushMarkup(n, origin, { ...settings, bushIndex })).join("");
+  return `<svg class="cc-patch cc-hint-patch" data-groups="${g}" data-count="${n}" data-columns="${cols}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false">${bushes}</svg>`;
+}
+function examplePatchSvg(g, n, cols = defaultColumns(g)) {
+  const { w, h } = patchSize(g, cols);
+  const bushStart = 350;
+  const bushStep = 440;
+  const crittersAt = bushStart + Math.max(0, g - 1) * bushStep + 420;
+  const bushes = bushOrigins(g, cols).map((origin, bushIndex) => bushMarkup(n, origin, {
+    bushIndex,
+    bushStart,
+    bushStep,
+    crittersAt,
+    critterStep: 320,
+    bushClass: "cc-example-bush",
+    critterClass: "cc-example-critter"
+  })).join("");
+  return `<svg class="cc-patch cc-example-patch-art" data-groups="${g}" data-count="${n}" data-columns="${cols}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false">${bushes}</svg>`;
+}
+function defaultColumns(g) {
+  return g <= 3 ? g : 3;
+}
+const SESSION_QUESTIONS = 6;
+const START_BUTTON_LABEL = "LET'S GO CATCH THEM!";
+const REVEAL_VISIBLE_MS = 3850;
+const AMPLIFY_STEM = "Select the equal-groups drawing that represents the situation.";
+const MECHANIC_TAIL = "Catch the creature inside.";
+const caughtLabel = (count) => `${count} ${count === 1 ? "critter" : "critters"} caught`;
+const CREATURES = [
+  { name: "Sprigg", type: "leaf", color: "#2ed573", accent: "#ffd93d", shape: 0 },
+  { name: "Fernby", type: "leaf", color: "#55c96b", accent: "#6bcb77", shape: 1 },
+  { name: "Mossle", type: "leaf", color: "#79d86d", accent: "#2f9e59", shape: 2 },
+  { name: "Cinderpup", type: "flame", color: "#ff9f43", accent: "#ffd93d", shape: 0 },
+  { name: "Flarebit", type: "flame", color: "#ffb142", accent: "#fff0a6", shape: 1 },
+  { name: "Emberling", type: "flame", color: "#f6a623", accent: "#ffe66d", shape: 2 },
+  { name: "Puddlefin", type: "drop", color: "#54a0ff", accent: "#a8e6ff", shape: 0 },
+  { name: "Dripp", type: "drop", color: "#6bcbff", accent: "#d6f3ff", shape: 1 },
+  { name: "Splashy", type: "drop", color: "#48bfe3", accent: "#90e0ef", shape: 2 },
+  { name: "Zippit", type: "spark", color: "#a66cff", accent: "#ffd93d", shape: 0 },
+  { name: "Sparklet", type: "spark", color: "#8e7dff", accent: "#fff0a6", shape: 1 },
+  { name: "Voltie", type: "spark", color: "#b56cff", accent: "#ffe66d", shape: 2 }
+];
+let roster = [];
+let caught = [];
+let wrongFeedback = null;
+function clearWrongFeedback() {
+  if (!wrongFeedback) return;
+  wrongFeedback.timers.forEach(clearTimeout);
+  wrongFeedback.panel.remove();
+  wrongFeedback = null;
+}
+function setWrongFeedback(panel, timers = []) {
+  clearWrongFeedback();
+  wrongFeedback = { panel, timers: Array.isArray(timers) ? timers : [timers] };
+}
+const esc = (value) => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+function wrongHint(g, n) {
+  const crittersAt = 400 + g * 240 + 600;
+  return `<div class="cc-wrong-hint" role="img" aria-label="${g} bushes with ${n} critters in each bush" style="--cc-hint-critters-at:${crittersAt}ms">
+    <div class="cc-wrong-hint-picture">${hintPatchSvg(g, n)}</div>
+    <div class="cc-wrong-hint-labels"><b>${g} bushes</b><span>${n} critters in each bush</span></div>
+  </div>`;
+}
+function creatureSvg(creature, small = false) {
+  const extras = [
+    '<path d="M28 35 Q17 19 27 13 Q39 18 41 31"/>',
+    '<path d="M30 30 Q15 25 18 14 Q32 14 40 29"/><circle cx="58" cy="18" r="7"/>',
+    '<path d="M25 36 Q15 24 24 15 Q36 17 41 30"/><path d="M55 27 Q66 13 72 25"/>'
+  ][creature.shape];
+  const typeMark = {
+    leaf: '<path d="M47 58 Q65 42 70 59 Q58 69 47 58"/>',
+    flame: '<path d="M53 70 Q41 57 55 41 Q57 53 65 55 Q70 65 53 70"/>',
+    drop: '<path d="M58 40 Q72 58 58 70 Q44 58 58 40"/>',
+    spark: '<path d="M52 39 L68 39 L61 52 L72 52 L52 72 L57 57 L46 57 Z"/>'
+  }[creature.type];
+  return `<svg class="cc-creature${small ? " cc-creature-small" : ""}" viewBox="0 0 100 100" role="img" aria-label="${esc(creature.name)}, ${esc(creature.type)} type">
+    <g stroke="#1a1a2e" stroke-width="5" stroke-linejoin="round" stroke-linecap="round">
+      <g fill="${creature.accent}">${extras}</g>
+      <path fill="${creature.color}" d="M23 61 Q22 35 49 29 Q77 28 80 58 Q82 82 52 84 Q24 82 23 61 Z"/>
+      <g fill="${creature.accent}">${typeMark}</g>
+      <circle fill="#1a1a2e" stroke="none" cx="42" cy="53" r="4"/><circle fill="#1a1a2e" stroke="none" cx="64" cy="53" r="4"/>
+      <path fill="none" d="M48 66 Q54 70 60 65"/>
+    </g>
+  </svg>`;
+}
+function snapBallSvg() {
+  return `<svg class="cc-ball" viewBox="0 0 100 100" aria-hidden="true">
+    <defs><clipPath id="cc-ball-clip"><circle cx="48" cy="50" r="37"/></clipPath></defs>
+    <circle cx="48" cy="50" r="37" fill="#fff4d6" stroke="#1a1a2e" stroke-width="6"/>
+    <path d="M10 24 L78 12 L86 61 L18 76 Z" fill="#2ed573" clip-path="url(#cc-ball-clip)"/>
+    <path d="M29 28 L33 38 L44 39 L35 46 L38 57 L29 51 L20 57 L23 46 L14 39 L25 38 Z" fill="#ffd93d" stroke="#1a1a2e" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M78 37 H91 Q96 37 96 42 V58 Q96 63 91 63 H78 Z" fill="#ffd93d" stroke="#1a1a2e" stroke-width="6"/>
+    <circle cx="48" cy="50" r="37" fill="none" stroke="#1a1a2e" stroke-width="6"/>
+  </svg>`;
+}
+let tileObserver = null;
+function layoutTile(tile) {
+  const svg = tile.querySelector(".cc-patch");
+  if (!svg) return;
+  const g = Number(svg.dataset.groups);
+  const n = Number(svg.dataset.count);
+  const box = svg.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const cols = chooseColumns(g, box.width, box.height);
+  if (cols !== Number(svg.dataset.columns)) svg.outerHTML = patchSvg(g, n, cols);
+}
+function watchTile(tile) {
+  if (typeof ResizeObserver === "undefined") return;
+  tileObserver || (tileObserver = new ResizeObserver((entries) => entries.forEach((entry) => layoutTile(entry.target))));
+  tileObserver.observe(tile);
+}
+const POPUP_MARGIN = 8;
+function ensurePopup(root) {
+  let popup = root.querySelector(".cc-slot-popup");
+  if (!popup) {
+    popup = document.createElement("div");
+    popup.className = "cc-slot-popup";
+    popup.id = "cc-slot-popup";
+    popup.setAttribute("role", "tooltip");
+    popup.hidden = true;
+    root.append(popup);
+  }
+  return popup;
+}
+function placePopup(popup, slotRect, rootRect, viewport) {
+  const width = popup.offsetWidth;
+  const height = popup.offsetHeight;
+  const left = Math.min(Math.max(POPUP_MARGIN, slotRect.left + slotRect.width / 2 - width / 2), viewport.width - width - POPUP_MARGIN);
+  let top = slotRect.top - POPUP_MARGIN - height;
+  if (top < POPUP_MARGIN) top = slotRect.bottom + POPUP_MARGIN;
+  top = Math.min(Math.max(POPUP_MARGIN, top), viewport.height - height - POPUP_MARGIN);
+  popup.style.left = `${left}px`;
+  popup.style.top = `${top}px`;
+}
+function showPopup(slot, creature) {
+  const root = slot.closest(".mg-root");
+  if (!root) return;
+  const popup = ensurePopup(root);
+  popup.innerHTML = `${creatureSvg(creature, true)}<b>${esc(creature.name)}</b><span>${esc(creature.type)} type</span>`;
+  popup.hidden = false;
+  placePopup(popup, slot.getBoundingClientRect(), root.getBoundingClientRect(), { width: window.innerWidth, height: window.innerHeight });
+  slot.setAttribute("aria-describedby", popup.id);
+}
+function hidePopup(slot) {
+  const popup = slot.closest(".mg-root")?.querySelector(".cc-slot-popup");
+  if (popup) popup.hidden = true;
+  slot.removeAttribute("aria-describedby");
+}
+function renderTray(el2) {
+  el2.setAttribute("aria-label", caughtLabel(caught.length));
+  el2.innerHTML = Array.from({ length: SESSION_QUESTIONS }, (_, index) => {
+    const creature = caught[index];
+    return creature ? `<button type="button" class="cc-tray-slot cc-filled" data-index="${index}" aria-label="Show ${esc(creature.name)} card">${creatureSvg(creature, true)}</button>` : '<span class="cc-tray-slot" aria-hidden="true"></span>';
+  }).join("");
+  el2.querySelectorAll(".cc-filled").forEach((slot) => {
+    const creature = caught[Number(slot.dataset.index)];
+    const open = () => showPopup(slot, creature);
+    const close = () => {
+      if (!slot.classList.contains("cc-card-open")) hidePopup(slot);
+    };
+    slot.addEventListener("pointerenter", open);
+    slot.addEventListener("focus", open);
+    slot.addEventListener("pointerleave", close);
+    slot.addEventListener("blur", close);
+    slot.addEventListener("click", () => {
+      const isOpen = slot.classList.toggle("cc-card-open");
+      el2.querySelectorAll(".cc-card-open").forEach((other) => {
+        if (other !== slot) other.classList.remove("cc-card-open");
+      });
+      if (isOpen) open();
+      else hidePopup(slot);
+    });
+  });
+}
+function resetCollection(seed) {
+  roster = createRng(seed).shuffle(CREATURES);
+  caught = [];
+}
+const game = defineGame({
+  keyboardAnswersFirst: true,
+  meta: {
+    name: "critter_catch",
+    lesson: "102",
+    title: "CREATURE CATCH",
+    subtitle: "Tap the bush that matches to catch the creature inside.",
+    emoji: "🍃",
+    tag: "ML 1.02 · EQUAL GROUPS",
+    questions: SESSION_QUESTIONS
+  },
+  ...gen,
+  renderExample(el2) {
+    el2.innerHTML = `<p class="cc-example-story">There are 3 bushes. Each bush has 4 ${OBJECT_WORD}.</p><div class="cc-example-patch">${examplePatchSvg(3, 4, 3)}</div>`;
+  },
+  renderPrompt(el2, problem) {
+    el2.replaceChildren();
+    const statement = document.createElement("span");
+    statement.textContent = problem.prompt;
+    const instruction = document.createElement("span");
+    instruction.className = "cc-prompt-instruction mg-card-stem";
+    const stem = document.createElement("span");
+    stem.textContent = AMPLIFY_STEM;
+    const tail = document.createElement("span");
+    tail.className = "cc-prompt-tail";
+    tail.textContent = ` ${MECHANIC_TAIL}`;
+    instruction.append(stem, tail);
+    el2.append(statement, instruction);
+  },
+  renderProblem(el2) {
+    if (caught.length === SESSION_QUESTIONS) resetCollection(Date.now());
+    tileObserver?.disconnect();
+    const tray = document.createElement("div");
+    tray.className = "cc-tray";
+    tray.setAttribute("aria-label", caughtLabel(caught.length));
+    renderTray(tray);
+    el2.append(tray);
+  },
+  renderChoice(tile, item) {
+    tile.setAttribute("aria-label", `${item.g} bushes with ${item.n} ${OBJECT_WORD} in each`);
+    tile.innerHTML = patchSvg(item.g, item.n);
+    watchTile(tile);
+  },
+  onWrong({ state, tile }) {
+    clearWrongFeedback();
+    tile.closest(".mg-root")?.querySelectorAll(".mg-toast-warm").forEach((toast2) => toast2.remove());
+    tile.classList.add("cc-shake-in-place");
+    setTimeout(() => tile.classList.remove("cc-shake-in-place"), 650);
+    const panel = document.createElement("div");
+    panel.className = "cc-feedback-panel cc-wrong-panel";
+    const showHint = state.wrongAttempts >= 2;
+    if (showHint) panel.classList.add("cc-wrong-panel-hint");
+    panel.innerHTML = showHint ? `<span>Look for these equal groups.</span>${wrongHint(state.problem.params.g, state.problem.params.n)}<button type="button" class="cc-try-again">TRY AGAIN</button>` : '<span>Count each bush again. You can do this!</span><button type="button" class="cc-try-again">TRY AGAIN</button>';
+    tile.closest(".mg-root")?.querySelector(".mg-fx")?.append(panel);
+    const timers = [];
+    if (showHint && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      const { g, n } = state.problem.params;
+      const crittersAt = 400 + g * 240 + 600;
+      for (let index = 0; index < g; index += 1) timers.push(setTimeout(() => playHint("group", index), 400 + index * 240));
+      for (let index = 0; index < n; index += 1) timers.push(setTimeout(() => playHint("critter", index), crittersAt + index * 220));
+    }
+    setWrongFeedback(panel, timers);
+    return {
+      shakeStage: false,
+      showToast: false,
+      retryElement: panel.querySelector(".cc-try-again"),
+      onRetry: clearWrongFeedback
+    };
+  },
+  onCorrect({ tile, fx }) {
+    clearWrongFeedback();
+    const creature = roster[caught.length] || CREATURES[caught.length % CREATURES.length];
+    caught.push(creature);
+    const layer = document.createElement("div");
+    layer.className = "cc-catch-layer";
+    layer.innerHTML = `<div class="cc-reveal-panel"><div class="cc-thrown-ball">${snapBallSvg()}</div><div class="cc-reveal-message"><b>GOT ONE!</b><span>Nice equal groups!</span></div><div class="cc-reveal-card">${creatureSvg(creature)}<b>${esc(creature.name)}</b><span>${esc(creature.type)} type</span></div><button type="button" class="cc-continue">TAP TO CONTINUE</button></div><div class="cc-starburst">★</div>`;
+    fx.append(layer);
+    play("throw");
+    const timers = [];
+    const later = (fn, delay) => timers.push(setTimeout(fn, delay));
+    [520, 770, 1020].forEach((delay) => later(() => play("tick"), delay));
+    let revealed = false;
+    const reveal = () => {
+      if (revealed) return;
+      revealed = true;
+      timers.forEach(clearTimeout);
+      play("click");
+      layer.classList.add("cc-revealed");
+      continueButton.disabled = false;
+      const tray = tile.closest(".mg-root")?.querySelector(".cc-tray");
+      if (tray) renderTray(tray);
+    };
+    const removeTimer = setTimeout(() => layer.remove(), REVEAL_VISIBLE_MS);
+    const continueButton = layer.querySelector(".cc-continue");
+    continueButton.disabled = true;
+    const continueAndClear = () => {
+      if (!revealed) return;
+      reveal();
+      clearTimeout(removeTimer);
+      setTimeout(() => layer.remove(), 80);
+    };
+    continueButton.addEventListener("pointerdown", continueAndClear, { once: true });
+    continueButton.addEventListener("click", continueAndClear, { once: true });
+    later(reveal, 200);
+    return { delayMs: REVEAL_VISIBLE_MS + 50, continueElement: continueButton };
+  },
+  renderEnd(el2) {
+    const summary = document.createElement("section");
+    summary.className = "cc-end-collection";
+    summary.innerHTML = `<h2>Caught ${caught.length}/${SESSION_QUESTIONS}</h2><div class="cc-collection-grid">${caught.map((creature) => `<div>${creatureSvg(creature)}<b>${esc(creature.name)}</b><span>${esc(creature.type)} type</span></div>`).join("")}</div>`;
+    el2.append(summary);
+  }
+});
+function mount(element, options = {}) {
+  resetCollection(options.seed == null ? Date.now() : Number(options.seed) + 102);
+  return mountGame(element, game, {
+    questions: SESSION_QUESTIONS,
+    retryDelayMs: 650,
+    nextDelayMs: 3e3,
+    rootClass: "cc-game",
+    startButton: START_BUTTON_LABEL,
+    theme: { "bg-a": "#2ed573", "bg-b": "#176b3a" },
+    ...options
+  });
+}
+mount(document.getElementById("game"), { gameFile: "equal_groups_situations_102.html" });</script>
+  <style rel="stylesheet" crossorigin>/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: 1.05;
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+.mg-root.cc-game { --cc-prompt-tray-gap: clamp(27px, calc(6vh - 1px), 45px); --cc-tray-answers-gap: clamp(27px, calc(6vh - 1px), 45px); --cc-answer-gap: clamp(16px, 2vw, 24px); background: linear-gradient(180deg, #8be6bf 0%, #2ed573 42%, #176b3a 100%); }
+.cc-game .mg-stage { padding-bottom: calc(65px + env(safe-area-inset-bottom, 0px)); }
+.cc-game .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.cc-prompt-instruction {
+  display: block; margin-top: clamp(5px, .8vh, 10px);
+  font-size: clamp(15px, 2vw, 19px); font-weight: 700; line-height: 1.15;
+}
+/* Game 102 keeps every word of the full direction. It stays one line wherever
+   the complete copy fits at the readable 15px floor, and wraps on the narrow
+   portrait phones when it does not. */
+.cc-game .mg-big-btn { font-size: clamp(18px, 2.1vw, 30px); padding-left: clamp(12px, 2.8vw, 40px); padding-right: clamp(12px, 2.8vw, 40px); white-space: nowrap; }
+.cc-game .mg-visual { grid-row: 2; }
+.cc-game .mg-tiles { grid-row: 3; }
+.cc-game :is(.mg-tile, .cc-tray-slot):focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; box-shadow: 0 0 0 2px #1a1a2e, 0 5px 0 #1a1a2e; }
+
+.cc-example-story { font-weight: 700; margin-bottom: 10px; }
+
+.mg-visual { flex: 0 0 52px; }
+.mg-tiles { flex: 1; min-height: 0; }
+.mg-tile { min-height: 128px; overflow: hidden; }
+
+/* Answer cards: one plain white card, one SVG patch inset by --cc-pad so every
+   bush stays well inside the border. The SVG scales to fit (meet) and the grid
+   is chosen in JS from the card's inner size. */
+.cc-game .mg-tile { --cc-pad: clamp(8px, 1.4vw, 14px); position: relative; padding: 0; }
+.cc-game .mg-tile .cc-patch { position: absolute; left: var(--cc-pad); top: var(--cc-pad); width: calc(100% - 2 * var(--cc-pad)); height: calc(100% - 2 * var(--cc-pad)); display: block; overflow: visible; }
+.cc-example-patch { width: 100%; height: clamp(84px, 13vh, 120px); }
+.cc-example-patch .cc-patch { display: block; width: 100%; height: 100%; }
+
+.cc-bush-leaf { fill: #64d477; stroke: #1a1a2e; stroke-width: 3; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.cc-bush-shade { fill: #3fae5c; opacity: 0.55; }
+.cc-critter { transform-box: fill-box; transform-origin: 50% 50%; }
+.cc-shake-in-place .cc-critter-set { animation: cc-shake-in-place 0.65s ease-in-out; transform-box: fill-box; transform-origin: 50% 50%; }
+@keyframes cc-shake-in-place { 0%, 100% { transform: translateY(2px); } 20% { transform: translate(-1px, 2px) rotate(-2deg); } 40% { transform: translate(1px, 2px) rotate(2deg); } 60% { transform: translate(-1px, 2px) rotate(-1.5deg); } 80% { transform: translate(1px, 2px) rotate(1.5deg); } }
+
+.cc-tray {
+  width: min(560px, 100%); display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: clamp(4px, 1vw, 9px);
+  padding: 5px 8px; background: rgba(255, 255, 255, 0.9);
+  border: 3px solid #1a1a2e; border-radius: 16px; box-shadow: 0 4px 0 #1a1a2e;
+}
+.cc-tray-slot {
+  position: relative; aspect-ratio: 1; min-width: 0; background: #d8e6d2; border: 2px dashed #7c977a; border-radius: 9px;
+  display: grid; place-items: center; overflow: hidden;
+}
+.cc-tray-slot.cc-filled { background: #fff4d6; border-style: solid; border-color: #1a1a2e; }
+.cc-tray-slot.cc-filled { cursor: pointer; padding: 0; }
+.cc-tray-slot.cc-filled:focus-visible { outline: 4px solid #ffd93d; outline-offset: 3px; }
+.cc-slot-popup { position: fixed; z-index: 60; width: clamp(130px, 22vw, 165px); padding: 7px; text-align: center; background: #fff; border: 3px solid #1a1a2e; border-radius: 14px; box-shadow: 0 5px 0 #1a1a2e; color: #1a1a2e; pointer-events: none; }
+.cc-slot-popup[hidden] { display: none; }
+.cc-slot-popup .cc-creature { width: 68px; height: 68px; }
+.cc-slot-popup b, .cc-slot-popup span { display: block; font-size: 12px; }
+
+.cc-creature { width: clamp(86px, 15vw, 128px); height: clamp(86px, 15vw, 128px); display: block; margin: auto; }
+.cc-creature-small { width: 100%; height: 100%; }
+
+.cc-catch-layer { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: auto; }
+.cc-reveal-panel { position: relative; display: grid; grid-template-rows: auto 1fr auto; justify-items: center; gap: 2px; width: min(300px, calc(100% - 32px)); min-height: clamp(390px, 56vh, 440px); padding: 20px 14px 40px; background: #fff; color: #1a1a2e; border: 4px solid #1a1a2e; border-radius: 20px; box-shadow: 0 7px 0 #1a1a2e; }
+.cc-thrown-ball { position: absolute; right: 18px; top: 28px; width: clamp(52px, 10vw, 66px); transform: none; animation: cc-wiggle 0.25s 0.36s ease-in-out 3; }
+.cc-ball { display: block; width: 100%; filter: drop-shadow(0 6px 0 rgba(26, 26, 46, 0.35)); }
+.cc-starburst { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; opacity: 0; color: #ffd93d; font-size: 120px; text-shadow: 4px 4px 0 #1a1a2e; }
+.cc-reveal-card {
+  opacity: 0; width: 152px; padding: 9px; text-align: center; color: #1a1a2e;
+  background: #fff; border: 4px solid #1a1a2e; border-radius: 18px; box-shadow: 0 7px 0 #1a1a2e;
+}
+.cc-reveal-message { margin: 0; text-align: center; }
+.cc-reveal-message b { display: block; font-family: var(--mg-font-shout); font-size: 31px; color: #2f9e59; }
+.cc-reveal-message span { display: block; font-weight: 700; }
+.cc-continue { min-height: 44px; margin-top: 5px; padding: 7px 15px; color: #1a1a2e; background: #ffd93d; border: 3px solid #1a1a2e; border-radius: 999px; font-family: var(--mg-font-shout); font-size: 20px; cursor: pointer; }
+.cc-reveal-card { align-self: center; }
+.cc-feedback-panel { position: absolute; left: 50%; top: 50%; z-index: 4; width: fit-content; max-width: calc(100% - 32px); min-height: clamp(104px, 10vw, 144px); transform: translate(-50%, -50%); display: grid; align-content: center; gap: clamp(5px, .5vw, 8px); padding: clamp(16px, 2.5vw, 28px) clamp(18px, 3vw, 32px); text-align: center; background: #fff; color: #1a1a2e; border: 4px solid #1a1a2e; border-radius: 20px; box-shadow: 0 8px 0 #1a1a2e; animation: cc-feedback-in .24s ease-out; pointer-events: auto; }
+.cc-game .mg-toast-warm { animation: cc-warm-toast 2.109375s ease-out forwards; }
+
+/* Warm feedback keeps movement and its stationary reading dwell as separate
+   phases. The 0-20% and 80-100% movement phases total 843.75ms; the 20-80%
+   stationary phase lasts 1,265.625ms. */
+@keyframes cc-warm-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+.cc-wrong-panel span { font-size: clamp(15px, 1.8vw, 24px); line-height: 1.15; }
+.cc-wrong-panel-hint { width: min(560px, calc(100% - 32px)); max-height: calc(100% - 32px); gap: clamp(10px, 1.8vh, 16px); padding: clamp(12px, 2vh, 20px) clamp(12px, 2vw, 24px); }
+.cc-wrong-panel-hint > span { margin-block: clamp(10px, 1.8vh, 16px); font-size: clamp(20px, 4vw, 28px); font-weight: 800; }
+.cc-wrong-hint { display: grid; gap: clamp(16px, 2.4vh, 24px); width: min(480px, 100%); min-width: 0; margin: 0 auto; }
+.cc-wrong-hint-picture { height: clamp(96px, 20vh, 150px); min-height: 0; padding: 4px 8px; overflow: hidden; background: #f5f3ff; border: 3px solid #1a1a2e; border-radius: 14px; }
+.cc-wrong-hint-picture .cc-patch { display: block; width: 100%; height: 100%; }
+.cc-hint-bush { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cc-hint-pop-in 260ms var(--cc-hint-delay) cubic-bezier(.2, .85, .3, 1.3) forwards; }
+.cc-hint-critter { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cc-hint-pop-in 200ms var(--cc-hint-delay) cubic-bezier(.2, .85, .3, 1.3) forwards; }
+.cc-example-bush { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cc-hint-pop-in 260ms var(--cc-hint-delay) cubic-bezier(.2, .85, .3, 1.3) forwards; }
+.cc-example-critter { opacity: 0; transform-box: fill-box; transform-origin: center; animation: cc-hint-pop-in 220ms var(--cc-hint-delay) cubic-bezier(.2, .85, .3, 1.3) forwards; }
+.cc-wrong-hint-labels { display: flex; justify-content: center; gap: 6px; flex-wrap: wrap; }
+.cc-wrong-hint-labels :is(b, span) { opacity: 0; padding: 3px 9px; border: 2px solid #1a1a2e; border-radius: 999px; font-size: clamp(13px, 1.6vw, 18px); line-height: 1.1; animation: cc-hint-label-in 180ms 400ms ease-out forwards; }
+.cc-wrong-hint-labels b { background: #dff7e6; }
+.cc-wrong-hint-labels span { background: #fff4d6; font-weight: 700; animation-delay: var(--cc-hint-critters-at); }
+.cc-try-again { justify-self: center; min-height: 44px; margin-top: 4px; padding: 7px 18px; color: #1a1a2e; background: #ffd93d; border: 3px solid #1a1a2e; border-radius: 999px; box-shadow: 0 4px 0 #1a1a2e; font-family: var(--mg-font-shout); font-size: clamp(18px, 2.2vw, 27px); cursor: pointer; }
+.cc-try-again:active { transform: translateY(3px); box-shadow: 0 1px 0 #1a1a2e; }
+.cc-try-again:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+.cc-reveal-card b { display: block; font-family: var(--mg-font-shout); font-size: 27px; letter-spacing: 1px; }
+.cc-reveal-card span { display: inline-block; margin-top: 2px; padding: 2px 9px; border-radius: 999px; background: #ffd93d; font-weight: 700; text-transform: capitalize; }
+.cc-revealed .cc-thrown-ball { animation: cc-wiggle 0.25s ease-in-out 3; }
+.cc-revealed .cc-starburst { animation: cc-burst 0.75s ease-out forwards; }
+.cc-revealed .cc-reveal-card { animation: cc-reveal 0.34s ease-out forwards; }
+.cc-stowed .cc-reveal-card { animation: cc-stow 0.3s ease-in forwards; }
+
+.cc-end-collection { margin: 12px 0; }
+.cc-end-collection h2 { font-family: var(--mg-font-shout); font-size: 28px; letter-spacing: 1px; }
+.cc-collection-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
+.cc-collection-grid > div { min-width: 0; padding: 4px 2px; background: #f5f3ff; border: 2px solid #1a1a2e; border-radius: 11px; }
+.cc-collection-grid .cc-creature { width: 54px; height: 54px; max-width: 100%; }
+.cc-collection-grid b { display: block; overflow: hidden; font-size: 11px; text-overflow: ellipsis; }
+.cc-collection-grid span { display: block; font-size: 9px; text-transform: capitalize; color: #526057; }
+
+@keyframes cc-wiggle {
+  0%, 100% { transform: rotate(0); }
+  35% { transform: rotate(-14deg); }
+  70% { transform: rotate(14deg); }
+}
+@keyframes cc-burst { 0% { opacity: 0; transform: scale(0.2) rotate(0); } 45% { opacity: 1; } 100% { opacity: 0; transform: scale(1.5) rotate(50deg); } }
+@keyframes cc-reveal { from { opacity: 0; } to { opacity: 1; } }
+@keyframes cc-stow { to { opacity: 0; transform: translateY(48vh) scale(0.28); } }
+@keyframes cc-feedback-in { from { opacity: 0; transform: translate(-50%, -42%) scale(.9); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes cc-hint-pop-in { from { opacity: 0; transform: scale(.2); } to { opacity: 1; transform: scale(1); } }
+@keyframes cc-hint-label-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+@media (max-height: 690px) {
+  .mg-stage { gap: 6px; padding-top: 6px; }
+  .mg-prompt { padding: 8px 12px; }
+  .mg-tile { min-height: 105px; }
+}
+
+
+@media (max-width: 520px) {
+  .cc-collection-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+@media (max-width: 380px) {
+  .cc-game .mg-tiles[data-count="3"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cc-game .mg-tiles[data-count="3"] .mg-tile:last-child { grid-column: 1 / -1; }
+  .cc-game .mg-tiles { grid-auto-rows: minmax(64px, 1fr); }
+}
+
+@media (max-width: 380px) {
+  .cc-game .mg-screen { padding: 8px; }
+  .cc-game .mg-screen .mg-card { max-height: calc(100% - 16px); padding: 12px 8px; overflow: hidden; }
+  .cc-end-collection { margin: 6px 0; }
+  .cc-end-collection h2 { font-size: 24px; }
+  .cc-collection-grid { gap: 3px; margin-top: 4px; }
+  .cc-collection-grid > div { padding: 2px 1px; }
+  .cc-collection-grid .cc-creature { width: 42px; height: 42px; }
+  .cc-collection-grid b { overflow: visible; white-space: normal; overflow-wrap: anywhere; text-overflow: clip; font-size: 9px; line-height: 1.05; min-height: 19px; }
+  .cc-collection-grid span { font-size: 8px; }
+  .cc-game .mg-stats { gap: 4px; margin: 8px 0; }
+  .cc-game .mg-stat { min-width: 74px; padding: 5px 6px; }
+  .cc-game .mg-stat b { font-size: 24px; }
+}
+
+@media (orientation: landscape) and (min-width: 600px) and (max-height: 500px) {
+  /* Short landscape start screen: use the available width to keep the
+     worked example and the full-size start action visible together. */
+  .cc-game > .mg-screen:first-child { padding: 8px; }
+  .cc-game > .mg-screen:first-child .mg-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    grid-template-rows: auto auto auto auto auto;
+    column-gap: clamp(12px, 2vw, 24px);
+    row-gap: 2px;
+    width: min(900px, 100%);
+    max-height: calc(100% - 16px);
+    overflow: hidden;
+    padding: 12px 18px;
+    text-align: center;
+  }
+  .cc-game > .mg-screen:first-child .mg-emoji { grid-column: 1; grid-row: 1; font-size: 44px; }
+  .cc-game > .mg-screen:first-child .mg-title { grid-column: 1; grid-row: 2; margin-top: 2px; font-size: clamp(32px, 5vw, 46px); }
+  .cc-game > .mg-screen:first-child .mg-subtitle { grid-column: 1; grid-row: 3; min-width: 0; font-size: clamp(16px, 2vw, 20px); }
+  .cc-game > .mg-screen:first-child .mg-tag { grid-column: 1; grid-row: 4; justify-self: center; margin-top: 4px; }
+  .cc-game > .mg-screen:first-child .mg-example { grid-column: 2; grid-row: 1 / span 4; align-self: center; min-width: 0; margin: 0; padding: 8px 10px; }
+  .cc-game > .mg-screen:first-child .mg-big-btn { grid-column: 2; grid-row: 5; justify-self: center; align-self: start; min-height: 64px; margin-top: 6px; }
+  .cc-game .mg-stage { height: calc(100vh - 74px); padding-top: 6px; }
+  .cc-game .mg-prompt { padding: 8px 12px; font-size: clamp(18px, 3vw, 22px); }
+  .cc-wrong-panel-hint > span { font-size: clamp(18px, 3vw, 22px); }
+  .cc-game .cc-prompt-instruction { margin-top: 3px; }
+  .cc-game .mg-visual { margin-top: 8px; margin-bottom: 8px; }
+  .cc-game .cc-tray { width: min(420px, 100%); padding: 3px 6px; }
+  .cc-game .mg-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); grid-auto-rows: minmax(58px, 1fr); }
+  .cc-game .mg-tile { min-height: 58px; }
+  .cc-reveal-panel { min-height: 0; height: min(366px, calc(100vh - 24px)); padding: 12px 14px 18px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-game * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .cc-game .cc-wrong-panel { animation: none !important; opacity: 1; transform: translate(-50%, -50%) !important; }
+  .cc-game :is(.cc-hint-bush, .cc-hint-critter, .cc-example-bush, .cc-example-critter, .cc-wrong-hint-labels b, .cc-wrong-hint-labels span) { animation-delay: 0s !important; opacity: 1 !important; transform: none !important; }
+  .cc-game .cc-reveal-card { animation: none !important; opacity: 1; }
+  .cc-game .cc-thrown-ball, .cc-game .cc-shake-in-place .cc-critter-set { animation: none !important; transform: translateY(2px) !important; }
+  .cc-game .cc-starburst, .cc-game .mg-confetti, .cc-game .mg-fly { display: none !important; }
+  .cc-game .mg-toast { animation: none !important; opacity: 1; transform: translate(-50%, -50%) !important; }
+}</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>

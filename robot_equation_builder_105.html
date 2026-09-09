@@ -1,0 +1,2632 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+function tone({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.18 }) {
+  if (!ctx) return;
+  const t0 = ctx.currentTime + at;
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+  g.gain.setValueAtTime(gain, t0);
+  g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+const SOUNDS = {
+  // ascending arpeggio, Eric's canonical "correct"
+  correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09 })),
+  // soft descending slide, kept gentle on purpose
+  wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+  // four-note fanfare for the end screen
+  complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16 })),
+  // streak tier hit
+  tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle" })),
+  tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+  throw: () => tone({ freq: 720, to: 260, type: "sawtooth", dur: 0.25, gain: 0.06 }),
+  tick: () => tone({ freq: 440, dur: 0.04, gain: 0.05, type: "triangle" }),
+  click: () => [880, 1320].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.07, gain: 0.07 }))
+};
+const HINT_SCALE = [0, 2, 4, 7, 9, 12];
+function playHint(kind, step) {
+  if (!ctx) return;
+  if (kind === "group") {
+    tone({ freq: 196 * 2 ** (step * 2 / 12), type: "triangle", dur: 0.18, gain: 0.12 });
+    return;
+  }
+  const freq = 262 * 2 ** (HINT_SCALE[Math.min(step, HINT_SCALE.length - 1)] / 12);
+  tone({ freq, type: "triangle", dur: 0.14, gain: 0.055 });
+}
+function play(name) {
+  const fn = SOUNDS[name];
+  if (fn && ctx) fn();
+}
+const CONFETTI_COLORS = ["#ffd93d", "#2ed573", "#6bcbff", "#b28dff", "#ff8fab", "#ff9f43"];
+function confetti(root, count = 24) {
+  for (let i = 0; i < count; i += 1) {
+    const p = document.createElement("i");
+    p.className = "mg-confetti";
+    p.style.left = `${Math.random() * 100}%`;
+    p.style.background = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
+    p.style.animationDelay = `${Math.random() * 0.4}s`;
+    p.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    p.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.appendChild(p);
+    p.addEventListener("animationend", () => p.remove());
+  }
+}
+function flyEmoji(root, from, emoji = "⭐", count = 5) {
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const e = document.createElement("span");
+    e.className = "mg-fly";
+    e.textContent = emoji;
+    e.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    e.style.top = `${r.top - base.top + r.height / 2}px`;
+    e.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    e.style.animationDelay = `${i * 0.05}s`;
+    root.appendChild(e);
+    e.addEventListener("animationend", () => e.remove());
+  }
+}
+function shake(el2) {
+  el2.classList.remove("mg-shake");
+  void el2.offsetWidth;
+  el2.classList.add("mg-shake");
+  el2.addEventListener("animationend", () => el2.classList.remove("mg-shake"), { once: true });
+}
+function toast(root, text, kind = "good", { removeAfterMs } = {}) {
+  const t = document.createElement("div");
+  t.className = `mg-toast mg-toast-${kind}`;
+  t.textContent = text;
+  root.appendChild(t);
+  let removalTimer = null;
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
+    if (removalTimer != null) clearTimeout(removalTimer);
+    removalTimer = null;
+    t.remove();
+  };
+  t.addEventListener("animationend", remove, { once: true });
+  if (Number.isFinite(removeAfterMs) && removeAfterMs >= 0) {
+    removalTimer = setTimeout(remove, removeAfterMs);
+  }
+}
+const PRAISE = ["NICE!", "YES!", "GOT IT!", "NO CAP!", "GOATED!", "W!", "SLAY!", "BOOM!"];
+const GROWTH = [
+  "Almost! Try again!",
+  "Great effort! Keep going!",
+  "Mistakes help your brain grow!",
+  "Look again. You got this!",
+  "So close! One more try!"
+];
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+const END_TITLE = "You're a Mathematician!";
+const TRY_AGAIN = "TRY AGAIN";
+function checkGenerator(game2, { count = 500, seed = 1, choiceCounts = [3, 4] } = {}) {
+  const rng = createRng(seed);
+  const errors = [];
+  const seenParams = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i += 1) {
+    let params;
+    let problem;
+    try {
+      params = game2.generate(rng);
+      problem = game2.build(params, rng);
+    } catch (e) {
+      errors.push(`#${i}: threw ${e.message}`);
+      continue;
+    }
+    const tag = `#${i} ${JSON.stringify(params)}`;
+    if (JSON.stringify(JSON.parse(JSON.stringify(params))) !== JSON.stringify(params)) errors.push(`${tag}: params must be JSON-safe`);
+    if (!problem || typeof problem !== "object") {
+      errors.push(`${tag}: build returned nothing`);
+      continue;
+    }
+    if (JSON.stringify(problem.params) !== JSON.stringify(params)) errors.push(`${tag}: problem.params must equal the input params`);
+    const validateStep = (step, label, requireValue = false) => {
+      if (typeof step?.prompt !== "string" || !step.prompt.trim()) errors.push(`${tag}: ${label} prompt must be non-empty text`);
+      const choices = step?.choices;
+      if (!Array.isArray(choices) || !choiceCounts.includes(choices.length)) errors.push(`${tag}: ${label} expected ${choiceCounts.join(" or ")} choices, got ${choices && choices.length}`);
+      else {
+        const ids = choices.map((c) => c && c.id);
+        const labels = choices.map((c) => c && String(c.label));
+        if (new Set(ids).size !== ids.length) errors.push(`${tag}: ${label} choice ids must be unique`);
+        if (new Set(labels).size !== labels.length) errors.push(`${tag}: ${label} choice labels must be unique (${labels.join(" | ")})`);
+        if (!ids.includes(step.answer)) errors.push(`${tag}: ${label} answer ${step.answer} is not a choice id`);
+        if (choices.some((c) => !c || c.label == null)) errors.push(`${tag}: ${label} every choice needs a label`);
+        if (requireValue && choices.some((c) => typeof c?.value !== "number" || !Number.isFinite(c.value))) errors.push(`${tag}: ${label} every choice needs a finite numeric value`);
+      }
+    };
+    if (problem.steps) {
+      if (!Array.isArray(problem.steps) || problem.steps.length === 0) errors.push(`${tag}: steps must be a non-empty array`);
+      else {
+        const keys = problem.steps.map((step) => step && step.key);
+        if (keys.some((key) => typeof key !== "string" || !key)) errors.push(`${tag}: every step needs a key`);
+        if (new Set(keys).size !== keys.length) errors.push(`${tag}: step keys must be unique`);
+        problem.steps.forEach((step, index) => validateStep(step, `step ${index + 1}`, true));
+      }
+    } else {
+      validateStep(problem, "problem");
+    }
+    if (game2.ranges) {
+      for (const [k, [min, max]] of Object.entries(game2.ranges)) {
+        const v = params[k];
+        if (typeof v !== "number" || v < min || v > max) errors.push(`${tag}: ${k}=${v} outside [${min}, ${max}]`);
+      }
+    }
+    if (typeof game2.check === "function") {
+      for (const msg of game2.check(problem) || []) errors.push(`${tag}: ${msg}`);
+    }
+    const again = game2.build(JSON.parse(JSON.stringify(params)), createRng(seed + i));
+    const answerLabels = (p) => (p.steps || [p]).map((step) => step.choices.find((c) => c.id === step.answer)?.label);
+    if (JSON.stringify(answerLabels(again)) !== JSON.stringify(answerLabels(problem))) errors.push(`${tag}: rebuilding from params changed the correct answer`);
+    seenParams.add(JSON.stringify(params));
+  }
+  return { count, distinct: seenParams.size, errors };
+}
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const DEFAULTS = {
+  basePoints: 10,
+  streakBonus: true,
+  hotStreak: 5,
+  questions: 12,
+  // null = endless
+  retryDelayMs: 450,
+  nextDelayMs: 900,
+  tierToastDurationMs: null,
+  autoSaveInterval: 3,
+  startButton: "LET'S GO!",
+  playAgain: "PLAY AGAIN"
+};
+function startSession(root, game2, options = {}) {
+  const opt = { ...DEFAULTS, ...options };
+  if (!opt.gameFile) throw new Error("startSession: options.gameFile is required (must equal the output filename)");
+  const rng = createRng(opt.seed);
+  let generateRound = game2.createSessionGenerator?.(rng, opt.seed);
+  const tracker = connectTracker({ gameFile: opt.gameFile, interval: opt.autoSaveInterval });
+  const meta = game2.meta;
+  const state = { score: 0, streak: 0, bestStreak: 0, questionsAnswered: 0, problem: null, isReplay: false, canAnswer: false, firstTry: true, wrongAttempts: 0, stepIndex: 0 };
+  const sync = () => tracker.publish(state);
+  if (opt.theme) for (const [k, v] of Object.entries(opt.theme)) root.style.setProperty(`--mg-${k}`, v);
+  root.classList.add("mg-root");
+  if (game2.layout === "standard") root.classList.add("mg-shell-standard");
+  if (opt.rootClass) root.classList.add(opt.rootClass);
+  root.replaceChildren();
+  const fx = el("div", "mg-fx");
+  const start = el("div", "mg-screen");
+  const hud = el("div", "mg-hud");
+  const progress = el("div", "mg-progress");
+  const stage = el("div", "mg-stage");
+  const end = el("div", "mg-screen mg-hidden");
+  root.append(start, hud, progress, stage, end, fx);
+  const startCard = el("div", "mg-card");
+  startCard.append(el("div", "mg-emoji", meta.emoji), el("h1", "mg-title", meta.title), el("p", "mg-subtitle", meta.subtitle));
+  if (meta.tag) startCard.append(el("p", "mg-tag", meta.tag));
+  const example = el("div", "mg-example");
+  if (game2.renderExample) game2.renderExample(example, { rng: createRng(7) });
+  else example.remove();
+  const startBtn = el("button", "mg-big-btn", opt.startButton);
+  startCard.append(example, startBtn);
+  start.append(startCard);
+  const hudTitle = el("div", "mg-hud-title", meta.title);
+  const chips = el("div", "mg-chips");
+  const scoreChip = el("div", "mg-chip mg-chip-score", "Score 0");
+  const streakChip = el("div", "mg-chip mg-chip-streak", "0🔥");
+  chips.append(scoreChip, streakChip);
+  hud.append(hudTitle, chips);
+  const view = hudTitle.ownerDocument?.defaultView;
+  const overflows = () => hudTitle.scrollWidth > hudTitle.clientWidth + 0.5;
+  function fitHudTitle() {
+    if (typeof view?.getComputedStyle !== "function") return;
+    const style = view.getComputedStyle(hudTitle);
+    const max = parseFloat(style.getPropertyValue("--mg-hud-title-max")) || 40;
+    const min = parseFloat(style.getPropertyValue("--mg-hud-title-min")) || 15;
+    delete hudTitle.dataset.hudTitleLines;
+    let size = max;
+    hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+    if (overflows()) {
+      const room = hudTitle.clientWidth / hudTitle.scrollWidth;
+      size = Math.max(min, Math.min(max, Math.floor(size * room * 10) / 10));
+      hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      while (size > min && overflows()) {
+        size = Math.max(min, size - 0.5);
+        hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      }
+      if (overflows()) hudTitle.dataset.hudTitleLines = "2";
+    }
+  }
+  let fittedWidth = -1;
+  const refitHudTitle = () => {
+    const width = hud.clientWidth;
+    if (width === fittedWidth) return;
+    fittedWidth = width;
+    fitHudTitle();
+  };
+  refitHudTitle();
+  if (typeof view?.ResizeObserver === "function") new view.ResizeObserver(refitHudTitle).observe(hud);
+  else view?.addEventListener?.("resize", refitHudTitle);
+  document.fonts?.ready?.then(fitHudTitle);
+  const bar = el("i");
+  progress.append(bar);
+  if (!opt.questions) progress.classList.add("mg-hidden");
+  const prompt = el("div", "mg-prompt");
+  const visual = el("div", "mg-visual");
+  const tiles = el("div", "mg-tiles");
+  if (game2.keyboardAnswersFirst) stage.append(prompt, tiles, visual);
+  else stage.append(prompt, visual, tiles);
+  const renderHud = () => {
+    scoreChip.textContent = `Score ${state.score}`;
+    streakChip.textContent = `${state.streak}🔥`;
+    streakChip.classList.toggle("mg-hot", state.streak >= opt.hotStreak);
+    fitHudTitle();
+    if (opt.questions) bar.style.width = `${Math.min(100, state.questionsAnswered / opt.questions * 100)}%`;
+    sync();
+  };
+  function nextProblem() {
+    const missed = generateRound ? null : tracker.getMissedProblem();
+    state.isReplay = Boolean(missed);
+    const params = missed || (generateRound ? generateRound() : game2.generate(rng));
+    state.problem = game2.build(params, rng);
+    state.firstTry = true;
+    state.wrongAttempts = 0;
+    state.stepIndex = 0;
+    visual.replaceChildren();
+    if (game2.renderProblem) game2.renderProblem(visual, state.problem);
+    renderStep();
+  }
+  function activeStep() {
+    return state.problem.steps ? state.problem.steps[state.stepIndex] : state.problem;
+  }
+  function renderStep() {
+    const p = state.problem;
+    const step = activeStep();
+    if (game2.renderPrompt) game2.renderPrompt(prompt, p, step, state.stepIndex);
+    else prompt.textContent = step.prompt;
+    tiles.replaceChildren();
+    tiles.dataset.count = String(step.choices.length);
+    for (const c of step.choices) {
+      const b = el("button", "mg-tile");
+      if (game2.renderChoice) game2.renderChoice(b, c, p, step, state.stepIndex);
+      else b.textContent = String(c.label);
+      b.addEventListener("click", () => answer(c, b));
+      tiles.append(b);
+    }
+    state.canAnswer = true;
+  }
+  function answer(choice, tile) {
+    if (!state.canAnswer) return;
+    state.canAnswer = false;
+    const p = state.problem;
+    const step = activeStep();
+    const correct = choice.id === step.answer;
+    tracker.recordQuestion({
+      question: step.prompt,
+      params: p.params,
+      answer: String(choice.label),
+      correctAnswer: String(step.choices.find((c) => c.id === step.answer).label),
+      correct,
+      firstTry: state.firstTry,
+      replay: state.isReplay
+    });
+    if (!correct) onWrong(tile, step);
+    else if (p.steps && state.stepIndex < p.steps.length - 1) onStepCorrect(tile, step);
+    else onCorrect(tile);
+  }
+  function onStepCorrect(tile, step) {
+    play("correct");
+    tile.classList.add("mg-right");
+    for (const b of tiles.children) b.disabled = true;
+    const hook = game2.onStepCorrect?.({ state, problem: state.problem, step, tile, fx });
+    setTimeout(() => {
+      state.stepIndex += 1;
+      state.wrongAttempts = 0;
+      renderStep();
+    }, hook?.delayMs ?? 450);
+  }
+  function onCorrect(tile) {
+    const p = state.problem;
+    play("correct");
+    tile.classList.add("mg-right");
+    for (const b of tiles.children) b.disabled = true;
+    if (state.isReplay || generateRound) tracker.markCorrected(p.params);
+    state.streak += 1;
+    state.bestStreak = Math.max(state.bestStreak, state.streak);
+    state.score += opt.basePoints + (opt.streakBonus ? state.streak : 0);
+    state.questionsAnswered += 1;
+    renderHud();
+    tracker.checkAutoSave();
+    toast(fx, rng.pick(PRAISE));
+    flyEmoji(fx, tile, meta.emoji, 4);
+    const tier = STREAK_TIERS.find((t) => t.at === state.streak);
+    if (tier) {
+      play("tier");
+      confetti(fx, tier.burst);
+      setTimeout(() => toast(fx, tier.word, "tier", { removeAfterMs: opt.tierToastDurationMs }), 250);
+    }
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
+      if (opt.questions && state.questionsAnswered >= opt.questions) showEnd();
+      else nextProblem();
+    };
+    const hook = game2.onCorrect ? game2.onCorrect({ state, tile, fx, continue: advance, tier }) : null;
+    if (hook?.continueElement) {
+      hook.continueElement.addEventListener("pointerdown", advance, { once: true });
+      hook.continueElement.addEventListener("click", advance, { once: true });
+    }
+    setTimeout(advance, hook?.delayMs ?? opt.nextDelayMs + (tier ? 500 : 0));
+  }
+  function onWrong(tile, step = activeStep()) {
+    play("wrong");
+    tile.classList.add("mg-wrong");
+    state.streak = 0;
+    state.firstTry = false;
+    state.wrongAttempts += 1;
+    tracker.markMissed(state.problem.params);
+    renderHud();
+    const wrongEffect = game2.onWrong ? game2.onWrong({ state, tile, fx, step }) : null;
+    if (wrongEffect?.showToast !== false) toast(fx, `${TRY_AGAIN}  ${rng.pick(GROWTH)}`, "warm");
+    if (wrongEffect?.shakeStage !== false) shake(stage);
+    const retry = () => {
+      tile.classList.remove("mg-wrong");
+      state.canAnswer = true;
+      wrongEffect?.onRetry?.();
+      tile.focus();
+    };
+    if (wrongEffect?.retryElement) {
+      wrongEffect.retryElement.addEventListener("click", retry, { once: true });
+      wrongEffect.retryElement.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          retry();
+        }
+      });
+    } else {
+      setTimeout(retry, opt.retryDelayMs);
+    }
+  }
+  function showEnd() {
+    play("complete");
+    fx.replaceChildren();
+    end.replaceChildren();
+    const card = el("div", "mg-card");
+    card.append(el("div", "mg-emoji", "🎓"), el("h1", "mg-title", END_TITLE));
+    const stats = el("div", "mg-stats");
+    for (const [label, v] of [["Score", state.score], ["Best Streak", state.bestStreak], ["Solved", state.questionsAnswered]]) {
+      const s = el("div", "mg-stat", label);
+      s.prepend(el("b", null, String(v)));
+      stats.append(s);
+    }
+    if (game2.renderEnd) game2.renderEnd(card, state);
+    const again = el("button", "mg-big-btn", opt.playAgain);
+    again.addEventListener("click", () => {
+      play("tap");
+      end.classList.add("mg-hidden");
+      reset();
+      nextProblem();
+    });
+    card.append(stats, again);
+    end.append(card);
+    end.classList.remove("mg-hidden");
+  }
+  function reset() {
+    generateRound = game2.createSessionGenerator?.(rng, opt.seed);
+    Object.assign(state, { score: 0, streak: 0, bestStreak: 0, questionsAnswered: 0 });
+    renderHud();
+  }
+  startBtn.addEventListener("click", () => {
+    initAudio();
+    play("tap");
+    start.classList.add("mg-hidden");
+    renderHud();
+    nextProblem();
+  });
+  const onKey = (e) => {
+    if (e.ctrlKey && e.key.toLowerCase() === "t") {
+      e.preventDefault();
+      const r = checkGenerator(game2, { count: 500 });
+      console.log(`[${opt.gameFile}] generator check: ${r.count} problems, ${r.distinct} distinct, ${r.errors.length} errors`, r.errors.slice(0, 20));
+    }
+  };
+  window.addEventListener("keydown", onKey);
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  renderHud();
+  return {
+    state,
+    tracker,
+    destroy() {
+      window.removeEventListener("keydown", onKey);
+      game2.onDestroy?.({ state, root, fx });
+      root.replaceChildren();
+      root.classList.remove("mg-root");
+      root.classList.remove("mg-shell-standard");
+      if (opt.rootClass) root.classList.remove(opt.rootClass);
+    }
+  };
+}
+function makeChoices(rng, { correct, distractors, count = 4, key = (c) => String(c.label) }) {
+  if (!correct || correct.id == null) throw new Error("makeChoices: correct needs an id");
+  const seen = /* @__PURE__ */ new Set([key(correct)]);
+  const picked = [];
+  for (const d of distractors) {
+    const k = key(d);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    picked.push({ ...d, id: d.id ?? `d${picked.length}` });
+    if (picked.length === count - 1) break;
+  }
+  if (picked.length < count - 1) {
+    throw new Error(`makeChoices: needed ${count - 1} distinct distractors, got ${picked.length}`);
+  }
+  const choices = rng.shuffle([correct, ...picked]);
+  return { choices, answer: correct.id };
+}
+const UNKNOWN_MARK = "?";
+const escapeHtml = (value) => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function expressionSlot({ key, label, value = "", unknown = false, mark = false, className = "", raw = false }) {
+  const classes = ["mg-expression-slot"];
+  if (unknown) classes.push("mg-expression-slot--unknown");
+  else classes.push("mg-expression-slot--filled");
+  if (className) classes.push(className);
+  const shown = value || (unknown ? mark ? UNKNOWN_MARK : "" : "");
+  const body = raw && shown === value ? shown : escapeHtml(shown);
+  return `<span class="${classes.join(" ")}" data-slot="${escapeHtml(key)}"><b class="mg-expression-label mg-kid-label">${escapeHtml(label)}</b><strong class="mg-expression-value">${body}</strong></span>`;
+}
+function fillExpressionSlot(root, key, value, { raw = false } = {}) {
+  const slot = root?.querySelector?.(`[data-slot="${key}"]`);
+  if (!slot) return null;
+  const line = slot.querySelector(".mg-expression-value");
+  if (line) {
+    if (raw) line.innerHTML = value;
+    else line.textContent = value;
+  }
+  slot.classList.remove("mg-expression-slot--unknown");
+  slot.classList.add("mg-expression-slot--filled");
+  return slot;
+}
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+function mountGame(element, game2, options = {}) {
+  return startSession(element, game2, { questions: game2.meta.questions ?? void 0, ...options });
+}
+const ranges = { groups: [2, 10], each: [2, 10], total: [6, 60] };
+const UNKNOWN_KINDS = ["total", "groups", "each"];
+const LEGACY_CONTEXTS = [
+  { id: "nature-books", container: "piles", singular: "pile", object: "books", subject: "books about nature", art: "book" },
+  { id: "sports-books", container: "piles", singular: "pile", object: "books", subject: "books about sports", art: "book" },
+  { id: "seashells", container: "piles", singular: "pile", object: "seashells", subject: "seashells", art: "shell" }
+];
+const REPLAY_CONTEXTS = [
+  { id: "tanks-fish", unknownKind: "total", container: "tanks", singular: "tank", object: "fish", objectSingular: "fish", art: "fish", perGroup: "in each tank" },
+  { id: "students-books", unknownKind: "total", container: "students", singular: "student", object: "books", objectSingular: "book", art: "book", perGroup: "for each student" },
+  { id: "baskets-apples", unknownKind: "groups", container: "baskets", singular: "basket", object: "apples", objectSingular: "apple", art: "apple", perGroup: "in each basket" },
+  { id: "tables-chairs", unknownKind: "groups", container: "tables", singular: "table", object: "chairs", objectSingular: "chair", art: "chair", perGroup: "around each table" },
+  { id: "bins-books", unknownKind: "each", container: "bins", singular: "bin", object: "books", objectSingular: "book", art: "book", perGroup: "in each bin" },
+  { id: "teams-students", unknownKind: "each", container: "teams", singular: "team", object: "students", objectSingular: "student", art: "student", perGroup: "on each team" },
+  { id: "vases-flowers", unknownKind: "total", container: "vases", singular: "vase", object: "flowers", objectSingular: "flower", art: "flower", perGroup: "in each vase" },
+  { id: "children-balloons", unknownKind: "total", container: "children", singular: "child", object: "balloons", objectSingular: "balloon", art: "balloon", perGroup: "for each child" },
+  { id: "bags-marbles", unknownKind: "groups", container: "bags", singular: "bag", object: "marbles", objectSingular: "marble", art: "marble", perGroup: "in each bag" },
+  { id: "boats-passengers", unknownKind: "groups", container: "boats", singular: "boat", object: "passengers", objectSingular: "passenger", art: "student", perGroup: "on each boat" },
+  { id: "jars-coins", unknownKind: "each", container: "jars", singular: "jar", object: "coins", objectSingular: "coin", art: "coin", perGroup: "in each jar" },
+  { id: "envelopes-tickets", unknownKind: "each", container: "envelopes", singular: "envelope", object: "tickets", objectSingular: "ticket", art: "ticket", perGroup: "in each envelope" },
+  { id: "bins-nuts", unknownKind: "each", container: "bins", singular: "bin", object: "nuts", objectSingular: "nut", art: "nut", perGroup: "in each bin" }
+];
+const CONTEXTS = [
+  { id: "robots-batteries", unknownKind: "total", container: "robots", singular: "robot", object: "batteries", objectSingular: "battery", art: "battery", perGroup: "for each robot" },
+  { id: "robots-bolts", unknownKind: "total", container: "robots", singular: "robot", object: "bolts", objectSingular: "bolt", art: "bolt", perGroup: "for each robot" },
+  { id: "trays-gears", unknownKind: "groups", container: "trays", singular: "tray", object: "gears", objectSingular: "gear", art: "gear", perGroup: "in each tray" },
+  { id: "crates-helmets", unknownKind: "groups", container: "crates", singular: "crate", object: "helmets", objectSingular: "helmet", art: "helmet", perGroup: "in each crate" },
+  { id: "bins-wheels", unknownKind: "each", container: "bins", singular: "bin", object: "wheels", objectSingular: "wheel", art: "wheel", perGroup: "in each bin" },
+  { id: "boxes-screws", unknownKind: "each", container: "boxes", singular: "box", object: "screws", objectSingular: "screw", art: "screw", perGroup: "in each box" }
+];
+const VARIANTS = {
+  "tanks-fish": { key: "ponds", container: "ponds", singular: "pond", perGroup: "in each pond" },
+  "students-books": { key: "comics", object: "comic books", objectSingular: "comic book" },
+  "baskets-apples": { key: "oranges", object: "oranges", objectSingular: "orange", art: "orange" },
+  "tables-chairs": { key: "classroom", tableSetting: "classroom table" },
+  "bins-books": { key: "balls", object: "balls", objectSingular: "ball", art: "ball" },
+  "teams-students": { key: "players", object: "players", objectSingular: "player" }
+};
+const BASKET_NAMES = ["Mira", "Nora", "Zoe"];
+const FACTS = [];
+for (let groups = ranges.groups[0]; groups <= ranges.groups[1]; groups += 1) {
+  for (let each = ranges.each[0]; each <= ranges.each[1]; each += 1) {
+    const total = groups * each;
+    if (total >= ranges.total[0] && total <= ranges.total[1] && !(groups === 2 && each === 2)) {
+      FACTS.push({ groups, each, total });
+    }
+  }
+}
+function generate(rng, scheduledUnknownKind) {
+  const fact = rng.pick(FACTS);
+  const unknownKind = scheduledUnknownKind ?? rng.pick(UNKNOWN_KINDS);
+  const context = rng.pick(CONTEXTS.filter((item) => item.unknownKind === unknownKind));
+  return {
+    groups: fact.groups,
+    each: fact.each,
+    total: fact.total,
+    unknownKind,
+    context: context.id,
+    ...context.id === "trays-gears" ? { name: rng.pick(BASKET_NAMES) } : {},
+    ...context.id === "robots-batteries" && rng.chance(0.5) ? { storyOrder: "each-first" } : {}
+  };
+}
+function questionKey(params) {
+  const context = contextFor(params.context, params.variant);
+  if (!context) throw new Error(`Unknown robot-workshop context: ${params.context}`);
+  const total = params.total ?? params.groups * params.each;
+  const givens = params.unknownKind === "total" ? [params.groups, params.each] : params.unknownKind === "groups" ? [params.each, total] : [params.groups, total];
+  return JSON.stringify(["105", "equation-and-unknown", context.id, context.key ?? "base", params.unknownKind, ...givens]);
+}
+function generateUnseen(rng, unknownKind, presented) {
+  const candidate = generate(rng, unknownKind);
+  if (!presented.has(questionKey(candidate))) return candidate;
+  for (const fact of FACTS) {
+    for (const context of CONTEXTS.filter((item) => item.unknownKind === unknownKind)) {
+      const params = { ...fact, unknownKind, context: context.id };
+      if (presented.has(questionKey(params))) continue;
+      if (context.id === "trays-gears") params.name = rng.pick(BASKET_NAMES);
+      return params;
+    }
+  }
+  throw new Error(`Game 105 has no unused ${unknownKind} questions in the lesson range`);
+}
+function contextFor(id, variant = "base") {
+  const legacy = { "trays-parts": "nature-books", "racks-cogs": "sports-books", "bins-bolts": "seashells" };
+  const context = [...CONTEXTS, ...REPLAY_CONTEXTS, ...LEGACY_CONTEXTS].find((item) => item.id === (legacy[id] ?? id));
+  if (!context) return void 0;
+  const substitution = variant === "base" ? {} : VARIANTS[context.id];
+  if (!substitution || variant !== "base" && substitution.key !== variant) return void 0;
+  return { objectSingular: context.object === "seashells" ? "seashell" : "book", perGroup: `in each ${context.singular}`, ...context, ...substitution };
+}
+function equationLabel(groups, each, total, unknownKind) {
+  if (unknownKind === "groups") return `? × ${each} = ${total}`;
+  if (unknownKind === "each") return `${groups} × ? = ${total}`;
+  return `${groups} × ${each} = ?`;
+}
+function equationChoice(label, id, unknownKind, value) {
+  return { id, label, value, unknownKind };
+}
+function equationChoices(rng, params) {
+  const { groups, each, total, unknownKind } = params;
+  const hiddenValue = unknownKind === "groups" ? groups : unknownKind === "each" ? each : total;
+  const knownValues = unknownKind === "groups" ? [total, each] : unknownKind === "each" ? [groups, total] : [groups, each];
+  const correct = equationChoice(
+    equationLabel(groups, each, total, unknownKind),
+    "equation-correct",
+    unknownKind,
+    hiddenValue
+  );
+  const wrongLabels = unknownKind === "total" ? [
+    `? × ${groups} = ${each}`,
+    `${groups} × ? = ${each}`,
+    `${each} × ? = ${groups}`,
+    `${groups} × ${each} = ${groups}`,
+    `${each} × ${each} = ?`,
+    `${groups} × ${groups} = ?`
+  ] : unknownKind === "groups" ? [
+    `${each} × ${total} = ?`,
+    `? × ${total} = ${each}`,
+    `${total} × ? = ${each}`,
+    `${each} × ? = ${each}`,
+    `${total} × ${total} = ?`,
+    `${each} × ${each} = ?`
+  ] : [
+    `? × ${total} = ${groups}`,
+    `${total} × ? = ${groups}`,
+    `${groups} × ? = ${groups}`,
+    `${groups} × ${total} = ?`,
+    `${total} × ${groups} = ?`,
+    `${groups} × ${groups} = ?`
+  ];
+  const distractors = wrongLabels.filter((label, index, all) => label !== correct.label && all.indexOf(label) === index).map((label, index) => equationChoice(label, `equation-wrong-${index + 1}`, "wrong-position", knownValues[index % knownValues.length]));
+  return makeChoices(rng, { correct, distractors, count: 4 });
+}
+function numberCandidates(params) {
+  const { groups, each, total, unknownKind } = params;
+  const answer = unknownKind === "groups" ? groups : unknownKind === "each" ? each : total;
+  const other = unknownKind === "groups" ? each : groups;
+  const max = unknownKind === "total" ? ranges.total[1] : ranges.each[1];
+  const values = [];
+  const add = (value, reason) => {
+    if (!Number.isFinite(value) || value < ranges.each[0] || value > max || value === answer || values.some((item) => item.value === value)) return;
+    values.push({ value, reason });
+  };
+  add(groups + each, "sum");
+  add(other, "other-factor");
+  add(answer - 1, "nearby");
+  add(answer + 1, "nearby");
+  add(total - other, "skip-counting");
+  add(total + other, "skip-counting");
+  add(answer - 2, "nearby");
+  add(answer + 2, "nearby");
+  for (let value = 2; value <= (unknownKind === "total" ? 60 : 10); value += 1) add(value, "nearby");
+  return values;
+}
+function numberChoices(rng, params) {
+  const answer = params.unknownKind === "groups" ? params.groups : params.unknownKind === "each" ? params.each : params.total;
+  const distractors = numberCandidates(params).map((candidate, index) => ({
+    id: `number-wrong-${index + 1}`,
+    label: String(candidate.value),
+    value: candidate.value,
+    reason: candidate.reason
+  }));
+  return makeChoices(rng, {
+    correct: { id: "number-correct", label: String(answer), value: answer, reason: "answer" },
+    distractors,
+    count: 4
+  });
+}
+function storyFor(params, context) {
+  const { groups, each, total, unknownKind } = params;
+  if (context.id === "robots-batteries") {
+    if (params.storyOrder === "each-first") return `Each robot comes with ${each} batteries. A crate holds ${groups} robots. How many batteries come with the robots in one crate?`;
+    return `There are ${groups} robots. Each robot is given ${each} batteries. How many batteries are given out?`;
+  }
+  if (context.id === "robots-bolts") return `${groups} robots received ${each} bolts each in the workshop. How many bolts did they receive?`;
+  if (context.id === "trays-gears") return `${params.name ?? "Mira"} has ${total} gears. She puts ${each} in each tray. How many trays does she fill?`;
+  if (context.id === "crates-helmets") return `Each crate holds ${each} helmets. There are ${total} helmets altogether. How many crates are there?`;
+  if (context.id === "bins-wheels") return `There are ${total} wheels. They are placed in ${groups} bins with the same number of wheels in each bin. How many wheels are in each bin?`;
+  if (context.id === "bins-nuts") return `There are ${total} nuts. They are placed in ${groups} bins with the same number of nuts in each bin. How many nuts are in each bin?`;
+  if (context.id === "boxes-screws") return `There are ${groups} boxes with the same number of screws in each box. There are ${total} screws altogether. How many screws are in each box?`;
+  if (context.id === "vases-flowers") return `There are ${groups} vases. Each vase has ${each} flowers. How many flowers are there?`;
+  if (context.id === "children-balloons") return `${groups} children received ${each} balloons each at a party. How many balloons did they receive?`;
+  if (context.id === "bags-marbles") return `${params.name ?? "Mira"} has ${total} marbles. She puts ${each} in each bag. How many bags does she fill?`;
+  if (context.id === "boats-passengers") return `Each boat carries ${each} passengers. There are ${total} passengers altogether. How many boats are there?`;
+  if (context.id === "jars-coins") return `There are ${total} coins. They are placed in ${groups} jars with the same number of coins in each jar. How many coins are in each jar?`;
+  if (context.id === "envelopes-tickets") return `There are ${groups} envelopes with the same number of tickets in each envelope. There are ${total} tickets altogether. How many tickets are in each envelope?`;
+  if (context.id === "tanks-fish") return `There are ${groups} fish ${context.container}. Each ${context.singular} has ${each} fish. How many fish are there?`;
+  if (context.id === "students-books") return `${groups} students borrowed ${each} ${context.object} each from the library. How many ${context.object} were borrowed?`;
+  if (context.id === "baskets-apples") return `${params.name ?? "Jada"} picked ${total} ${context.object}. She put ${each} in each basket. How many baskets did she have?`;
+  if (context.id === "tables-chairs") return `Each ${context.tableSetting ?? "table"} has ${each} chairs. There are ${total} chairs altogether. How many tables are there?`;
+  if (context.id === "bins-books") return `There are ${total} ${context.object === "books" ? "books about animals" : context.object}. They are placed in ${groups} bins with the same number of ${context.object} in each bin. How many ${context.object} are in each bin?`;
+  if (context.id === "teams-students") return `There are ${groups} equal-sized teams. ${total} ${context.object} are playing altogether. How many ${context.object} are on each team?`;
+  if (unknownKind === "total") {
+    return `Sam made ${groups} piles of ${context.subject}. Each pile had ${each} ${context.object}. How many ${context.subject} did Sam find?`;
+  }
+  if (unknownKind === "groups") {
+    return `Bethany found ${total} ${context.subject}. She put them in piles of ${each} ${context.object}. How many piles did she make?`;
+  }
+  return `Jada found ${total} ${context.subject}. She put them into ${groups} equal piles. How many ${context.object} were in each pile?`;
+}
+function build(params, rng) {
+  const context = contextFor(params.context, params.variant);
+  if (!context) throw new Error(`Unknown robot-workshop context: ${params.context}`);
+  if (!UNKNOWN_KINDS.includes(params.unknownKind)) throw new Error(`Unknown missing value: ${params.unknownKind}`);
+  if (context.unknownKind && context.unknownKind !== params.unknownKind) throw new Error(`Context ${context.id} requires unknown ${context.unknownKind}`);
+  if (params.storyOrder !== void 0 && params.storyOrder !== "each-first") {
+    throw new Error(`Unsupported robot-workshop story order: ${params.storyOrder}`);
+  }
+  if (params.storyOrder === "each-first" && (context.id !== "robots-batteries" || params.unknownKind !== "total")) {
+    throw new Error("Each-first story order requires the robots-batteries total situation");
+  }
+  if (["baskets-apples", "bags-marbles", "trays-gears"].includes(context.id) && params.name !== void 0 && params.name !== "Jada" && !BASKET_NAMES.includes(params.name)) throw new Error(`Unknown basket name: ${params.name}`);
+  const resolved = { ...params, total: params.total ?? params.groups * params.each };
+  const story = storyFor(resolved, context);
+  const equation = equationChoices(rng, resolved);
+  const number = numberChoices(rng, resolved);
+  return {
+    params,
+    context,
+    story,
+    equation: equationLabel(resolved.groups, resolved.each, resolved.total, resolved.unknownKind),
+    steps: [
+      { key: "equation", prompt: "Tap the equation that represents the situation.", ...equation },
+      { key: "number", prompt: "Tap the unknown value.", ...number }
+    ]
+  };
+}
+function check(problem) {
+  const errors = [];
+  const { groups, each, unknownKind } = problem.params;
+  const total = problem.params.total ?? groups * each;
+  const context = contextFor(problem.params.context, problem.params.variant);
+  if (!context) errors.push("context is unknown");
+  if (context?.unknownKind && context.unknownKind !== unknownKind) errors.push("context does not match the unknown role");
+  if (!UNKNOWN_KINDS.includes(unknownKind)) errors.push("unknown kind is invalid");
+  if (problem.params.storyOrder !== void 0 && problem.params.storyOrder !== "each-first") errors.push("storyOrder must be each-first or omitted");
+  if (problem.params.storyOrder === "each-first" && (context?.id !== "robots-batteries" || unknownKind !== "total")) errors.push("each-first storyOrder requires the robots-batteries total situation");
+  if (groups * each !== total) errors.push("total must equal groups × each");
+  if (problem.steps?.length !== 2) return ["there must be exactly two steps"];
+  const [equation, number] = problem.steps;
+  const expectedEquation = equationLabel(groups, each, total, unknownKind);
+  const equationAnswer = equation.choices.find((choice) => choice.id === equation.answer);
+  const numberAnswer = number.choices.find((choice) => choice.id === number.answer);
+  const expectedNumber = unknownKind === "groups" ? groups : unknownKind === "each" ? each : total;
+  if (equation.key !== "equation") errors.push("first step must choose an equation");
+  if (number.key !== "number") errors.push("second step must find the missing number");
+  if (!equationAnswer || equationAnswer.label !== expectedEquation) errors.push("equation answer does not match the story");
+  if (!numberAnswer || numberAnswer.value !== expectedNumber) errors.push("missing-number answer is wrong");
+  if (equation.choices.some((choice) => choice.label === expectedEquation && choice.id !== equation.answer)) errors.push("duplicate correct equation");
+  if (number.choices.some((choice) => choice.value === expectedNumber && choice.id !== number.answer)) errors.push("duplicate missing number");
+  return errors;
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  UNKNOWN_KINDS,
+  build,
+  check,
+  contextFor,
+  generate,
+  generateUnseen,
+  questionKey,
+  ranges
+}, Symbol.toStringTag, { value: "Module" }));
+const esc = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+function partShape(x, y, size, index, className = "reb-part", style = "", objectKind = "part") {
+  const half = size / 2;
+  if (objectKind !== "part") {
+    const shapes = {
+      battery: '<path d="M-3 -12 H3 V-9 H-3Z M-7 -9 H7 V12 H-7Z" fill="#37c8c5"/><path d="M-3 -4 H3 M0 -7 V-1 M-3 7 H3" fill="none"/>',
+      bolt: '<path d="M-8 -12 H8 L11 -8 L8 -4 H-8 L-11 -8Z M-4 -4 H4 V11 H-4Z" fill="#37c8c5"/><path d="M-4 0 H4 M-4 4 H4 M-4 8 H4" fill="none"/>',
+      gear: '<path d="M-3 -11 H3 V-7 L5 -5 L8 -8 L11 -3 L7 -1 V2 L11 4 L8 9 L4 6 L2 7 V11 H-4 V7 L-6 5 L-9 8 L-11 3 L-7 1 V-2 L-11 -4 L-8 -9 L-4 -6 L-3 -7Z" fill="#e8a838"/><circle cx="0" cy="0" r="3" fill="#fff4d6"/>',
+      helmet: '<path d="M-9 5 V1 A9 9 0 0 1 9 1 V5Z M-11 5 H11 V9 H-11Z" fill="#e8a838"/><path d="M-2 -8 V5 M2 -8 V5" fill="none"/>',
+      wheel: '<ellipse cx="0" cy="0" rx="11" ry="11" fill="#13213f"/><ellipse cx="0" cy="0" rx="8" ry="8" fill="#37c8c5"/><path d="M0 -8 V8 M-8 0 H8 M-6 -6 L6 6 M6 -6 L-6 6" fill="none" stroke="#fff4d6"/><ellipse cx="0" cy="0" rx="2" ry="2" fill="#fff4d6"/>',
+      nut: '<path d="M-5 -9 H5 L10 0 L5 9 H-5 L-10 0Z" fill="#e8a838"/><circle cx="0" cy="0" r="4" fill="#fff4d6"/>',
+      screw: '<path d="M-9 -5 A9 7 0 0 1 9 -5Z M-4 -5 H4 V5 L0 12 L-4 5Z" fill="#37c8c5"/><path d="M-5 -8 H5 M-4 -2 L4 0 M-4 2 L4 4 M-2 6 L2 7" fill="none"/>',
+      flower: '<path d="M0 2 V12 M0 9 Q-7 3 -7 8 Q-5 12 0 10" fill="#37c8c5"/><g fill="#e8a838"><ellipse cx="0" cy="-8" rx="4" ry="4"/><ellipse cx="-5" cy="-4" rx="4" ry="4"/><ellipse cx="5" cy="-4" rx="4" ry="4"/><ellipse cx="0" cy="0" rx="4" ry="4"/></g><circle cx="0" cy="-4" r="2" fill="#fff4d6"/>',
+      balloon: '<ellipse cx="0" cy="-3" rx="8" ry="9" fill="#f29b38"/><path d="M0 6 L-2 9 H2 Z M0 9 Q4 11 0 12" fill="#f29b38"/>',
+      marble: '<ellipse cx="0" cy="0" rx="10" ry="10" fill="#37c8c5"/><path d="M-8 -4 Q6 -9 2 0 Q-2 8 8 4" fill="none"/><path d="M-6 -6 L-4 -7" fill="none" stroke="#fffdf4" stroke-width="3"/>',
+      coin: '<ellipse cx="0" cy="0" rx="10" ry="10" fill="#e8a838"/><ellipse cx="0" cy="0" rx="7" ry="7" fill="none"/>',
+      ticket: '<path d="M-10 -6 H10 V-2 Q6 0 10 2 V6 H-10 V2 Q-6 0 -10 -2Z" fill="#f29b38"/><path d="M-3 -5 V5 M1 -2 H6 M1 2 H6" fill="none"/>',
+      shell: '<path d="M-9 3 Q-14 -6 -7 -9 Q-3 -14 0 -10 Q4 -14 8 -8 Q14 -3 9 4 L3 10 H-3 Z" fill="#fff4d6"/><path d="M0 8 V-8 M-2 8 L-7 -6 M2 8 L7 -6" fill="none"/>',
+      fish: '<path d="M-7 0 L-12 -7 V7 Z" fill="#f29b38"/><ellipse cx="2" cy="0" rx="9" ry="6" fill="#f29b38"/><circle cx="6" cy="-1" r="1" fill="#13213f"/>',
+      apple: '<path d="M0 -6 C-12 -13 -13 5 -5 10 Q0 8 5 10 C13 5 12 -13 0 -6Z" fill="#e8a838"/><path d="M0 -6 Q-1 -10 2 -12" fill="none"/><path d="M2 -9 Q8 -13 8 -7 Q5 -5 2 -9" fill="#37c8c5"/>',
+      orange: '<path d="M10 0 A10 10 0 1 1 -10 0 A10 10 0 1 1 10 0Z" fill="#f29b38"/><path d="M0 -9 Q3 -14 7 -10 Q5 -6 0 -9" fill="#37c8c5"/>',
+      ball: '<path d="M10 0 A10 10 0 1 1 -10 0 A10 10 0 1 1 10 0Z" fill="#37c8c5"/><path d="M-10 0 H10 M0 -10 Q-7 0 0 10 M0 -10 Q7 0 0 10" fill="none"/>',
+      chair: '<path d="M-8 -11 H6 V2 H-8 Z M-8 2 H10 V6 H-8 Z" fill="#f29b38"/><path d="M-7 6 V12 M8 6 V12" fill="none" stroke-width="3"/>',
+      student: '<circle cx="0" cy="-7" r="4" fill="#fff4d6"/><path d="M-7 8 V3 Q-7 -1 0 -1 Q7 -1 7 3 V8Z" fill="#37c8c5"/><path d="M-3 8 V12 M3 8 V12" fill="none"/>',
+      book: '<rect x="-10" y="-12" width="20" height="24" rx="2" fill="#37c8c5"/><path d="M-6 -12 V12 M-2 -6 H6 M-2 -1 H6" fill="none"/>'
+    };
+    const shape = shapes[objectKind] ?? shapes.book;
+    return `<g class="${className}" style="${style}" data-object-kind="${esc(objectKind)}" aria-hidden="true"><g transform="translate(${x} ${y}) scale(${size / 24})" stroke="#13213f" stroke-width="1.6" stroke-linejoin="round">${shape}</g></g>`;
+  }
+  return `<g class="${className}" style="${style}" aria-hidden="true"><rect x="${x - half}" y="${y - half}" width="${size}" height="${size}" rx="${Math.max(2, size * 0.18)}"/><circle cx="${x}" cy="${y}" r="${Math.max(1.2, size * 0.12)}"/></g>`;
+}
+function partGrid(each, x, y, width, height, { animate = false, startAt = 0, maxParts = each, className = "reb-part", objectKind = "part" } = {}) {
+  const count = Math.max(0, Math.min(each, maxParts));
+  const columns = each <= 4 ? each : each <= 8 ? 4 : 5;
+  const rows = Math.max(1, Math.ceil(each / columns));
+  const cellWidth = width / columns;
+  const cellHeight = height / rows;
+  const size = Math.max(8, Math.min(24, Math.min(cellWidth, cellHeight) * 0.62));
+  return Array.from({ length: count }, (_, index) => {
+    const col = index % columns;
+    const row = Math.floor(index / columns);
+    const px = x + cellWidth * (col + 0.5);
+    const py = y + cellHeight * (row + 0.5);
+    const delay = animate ? startAt : 0;
+    const round = animate ? index : Math.floor(index / columns);
+    return partShape(px, py, size, index, className, animate ? `--reb-delay:${delay}ms;--reb-round:${round}` : "", objectKind);
+  }).join("");
+}
+function tray({ x, y, width, height, each, index, animate = false, startAt = 0, groupStep = 360, partsAt = startAt + 1450, maxParts = each, empty = false, label = "", objectKind = "part" }) {
+  const delay = animate ? startAt + index * groupStep : 0;
+  const trayClass = animate ? "reb-tray reb-tray--animated" : "reb-tray";
+  const inside = empty ? `<text class="reb-tray-question" x="${x + width / 2}" y="${y + height / 2 + 12}">?</text>` : partGrid(each, x + 10, y + 18, width - 20, height - 28, { animate, startAt: partsAt, maxParts, objectKind });
+  return `<g class="${trayClass}" style="${animate ? `--reb-delay:${delay}ms` : ""}" aria-hidden="true">
+    ${objectKind === "part" ? `<rect class="reb-tray-shell" x="${x}" y="${y}" width="${width}" height="${height}" rx="16"/><rect class="reb-tray-inner" x="${x + 5}" y="${y + 5}" width="${width - 10}" height="${height - 10}" rx="12"/>` : `<rect x="${x}" y="${y}" width="${width}" height="${height}" rx="28" fill="#fffdf4" stroke="#13213f" stroke-width="3" stroke-dasharray="7 5"/>`}
+    ${inside}
+    ${label ? `<text class="reb-tray-label mg-kid-label" x="${x + width / 2}" y="${y + height + 18}">${esc(label)}</text>` : ""}
+  </g>`;
+}
+function layout(groups, width = 760) {
+  const columns = groups;
+  const trayWidth = columns <= 3 ? 166 : columns === 4 ? 146 : Math.min(138, (width - 16 - (columns - 1) * 9) / columns);
+  const trayHeight = 92;
+  const gap = columns <= 3 ? 18 : 9;
+  const rows = Math.ceil(groups / columns);
+  const totalWidth = columns * trayWidth + (columns - 1) * gap;
+  const left = (width - totalWidth) / 2;
+  return { columns, trayWidth, trayHeight, gap, rows, width, height: rows * (trayHeight + 36) + 10, left };
+}
+const MAX_DRAWN_PARTS = 30;
+function workshopSvg({ groups, each, total = groups * each, animate = false, mode = "full", label = "Equal groups in the Robot Workshop", objectKind = "part", objectLabel = "parts" } = {}) {
+  const safeGroups = Math.max(1, Number(groups) || 1);
+  const safeEach = Math.max(1, Number(each) || 1);
+  const safeTotal = Math.max(1, Number(total) || safeGroups * safeEach);
+  const geometry = layout(safeGroups);
+  let body = "";
+  if (mode === "groups-supply") {
+    const drawSupply = safeTotal <= MAX_DRAWN_PARTS;
+    const rowY = 74;
+    const supplyX = 33;
+    const supplyWidth = 340;
+    const supplyHeight = 112;
+    const groupX = 403;
+    const groupWidth = 148;
+    const groupHeight = 112;
+    const binParts = drawSupply ? partGrid(safeTotal, supplyX + 8, rowY + 10, supplyWidth - 16, supplyHeight - 20, { maxParts: safeTotal, objectKind }) : `<text class="reb-known-total mg-kid-label" x="${supplyX + supplyWidth / 2}" y="${rowY + 68}" style="font-size:34px">${esc(safeTotal)} ${esc(objectLabel)}</text>`;
+    const sample = tray({ objectKind, x: groupX, y: rowY, width: groupWidth, height: groupHeight, each: safeEach, index: 0, maxParts: safeEach });
+    const missingX = groupX + groupWidth + 28;
+    return `<svg class="reb-workshop-svg reb-workshop-svg--${mode}" viewBox="0 68 760 124" role="img" aria-label="${esc(label)}">
+      <rect class="reb-tray-shell" x="${supplyX}" y="${rowY}" width="${supplyWidth}" height="${supplyHeight}" rx="16"/>
+      <rect class="reb-tray-inner" x="${supplyX + 5}" y="${rowY + 5}" width="${supplyWidth - 10}" height="${supplyHeight - 10}" rx="12"/>
+      ${binParts}
+      ${sample}
+      <g class="reb-missing-total" aria-hidden="true"><rect x="${missingX}" y="${rowY}" width="${groupWidth}" height="${groupHeight}" rx="16"/><text x="${missingX + groupWidth / 2}" y="${rowY + 70}">?</text></g>
+    </svg>`;
+  }
+  if (mode === "unknown-groups") {
+    const completeGroups = Math.max(1, safeGroups - 1);
+    const drawParts = completeGroups * safeEach <= MAX_DRAWN_PARTS;
+    const groupStep = 210;
+    const partsAt = 250 + safeGroups * groupStep + 220;
+    for (let index = 0; index < completeGroups; index += 1) {
+      const col = index % geometry.columns;
+      const row = Math.floor(index / geometry.columns);
+      const x = geometry.left + col * (geometry.trayWidth + geometry.gap);
+      const y = 18 + row * (geometry.trayHeight + 36);
+      body += tray({
+        objectKind,
+        x,
+        y,
+        width: geometry.trayWidth,
+        height: geometry.trayHeight,
+        each: safeEach,
+        index,
+        animate,
+        startAt: 250,
+        groupStep,
+        partsAt,
+        maxParts: drawParts ? safeEach : 0
+      });
+    }
+    const badgeIndex = safeGroups - 1;
+    const badgeCol = badgeIndex % geometry.columns;
+    const badgeRow = Math.floor(badgeIndex / geometry.columns);
+    const bx = geometry.left + badgeCol * (geometry.trayWidth + geometry.gap);
+    const by = 18 + badgeRow * (geometry.trayHeight + 36);
+    body += `<g class="reb-missing-group" aria-hidden="true"><rect x="${bx}" y="${by}" width="${geometry.trayWidth}" height="${geometry.trayHeight}" rx="16"/><text x="${bx + geometry.trayWidth / 2}" y="${by + geometry.trayHeight / 2 + 14}">?</text></g>`;
+    const h = geometry.height + 24;
+    return `<svg class="reb-workshop-svg reb-workshop-svg--${mode}" viewBox="0 0 760 ${h}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+  }
+  if (mode === "unknown-each") {
+    const visibleRounds = Math.max(1, Math.min(3, safeEach - 1));
+    const singleRow = safeGroups > 5;
+    const gap = singleRow ? 6 : 14;
+    const trayWidth = singleRow ? Math.floor((744 - (safeGroups - 1) * gap) / safeGroups) : 132;
+    const totalWidth = safeGroups * trayWidth + (safeGroups - 1) * gap;
+    const left = (760 - totalWidth) / 2;
+    body = Array.from({ length: safeGroups }, (_, index) => {
+      const col = singleRow ? index : index % Math.min(safeGroups, 5);
+      const row = singleRow ? 0 : Math.floor(index / Math.min(safeGroups, 5));
+      const x = left + col * (trayWidth + gap);
+      const y = singleRow ? 20 : 20 + row * 106;
+      return tray({
+        objectKind,
+        x,
+        y,
+        width: trayWidth,
+        height: 82,
+        each: visibleRounds,
+        maxParts: visibleRounds,
+        index,
+        animate,
+        startAt: 300,
+        empty: !animate
+      });
+    }).join("");
+    const h = singleRow ? animate ? 146 : 126 : Math.ceil(safeGroups / 5) * 106 + 20;
+    return `<svg class="reb-workshop-svg reb-workshop-svg--${mode}" viewBox="0 0 760 ${h}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+  }
+  if (mode === "unknown-total") {
+    const shown = Math.max(1, safeGroups - 1);
+    const compact = layout(safeGroups);
+    const drawParts = shown * safeEach <= MAX_DRAWN_PARTS;
+    body = Array.from({ length: shown }, (_, index) => {
+      const col = index % compact.columns;
+      const row = Math.floor(index / compact.columns);
+      return tray({
+        objectKind,
+        x: compact.left + col * (compact.trayWidth + compact.gap),
+        y: 20 + row * 128,
+        width: compact.trayWidth,
+        height: compact.trayHeight,
+        each: safeEach,
+        index,
+        animate,
+        startAt: 250,
+        maxParts: drawParts ? safeEach : 0
+      });
+    }).join("");
+    const missingIndex = safeGroups - 1;
+    const missingColumn = missingIndex % compact.columns;
+    const missingRow = Math.floor(missingIndex / compact.columns);
+    const missingX = compact.left + missingColumn * (compact.trayWidth + compact.gap);
+    const missingY = 20 + missingRow * 128;
+    body += `<g class="reb-missing-total" aria-hidden="true"><rect x="${missingX}" y="${missingY}" width="${compact.trayWidth}" height="${compact.trayHeight}" rx="16"/><text x="${missingX + compact.trayWidth / 2}" y="${missingY + 58}">?</text></g>`;
+    return `<svg class="reb-workshop-svg reb-workshop-svg--${mode}" viewBox="0 0 760 ${compact.height}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+  }
+  for (let index = 0; index < safeGroups; index += 1) {
+    const col = index % geometry.columns;
+    const row = Math.floor(index / geometry.columns);
+    const x = geometry.left + col * (geometry.trayWidth + geometry.gap);
+    const y = 18 + row * (geometry.trayHeight + 36);
+    body += tray({
+      objectKind,
+      x,
+      y,
+      width: geometry.trayWidth,
+      height: geometry.trayHeight,
+      each: safeEach,
+      index,
+      animate,
+      startAt: 280,
+      maxParts: safeEach
+    });
+  }
+  return `<svg class="reb-workshop-svg" viewBox="0 0 760 ${geometry.height}" role="img" aria-label="${esc(label)}">${body}</svg>`;
+}
+function groupEquationLabel({ groups, each, total = groups * each, unknownKind }, context) {
+  const { object, singular, container } = context;
+  const piles = groups === 1 ? singular : container;
+  const objectName = (count) => count === 1 ? context.objectSingular : object;
+  const groupLabel = unknownKind === "groups" ? `An unknown number of ${container}` : `${groups} ${piles}`;
+  const eachLabel = unknownKind === "each" ? `an unknown number of ${object} ${context.perGroup}` : `${each} ${objectName(each)} ${context.perGroup}`;
+  const totalLabel = unknownKind === "total" ? `an unknown total number of ${object}` : `${total} ${objectName(total)}`;
+  return `${groupLabel}, times ${eachLabel}, equals ${totalLabel}.`;
+}
+function groupEquation(params, context) {
+  const { groups, each, total = groups * each, unknownKind } = params;
+  const { object, singular, container, art } = context;
+  const piles = groups === 1 ? singular : container;
+  const objectName = (count) => count === 1 ? context.objectSingular : object;
+  const label = groupEquationLabel(params, context);
+  const text = (role, value) => `<span class="reb-group-equation-text${value === "?" ? " reb-group-equation-text--unknown" : ""}" data-factor-role="${role}">${esc(value)}</span>`;
+  const pile = `<span class="reb-countable-pile" style="--reb-columns:${Math.min(each, 5)};--reb-count:${each}" data-factor-role="each">${Array.from({ length: each }, () => `<svg class="reb-countable-object" viewBox="0 0 24 28" aria-hidden="true">${partShape(12, 14, 20, 0, "reb-part", "", art)}</svg>`).join("")}</span>`;
+  const left = text("groups", unknownKind === "groups" ? "?" : `${groups} ${piles}`);
+  const right = unknownKind === "each" ? text("each", "?") : pile;
+  return `<div class="reb-group-equation" role="img" aria-label="${esc(label)}" data-unknown-kind="${esc(unknownKind)}"><div class="reb-group-equation-row" aria-hidden="true">${left}<span class="reb-group-equation-operator">×</span>${right}<span class="reb-group-equation-operator">=</span>${text("total", unknownKind === "total" ? "?" : `${total} ${objectName(total)}`)}</div></div>`;
+}
+function equationGuideSvg(params) {
+  const { groups, each, total, unknownKind, container = "trays", object = "parts" } = params;
+  const knownSentences = unknownKind === "groups" ? [`The ${each} tells how many go in each group.`, `The ${total} tells how many ${object} there are.`] : unknownKind === "each" ? [`The ${groups} tells how many ${container} there are.`, `The ${total} tells how many ${object} there are.`] : [`The ${groups} tells how many ${container} there are.`, `The ${each} tells how many go in each group.`];
+  const known = knownSentences.map((sentence) => `<span class="reb-guide-sentence">${esc(sentence)}</span>`).join("");
+  const roleValue = (role) => {
+    if (role === "groups") return unknownKind === "groups" ? "?" : groups;
+    if (role === "each") return unknownKind === "each" ? "?" : each;
+    return unknownKind === "total" ? "?" : total;
+  };
+  return `<div class="reb-equation-guide" role="img" aria-label="${esc("The story gives two numbers. Put the question mark where a number is missing.")}" data-unknown-kind="${esc(unknownKind)}">
+    <div class="reb-guide-steps">
+      <div class="reb-guide-step"><span class="reb-guide-dot reb-guide-dot--active mg-kid-label">1</span><span class="mg-kid-label">Find the two numbers you know.</span></div>
+      <div class="reb-guide-step"><span class="reb-guide-dot mg-kid-label">2</span><span class="mg-kid-label">Put ? where a number is missing.</span></div>
+    </div>
+    <p class="reb-guide-known mg-kid-label">${known}</p>
+    <div class="reb-role-slots">
+      <div class="reb-role-slot"><span class="mg-kid-label">groups</span><strong>${esc(roleValue("groups"))}</strong></div>
+      <div class="reb-role-slot"><span class="mg-kid-label">in each</span><strong>${esc(roleValue("each"))}</strong></div>
+      <div class="reb-role-slot"><span class="mg-kid-label">altogether</span><strong>${esc(roleValue("total"))}</strong></div>
+    </div>
+  </div>`;
+}
+const SESSION_QUESTIONS = 6;
+const HINT_START_MS = 320;
+const HINT_STEP_MS = 330;
+let teachingHelp = null;
+let storyFit = null;
+function clearStoryFit() {
+  storyFit?.observer?.disconnect();
+  if (storyFit && storyFit.frame !== null) globalThis.cancelAnimationFrame?.(storyFit.frame);
+  storyFit = null;
+}
+function fitStory(el2, storyOrder) {
+  clearStoryFit();
+  const card = el2.querySelector?.(".reb-story-card");
+  const paragraph = card?.querySelector?.("p");
+  const doc = paragraph?.ownerDocument;
+  if (!paragraph?.getBoundingClientRect || !card?.getBoundingClientRect || !doc?.createRange || !globalThis.getComputedStyle || !paragraph.style?.removeProperty) return;
+  const state = { observer: null, frame: null };
+  storyFit = state;
+  const measure = () => {
+    state.frame = null;
+    if (storyFit !== state || !paragraph.isConnected) return;
+    paragraph.style.removeProperty("font-size");
+    const upper = parseFloat(getComputedStyle(paragraph).fontSize);
+    const bounds = card.getBoundingClientRect();
+    if (!Number.isFinite(upper) || bounds.width <= 0 || bounds.height <= 0) return;
+    const maxLines = storyOrder === "each-first" && bounds.width <= 420 ? 3 : 2;
+    const floor = Math.min(15, upper);
+    const style = getComputedStyle(card);
+    const px = (key) => parseFloat(style[key]) || 0;
+    const inside = {
+      left: bounds.left + px("borderLeftWidth") + px("paddingLeft"),
+      right: bounds.right - px("borderRightWidth") - px("paddingRight"),
+      top: bounds.top + px("borderTopWidth") + px("paddingTop"),
+      bottom: bounds.bottom - px("borderBottomWidth") - px("paddingBottom")
+    };
+    const range = doc.createRange();
+    if (!range.selectNodeContents || !range.getClientRects) return;
+    range.selectNodeContents(paragraph);
+    let lines = 0;
+    const fits = (size) => {
+      paragraph.style.fontSize = `${size}px`;
+      const rects = [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+      const tops = [];
+      rects.forEach((rect) => {
+        if (!tops.some((top) => Math.abs(top - rect.top) < 0.5)) tops.push(rect.top);
+      });
+      lines = tops.length;
+      return lines > 0 && lines <= maxLines && rects.every((rect) => rect.left >= inside.left - 0.5 && rect.right <= inside.right + 0.5 && rect.top >= inside.top - 0.5 && rect.bottom <= inside.bottom + 0.5);
+    };
+    try {
+      let chosen = floor;
+      let fitsAtSize = fits(floor);
+      if (fitsAtSize) {
+        let low = Math.ceil(floor * 10);
+        let high = Math.floor(upper * 10);
+        for (let pass = 0; pass < 10 && low <= high; pass += 1) {
+          const middle = Math.floor((low + high) / 2);
+          if (fits(middle / 10)) {
+            chosen = middle / 10;
+            low = middle + 1;
+          } else high = middle - 1;
+        }
+        fitsAtSize = fits(chosen);
+      }
+      card.dataset.rebStoryFit = fitsAtSize ? "fit" : "conflict";
+      card.dataset.rebStoryLines = String(lines);
+      card.dataset.rebStoryFont = String(chosen);
+    } finally {
+      range.detach?.();
+    }
+  };
+  const queue = () => {
+    if (storyFit !== state || state.frame !== null) return;
+    if (globalThis.requestAnimationFrame) state.frame = requestAnimationFrame(measure);
+    else measure();
+  };
+  if (globalThis.ResizeObserver) {
+    state.observer = new ResizeObserver(queue);
+    state.observer.observe(card);
+  }
+  queue();
+  doc.fonts?.ready?.then?.(queue, () => {
+  });
+}
+function makeUnknownSchedule(seed = Date.now()) {
+  return createRng(seed).shuffle([...UNKNOWN_KINDS, ...UNKNOWN_KINDS]);
+}
+function prefersReducedMotion() {
+  return Boolean(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
+}
+function clearTeachingHelp() {
+  if (!teachingHelp) return;
+  teachingHelp.timers.forEach(clearTimeout);
+  teachingHelp.panel.remove();
+  teachingHelp.stage?.removeAttribute("inert");
+  teachingHelp.stage?.removeAttribute("aria-hidden");
+  teachingHelp.keyHandler && teachingHelp.panel.removeEventListener("keydown", teachingHelp.keyHandler);
+  teachingHelp = null;
+}
+function setFeedback(root, message, warm = false) {
+  const feedback = root?.querySelector?.(".reb-feedback");
+  if (!feedback) return;
+  feedback.textContent = message;
+  feedback.classList.toggle("reb-feedback--warm", warm);
+}
+function pauseAnswerTiles(root) {
+  root?.querySelectorAll?.(".mg-tile").forEach((tile) => {
+    tile.disabled = true;
+  });
+  const stage = root?.querySelector?.(".mg-stage");
+  stage?.setAttribute("inert", "");
+  stage?.setAttribute("aria-hidden", "true");
+  return stage;
+}
+function resumeAnswerTiles(root) {
+  root?.querySelectorAll?.(".mg-tile").forEach((tile) => {
+    tile.disabled = false;
+  });
+  const stage = root?.querySelector?.(".mg-stage");
+  stage?.removeAttribute("inert");
+  stage?.removeAttribute("aria-hidden");
+}
+function equationText(params) {
+  if (params.unknownKind === "groups") return `? × ${params.each} = ${params.total}`;
+  if (params.unknownKind === "each") return `${params.groups} × ? = ${params.total}`;
+  return `${params.groups} × ${params.each} = ?`;
+}
+function problemCard(problem) {
+  const art = groupEquation(problem.params, problem.context);
+  return `<section class="reb-problem-card mg-problem-card mg-card-column" aria-label="Robot Workshop problem">
+    <div class="reb-story-card"><p class="mg-problem-body mg-problem-body--fit2">${esc(problem.story)}</p></div>
+    <div class="reb-problem-art mg-card-picture mg-card-picture--tall">${art}</div>
+    <div class="reb-equation-line mg-expression-row mg-expression-row--readable-numerals" aria-label="Multiplication equation">${equationSlot()}${compactEquation(problem)}</div>
+    <p class="reb-feedback mg-feedback-line" aria-live="polite"></p>
+  </section>`;
+}
+function compactEquationLabel(params, context, solved = false) {
+  const value = (kind, known) => !solved && params.unknownKind === kind ? "an unknown number of" : known;
+  const groupNoun = params.groups === 1 && (solved || params.unknownKind !== "groups") ? context.singular : context.container;
+  return `${value("groups", params.groups)} ${groupNoun}, times ${value("each", params.each)} ${context.object} ${context.perGroup}, equals ${value("total", params.total ?? params.groups * params.each)} ${context.object}.`;
+}
+function compactEquation({ params, context }) {
+  const value = (kind, known) => params.unknownKind === kind ? "<span data-reb-compact-unknown>?</span>" : esc(known);
+  const groupNoun = params.groups === 1 && params.unknownKind !== "groups" ? context.singular : context.container;
+  return `<div class="reb-compact-equation" role="img" aria-label="${esc(compactEquationLabel(params, context))}"><span>${value("groups", params.groups)} ${esc(groupNoun)}</span><span>×</span><span>${value("each", params.each)} ${esc(context.object)} ${esc(context.perGroup)}</span><span>=</span><span>${value("total", params.total ?? params.groups * params.each)} ${esc(context.object)}</span></div>`;
+}
+const equationSlot = () => expressionSlot({
+  key: "equation",
+  label: "Equation:",
+  unknown: true,
+  mark: true,
+  className: "reb-equation-slot"
+});
+function fillEquation(root, label) {
+  const html = label.split(/\s+/).map((token) => {
+    const tokenClass = token === "×" || token === "=" ? "reb-equation-operator mg-expression-operator" : "reb-equation-number mg-expression-value";
+    return `<span class="${tokenClass}">${esc(token)}</span>`;
+  }).join("");
+  const slot = fillExpressionSlot(root, "equation", html, { raw: true });
+  if (!slot) return;
+  const equation = slot.querySelector(".mg-expression-value");
+  equation.classList.add("reb-equation-value");
+  equation.setAttribute("aria-label", label);
+}
+function firstMissCopy(step, params) {
+  const context = contextFor(params.context, params.variant);
+  const { object, singular, container } = context;
+  if (step.key === "equation") {
+    if (params.unknownKind === "total") return "The story asks how many altogether. Where should the ? go?";
+    if (params.unknownKind === "groups") return "The story asks how many groups. Where should the ? go?";
+    return "The story asks how many are in each group. Where should the ? go?";
+  }
+  if (params.unknownKind === "total") return `Count by ${params.each} once for each ${singular}.`;
+  if (params.unknownKind === "groups") return `Count groups of ${params.each} until you reach ${params.total}.`;
+  if (context.unknownKind) return `Put the same number of ${object} ${context.perGroup}.`;
+  return `Put ${params.total} ${object} into ${params.groups} equal ${container}.`;
+}
+function numberHelpPlan(params) {
+  const context = contextFor(params.context, params.variant);
+  const picture = { ...params, objectKind: context.art, objectLabel: context.object };
+  if (params.unknownKind === "total") {
+    const visibleGroups = Math.max(1, params.groups - 1);
+    return {
+      copy: `Count by ${params.each} for each ${context.singular}.`,
+      label: context.unknownKind ? `Count one group of ${context.object} for each ${context.singular}. The last total stays hidden.` : "Count the equal piles one at a time. The last total stays hidden.",
+      visual: workshopSvg({ ...picture, mode: "unknown-total", animate: true, label: context.unknownKind ? `Groups of ${context.object} appear one at a time, one group for each ${context.singular}. The final total is hidden.` : "Equal piles appear one at a time. The final total is hidden." }),
+      cues: Array.from({ length: visibleGroups }, (_, index) => ({ kind: "group", index, delay: HINT_START_MS + index * HINT_STEP_MS }))
+    };
+  }
+  if (params.unknownKind === "groups") {
+    return {
+      copy: context.id === "boats-passengers" ? `Put ${params.each} passengers on each boat until all ${params.total} passengers are on boats.` : context.unknownKind ? `Put ${params.each} ${context.object} ${context.perGroup} until all ${params.total} ${context.object} are used.` : `Make groups of ${params.each} until all ${params.total} ${context.object} are used.`,
+      label: "Equal groups build one at a time. The number of groups stays hidden.",
+      visual: workshopSvg({ ...picture, mode: "unknown-groups", animate: true, label: "Equal groups build one at a time. The missing group count stays hidden." }),
+      cues: [0, 1].map((index) => ({ kind: "group", index, delay: HINT_START_MS + index * HINT_STEP_MS }))
+    };
+  }
+  const total = params.total ?? params.groups * params.each;
+  const starter = [params.groups, 2 * params.groups].filter((value) => value < total);
+  return {
+    sequence: [...starter, "…"].join(", "),
+    copy: `Count by ${params.groups} until you reach ${params.total ?? params.groups * params.each}. How many rounds did you count?`,
+    cues: []
+  };
+}
+function equationHelpPlan(params) {
+  return {
+    copy: "Put the ? where the story has a missing number.",
+    label: "The story gives two numbers. Put the question mark where a number is missing.",
+    visual: equationGuideSvg({ ...params, container: contextFor(params.context, params.variant).container, object: contextFor(params.context, params.variant).object }),
+    cues: [
+      { kind: "group", index: 0, delay: HINT_START_MS },
+      { kind: "round", index: 0, delay: HINT_START_MS + HINT_STEP_MS }
+    ]
+  };
+}
+function helpPlan(step, params) {
+  return step.key === "equation" ? equationHelpPlan(params) : numberHelpPlan(params);
+}
+function makeHelpPanel(step, params) {
+  const plan = helpPlan(step, params);
+  const panel = document.createElement("section");
+  panel.className = `reb-help-panel mg-help-panel reb-help-panel--${step.key}`;
+  if (plan.sequence) panel.classList.add("reb-help-panel--counting");
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "reb-help-instruction");
+  const instruction = document.createElement("p");
+  instruction.id = "reb-help-instruction";
+  instruction.className = "mg-help-copy";
+  instruction.textContent = plan.copy;
+  panel.append(instruction);
+  if (plan.sequence) {
+    const sequence = document.createElement("p");
+    sequence.className = "reb-help-sequence";
+    sequence.dataset.sequence = plan.sequence;
+    const terms = document.createElement("span");
+    terms.className = "reb-help-sequence-terms";
+    plan.sequence.split(", ").forEach((term, index) => {
+      const item = document.createElement("span");
+      item.textContent = `${index ? ", " : ""}${term}`;
+      item.style.setProperty("--reb-sequence-delay", `${index * 330}ms`);
+      terms.append(item);
+    });
+    sequence.append(terms);
+    panel.append(sequence);
+  }
+  if (plan.visual) {
+    const picture = document.createElement("div");
+    picture.className = "reb-help-picture";
+    picture.setAttribute("role", "img");
+    picture.setAttribute("aria-label", plan.label);
+    picture.innerHTML = plan.visual;
+    panel.append(picture);
+  }
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "reb-help-retry";
+  retry.textContent = "TRY AGAIN";
+  retry.setAttribute("aria-label", "Try this problem again");
+  panel.append(retry);
+  return { panel, retry, cues: plan.cues };
+}
+function trapHelpFocus(panel, retry, onEscape) {
+  const keyHandler = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onEscape();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    event.preventDefault();
+    retry.focus();
+  };
+  panel.addEventListener("keydown", keyHandler);
+  return keyHandler;
+}
+function showTeachingHelp({ root, fx, tile, step, params }) {
+  clearTeachingHelp();
+  const stage = pauseAnswerTiles(root);
+  const help = makeHelpPanel(step, params);
+  const host = fx ?? root?.querySelector?.(".mg-fx");
+  host?.append(help.panel);
+  const timers = prefersReducedMotion() ? [] : help.cues.map((cue) => setTimeout(() => playHint(cue.kind, cue.index), cue.delay));
+  const finishHelp = () => {
+    clearTeachingHelp();
+    resumeAnswerTiles(root);
+    setFeedback(root, "");
+  };
+  help.retry.addEventListener("click", finishHelp, { once: true });
+  const onEscape = () => {
+    const activeHelp = teachingHelp;
+    help.retry.click();
+    if (teachingHelp === activeHelp) finishHelp();
+  };
+  const keyHandler = trapHelpFocus(help.panel, help.retry, onEscape);
+  teachingHelp = { panel: help.panel, timers, stage, keyHandler, tile };
+  help.retry.focus();
+  return {
+    retryElement: help.retry,
+    onRetry: finishHelp
+  };
+}
+function createSessionGenerator(rng, seed = Date.now()) {
+  const unknownOrder = makeUnknownSchedule(seed);
+  const presented = /* @__PURE__ */ new Set();
+  let generatedCount = 0;
+  return () => {
+    const params = generateUnseen(rng, unknownOrder[generatedCount % unknownOrder.length], presented);
+    presented.add(questionKey(params));
+    generatedCount += 1;
+    return params;
+  };
+}
+const game = defineGame({
+  layout: "standard",
+  meta: {
+    name: "robot_equation_builder",
+    lesson: "105",
+    title: "ROBOT EQUATION BUILDER",
+    subtitle: "Read the story. Pick the equation. Find the missing number.",
+    emoji: "🤖",
+    tag: "ML 1.05 · MISSING NUMBERS",
+    questions: SESSION_QUESTIONS
+  },
+  ...gen,
+  createSessionGenerator,
+  renderExample(el2) {
+    const lastTrayEndMs = 280 + (3 - 1) * 360 + 260;
+    const lastPartEndMs = lastTrayEndMs + 1e3 + (4 - 1) * 430 + 180;
+    el2.innerHTML = `<section class="reb-example" aria-label="Watch three trays fill equally"><p class="reb-example-copy">Count the trays. Put the same number of parts in each tray.</p><div class="reb-example-art">${workshopSvg({ groups: 3, each: 4, animate: true, label: "Three trays fill with four parts in each tray." })}</div><div class="reb-example-equation" aria-label="Three times question mark equals twelve"><b class="reb-example-value reb-example-value--known" style="--reb-example-delay: ${lastPartEndMs}ms">3</b><span class="reb-example-value" style="--reb-example-delay: ${lastPartEndMs + 180}ms">×</span><b class="reb-example-value" style="--reb-example-delay: ${lastPartEndMs + 360}ms">?</b><span class="reb-example-value" style="--reb-example-delay: ${lastPartEndMs + 540}ms">=</span><b class="reb-example-value" style="--reb-example-delay: ${lastPartEndMs + 2 * 360}ms">12</b></div><p class="reb-example-note">The ? shows the number we need to find.</p></section>`;
+  },
+  renderPrompt(el2, _problem, step) {
+    el2.textContent = step.prompt;
+    el2.setAttribute("role", "heading");
+    el2.setAttribute("aria-level", "2");
+    el2.setAttribute("aria-live", "polite");
+    el2.setAttribute("aria-atomic", "true");
+    el2.setAttribute("tabindex", "-1");
+    if (typeof el2.focus === "function") {
+      try {
+        el2.focus({ preventScroll: true });
+      } catch {
+        el2.focus();
+      }
+    }
+  },
+  renderProblem(el2, problem) {
+    el2.innerHTML = problemCard(problem);
+    fitStory(el2, problem.params.storyOrder);
+  },
+  renderChoice(tile, choice, problem, step) {
+    const unit = problem.params.unknownKind === "groups" ? problem.context.container : problem.params.unknownKind === "each" && problem.context.unknownKind ? `${problem.context.object} per ${problem.context.singular}` : problem.context.object;
+    tile.textContent = step.key === "number" ? `${choice.value} ${unit}` : choice.label;
+    tile.dataset.choiceKind = step.key;
+    tile.setAttribute("aria-label", step.key === "equation" ? `Choose equation ${choice.label}` : `Choose ${choice.value} ${unit}`);
+  },
+  onStepCorrect({ tile, step }) {
+    const root = tile.closest(".mg-root");
+    clearTeachingHelp();
+    const choice = step.choices.find((item) => item.id === step.answer);
+    fillEquation(root, choice.label);
+    setFeedback(root, "");
+    return { delayMs: 550 };
+  },
+  onCorrect({ state, tile }) {
+    const root = tile.closest(".mg-root");
+    clearTeachingHelp();
+    const step = state.problem.steps[state.stepIndex];
+    const choice = step.choices.find((item) => item.id === step.answer);
+    if (step.key === "number") {
+      fillEquation(root, `${equationText(state.problem.params)}  (${choice.label})`);
+      const compactUnknown = root?.querySelector?.("[data-reb-compact-unknown]");
+      if (compactUnknown) compactUnknown.textContent = choice.label;
+      root?.querySelector?.(".reb-compact-equation")?.setAttribute("aria-label", compactEquationLabel(state.problem.params, state.problem.context, true));
+    }
+    setFeedback(root, "");
+  },
+  onWrong({ state, tile, step, fx }) {
+    const root = tile.closest(".mg-root");
+    setFeedback(root, firstMissCopy(step, state.problem.params), true);
+    if ((state?.wrongAttempts ?? 1) < 2) return { showToast: false, shakeStage: false };
+    const help = showTeachingHelp({ root, fx, tile, step, params: state.problem.params });
+    return { showToast: false, shakeStage: false, ...help };
+  },
+  onDestroy() {
+    clearStoryFit();
+    clearTeachingHelp();
+  }
+});
+function mount(element, options = {}) {
+  const session = mountGame(element, game, {
+    questions: SESSION_QUESTIONS,
+    rootClass: "reb-game",
+    startButton: "START BUILDING",
+    theme: {
+      "bg-a": "#3156D8",
+      "bg-b": "#13213F",
+      accent: "#F29B38",
+      card: "#FFF4D6",
+      ink: "#13213F",
+      good: "#37C8C5",
+      warm: "#E8A838"
+    },
+    ...options
+  });
+  element.setAttribute?.("role", "main");
+  element.setAttribute?.("aria-label", "Robot Equation Builder game");
+  if (typeof document !== "undefined") document.title = "Robot Equation Builder | Math Games";
+  return session;
+}
+mount(document.getElementById("game"), { gameFile: "robot_equation_builder_105.html" });</script>
+  <style rel="stylesheet" crossorigin>/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: 1.05;
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+.mg-root.reb-game {
+  --mg-card: #fff4d6;
+  --mg-ink: #13213f;
+  --mg-shadow: 0 6px 0 #13213f;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(55, 200, 197, .22) 0 8%, transparent 9%),
+    radial-gradient(circle at 88% 80%, rgba(242, 155, 56, .24) 0 12%, transparent 13%),
+    linear-gradient(155deg, #3156d8 0%, #243d9f 48%, #13213f 100%);
+}
+
+.reb-game .mg-tile {
+  line-height: 1.05;
+}
+.reb-game :is(.mg-tile, .mg-big-btn, .reb-help-retry):focus-visible {
+  outline: 4px solid #37c8c5;
+  outline-offset: 4px;
+}
+.reb-game .mg-visual {
+  container: reb-visual / size;
+  position: relative;
+  flex: 1 1 0;
+  align-items: stretch;
+}
+
+.reb-example {
+  --reb-example-gap: clamp(10px, 2vh, 16px);
+  display: grid;
+  gap: var(--reb-example-gap);
+  color: var(--mg-ink);
+  background: #e5f8f5;
+  border: 3px dashed #37c8c5;
+  border-radius: 16px;
+  padding: 10px;
+}
+.reb-example-copy,
+.reb-example-note {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+/* Trade SVG letterboxing for gaps so the teaching card keeps its height. */
+.reb-example-art { height: calc(154px - 3 * var(--reb-example-gap)); }
+.reb-example-equation {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--mg-ink);
+  font-family: var(--mg-font-shout);
+  font-size: 30px;
+  line-height: 1;
+}
+.reb-example-equation b {
+  min-width: 38px;
+  padding: 4px 8px;
+  color: var(--mg-ink);
+  background: #fff;
+  border: 3px solid var(--mg-ink);
+  border-radius: 9px;
+  font-family: var(--mg-font-read);
+}
+.reb-example-value {
+  opacity: 0;
+  transform: translateY(5px) scale(.8);
+  animation: reb-example-reveal 180ms ease-out var(--reb-example-delay) forwards;
+}
+
+.reb-problem-card {
+  width: 100%;
+  max-width: 920px;
+  height: 100%;
+  min-height: 0;
+  padding: clamp(10px, 1.5vw, 16px);
+  color: var(--mg-ink);
+  background: var(--mg-card);
+  border: 4px solid var(--mg-ink);
+  border-radius: 22px;
+  box-shadow: 0 6px 0 var(--mg-ink);
+  text-align: center;
+}
+.reb-game .reb-problem-card {
+  container: reb-card / size;
+  /* Contain the card in the stage allocation above the anchored answers. */
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  margin: 0;
+  display: grid;
+  /* Story, picture, and equation share the remaining space in a 2:2:1 ratio. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 2fr) minmax(0, 2fr) minmax(0, 1fr) auto;
+  gap: 12px;
+}
+.reb-game .reb-problem-card > :is(.reb-story-card, .reb-problem-art, .reb-equation-line) {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+.reb-story-card {
+  display: grid;
+  align-content: center;
+  padding: 9px 12px;
+  color: var(--mg-ink);
+  background: #fffdf4;
+  border: 3px dashed #3156d8;
+  border-radius: 14px;
+}
+/* A measured two-line conflict remains visible for review, never ellipsized. */
+.reb-game .reb-problem-card .reb-story-card[data-reb-story-fit="conflict"] { overflow: visible; }
+.reb-story-card p {
+  font-weight: 700;
+  line-height: 1.3;
+}
+.reb-problem-art {
+  min-height: 0;
+  flex: none;
+  height: auto;
+  overflow: hidden;
+  padding: 4px 8px;
+  background: #e5f8f5;
+  border: 3px solid var(--mg-ink);
+  border-radius: 15px;
+}
+/* The ratio belongs to this lesson's card only. Let its picture fill the grid
+   track instead of inheriting the shared picture cap. */
+.mg-shell-standard.reb-game .reb-problem-card > .reb-problem-art { max-height: none; }
+.reb-workshop-svg { display: block; width: 100%; height: 100%; }
+.reb-group-equation {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  font-family: var(--mg-font-read);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+.reb-group-equation-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  max-width: 540px;
+}
+.reb-group-equation-text { flex: 0 1 100px; min-width: 0; }
+.reb-group-equation-text--unknown { flex: 0 0 auto; }
+.reb-group-equation-operator { flex: 0 0 14px; }
+.reb-countable-pile,
+.reb-pile-collection {
+  display: grid;
+  grid-template-columns: repeat(var(--reb-columns), var(--reb-item-width, 18px));
+  justify-content: center;
+  align-content: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+.reb-countable-pile {
+  padding: 4px;
+  border: 2px dashed #13213f;
+  border-radius: 14px;
+  background: #fffdf4;
+}
+.reb-countable-object { display: block; width: var(--reb-item-width, 18px); height: var(--reb-item-height, 22px); }
+.reb-unspecified-pile { display: block; width: var(--reb-item-width, 18px); height: var(--reb-item-width, 18px); }
+.reb-tray-shell { fill: #f29b38; stroke: #13213f; stroke-width: 4; }
+.reb-tray-inner { fill: #fff4d6; stroke: #13213f; stroke-width: 2; }
+.reb-part rect { fill: #37c8c5; stroke: #13213f; stroke-width: 2; }
+.reb-part circle { fill: #fff4d6; }
+.reb-tray-label,
+.reb-small-caption,
+.reb-tray-count,
+.reb-known-total {
+  fill: #13213f;
+  font-family: var(--mg-font-read);
+  font-size: 15px;
+  font-weight: 700;
+  text-anchor: middle;
+}
+.reb-tray-question,
+.reb-missing-group text,
+.reb-missing-total text,
+.reb-question-badge {
+  fill: #13213f;
+  font-family: var(--mg-font-shout);
+  font-size: 42px;
+  font-weight: 700;
+  text-anchor: middle;
+}
+.reb-missing-group rect,
+.reb-missing-total rect { fill: #e5f8f5; stroke: #3156d8; stroke-width: 4; stroke-dasharray: 8 6; }
+.reb-question-badge { fill: #f29b38; stroke: #13213f; stroke-width: 3; }
+
+/* Geometry and type for the expression row belong to the shell
+   (.mg-expression-row / .mg-expression-slot in src/engine/styles.css). This
+   file supplies the workshop blues only. */
+.reb-game {
+  --mg-expression-slot-border-color: #3156d8;
+  --mg-expression-slot-bg: #e5f8f5;
+  --mg-expression-slot-bg-filled: #c5f4dc;
+}
+.reb-equation-line {
+  min-width: 0;
+  min-height: 0;
+  color: var(--mg-ink);
+}
+.reb-equation-line .mg-expression-slot {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  column-gap: clamp(4px, 1vw, 10px);
+}
+.reb-equation-line .mg-expression-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.reb-equation-line .mg-expression-value {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+.reb-feedback {
+  display: grid;
+  height: 38px;
+  min-height: 38px;
+  place-items: center;
+  margin: 0;
+  overflow: hidden;
+  color: #8a5700;
+  white-space: nowrap;
+}
+.reb-feedback:empty { visibility: hidden; }
+.reb-feedback--warm { color: #8a5700; }
+
+.reb-help-panel {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 4;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  width: min(600px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  gap: clamp(8px, 1.6vh, 16px);
+  padding: clamp(14px, 2vh, 20px) clamp(14px, 2vw, 24px);
+  transform: translate(-50%, -50%);
+  overflow: hidden;
+  color: var(--mg-ink);
+  background: var(--mg-card);
+  border: 4px solid var(--mg-ink);
+  border-radius: 20px;
+  box-shadow: 0 8px 0 var(--mg-ink);
+  pointer-events: auto;
+  text-align: center;
+}
+.reb-help-panel > p {
+  margin: 0;
+  font-size: clamp(19px, 3.5vw, 27px);
+  font-weight: 800;
+  line-height: 1.15;
+}
+.reb-help-picture {
+  width: min(540px, 100%);
+  height: clamp(110px, 23vh, 190px);
+  min-height: 0;
+  padding: 4px 8px;
+  overflow: hidden;
+  background: #e5f8f5;
+  border: 3px solid var(--mg-ink);
+  border-radius: 14px;
+}
+/* The equation guide is HTML that must not clip, so let its picture size to
+   content. The number-step help is an SVG that needs the fixed box above. */
+.reb-help-panel--equation .reb-help-picture { height: auto; }
+.reb-help-retry {
+  min-height: 44px;
+  margin-top: 2px;
+  padding: 7px 22px;
+  color: var(--mg-ink);
+  background: #f29b38;
+  border: 3px solid var(--mg-ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 0 var(--mg-ink);
+  font-family: var(--mg-font-shout);
+  font-size: clamp(18px, 2.2vw, 27px);
+  cursor: pointer;
+}
+.reb-help-retry:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mg-ink); }
+
+.reb-equation-guide {
+  display: grid;
+  gap: 9px;
+  height: 100%;
+  align-content: center;
+  color: var(--mg-ink);
+}
+.reb-guide-steps {
+  display: grid;
+  gap: 5px;
+  font-size: 15px;
+  font-weight: 700;
+}
+.reb-guide-step {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  text-align: left;
+}
+.reb-guide-dot {
+  display: inline-grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
+  place-items: center;
+  color: #fff;
+  background: #3156d8;
+  border-radius: 50%;
+}
+.reb-guide-dot--active { background: #f29b38; color: var(--mg-ink); }
+.reb-guide-known { margin: 0; font-size: 15px; font-weight: 700; line-height: 1.15; }
+.reb-guide-sentence { display: block; text-align: center; }
+.reb-role-slots {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+.reb-role-slot {
+  display: grid;
+  min-height: 58px;
+  place-items: center;
+  padding: 5px 4px;
+  color: var(--mg-ink);
+  background: #fff;
+  border: 3px solid #3156d8;
+  border-radius: 12px;
+}
+.reb-role-slot span {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+}
+.reb-role-slot strong {
+  font-family: var(--mg-font-read);
+  font-size: 31.5px;
+  line-height: 1;
+}
+
+.reb-tray--animated { opacity: 0; transform: translateY(8px) scale(.86); animation: reb-tray-in 260ms var(--reb-delay) cubic-bezier(.2, .85, .3, 1.2) forwards; transform-box: fill-box; transform-origin: center; }
+.reb-tray--animated .reb-part { opacity: 0; transform: scale(.2); animation: reb-part-in 180ms calc(var(--reb-delay) + 1150ms + (var(--reb-round) * 430ms)) cubic-bezier(.2, .85, .3, 1.2) forwards; transform-box: fill-box; transform-origin: center; }
+
+/* The start example's last tray settles at 280 + 2 * 360 + 260 = 1260ms.
+   Start the first simultaneous filling round exactly one second later. */
+.reb-example .reb-tray--animated .reb-part {
+  animation-delay: calc(1260ms + 1000ms + (var(--reb-round) * 430ms));
+}
+
+@keyframes reb-example-reveal { to { opacity: 1; transform: none; } }
+@keyframes reb-tray-in { to { opacity: 1; transform: none; } }
+@keyframes reb-part-in { to { opacity: 1; transform: none; } }
+
+@media (max-height: 820px) and (min-width: 561px) {
+  .reb-problem-card { padding: 10px 12px; }
+  .reb-story-card { padding: 7px 10px; }
+  .reb-story-card p { line-height: 1.3; }
+  .reb-feedback { height: 32px; min-height: 32px; }
+}
+
+@media (min-width: 561px) and (min-height: 501px) and (max-height: 800px) {
+  .reb-story-card { padding: 3px 8px; }
+  .reb-story-card p { line-height: 1.05; }
+  .reb-feedback { height: 31px; min-height: 31px; }
+}
+
+@media (max-width: 560px) {
+  .reb-game .reb-problem-card { gap: 8px; }
+  .reb-story-card p { line-height: 1.3; }
+  .reb-feedback { height: 42px; min-height: 42px; white-space: normal; }
+  .reb-role-slot { min-height: 58px; }
+  .reb-role-slot strong { font-size: 31.5px; }
+  .reb-help-panel { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
+  .reb-help-picture { height: clamp(112px, 23vh, 170px); }
+  .reb-example-art { height: calc(136px - 3 * var(--reb-example-gap)); }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .reb-game > .mg-screen:first-child { padding: 8px; }
+  .reb-game > .mg-screen:first-child .mg-card { width: 100%; max-height: calc(100% - 16px); padding: 10px 8px; overflow: hidden; border-radius: 18px; }
+  .reb-game > .mg-screen:first-child .mg-emoji { font-size: 40px; }
+  .reb-game > .mg-screen:first-child .mg-title { font-size: 32px; line-height: .94; }
+  .reb-game > .mg-screen:first-child .mg-subtitle { font-size: 15px; line-height: 1.1; }
+  .reb-game > .mg-screen:first-child .mg-tag { margin-top: 4px; padding: 3px 7px; font-size: 15px; }
+  .reb-game > .mg-screen:first-child .mg-example { margin: 8px 0; padding: 7px; }
+  .reb-example-copy,
+  .reb-example-note { font-size: 17px; }
+  .reb-example { --reb-example-gap: 8px; }
+  .reb-example-art { height: calc(94px - 3 * var(--reb-example-gap)); }
+  .reb-example-equation { font-size: 24px; }
+  .reb-example-equation b { min-width: 30px; padding: 3px 6px; }
+  .reb-game > .mg-screen:first-child .mg-big-btn { min-height: 48px; padding: 8px 18px; font-size: 22px; }
+  .reb-game .mg-prompt { padding: 8px 10px; }
+  .reb-game .mg-stage { gap: 4px; }
+  .reb-game .mg-tile { padding: 6px; }
+  .reb-problem-card { padding: 4px; border-radius: 16px; }
+  .reb-story-card { padding: 2px 4px; }
+  .reb-story-card p { line-height: 1.3; }
+  .reb-problem-art { padding: 1px 2px; }
+  .reb-feedback { height: 31px; min-height: 31px; }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .reb-game .mg-prompt { padding: 6px 10px; }
+  .reb-game .mg-tile { padding: 4px 6px; line-height: 1; }
+  .reb-game .reb-problem-card.mg-card-column {
+    gap: 4px;
+    padding: 5px;
+    border-radius: 16px;
+    overflow: hidden;
+  }
+  .reb-story-card { align-self: stretch; overflow: hidden; padding: 4px 6px; border-width: 2px; }
+  .reb-story-card p { line-height: 1.1; }
+  .reb-problem-art { height: 100%; min-height: 0; padding: 1px 2px; border-width: 2px; }
+  .reb-feedback { height: 31px; min-height: 31px; white-space: normal; }
+  .reb-help-panel { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); grid-template-columns: minmax(0, 1.5fr) minmax(180px, .8fr); gap: 8px 12px; padding: 10px; }
+  .reb-help-panel > p { font-size: clamp(17px, 3vw, 22px); }
+  .reb-help-picture { grid-column: 1; grid-row: 1 / span 2; height: 112px; }
+  .reb-help-retry { grid-column: 2; min-height: 44px; padding: 6px 16px; font-size: 19px; }
+  .reb-role-slots { gap: 4px; }
+  .reb-role-slot { min-height: 38px; padding: 3px 2px; border-width: 2px; }
+  .reb-role-slot strong { font-size: 31.5px; }
+}
+
+.reb-compact-equation { display: none; }
+@media (min-width: 768px) {
+  .reb-countable-pile,
+  .reb-pile-collection { grid-template-columns: repeat(var(--reb-count), var(--reb-item-width, 18px)); }
+}
+/* Size type against the actual allocated card, not an inferred screenshot viewport. */
+@container reb-card (max-height: 320px) {
+  .reb-game .reb-problem-card .reb-story-card .mg-problem-body { font-size: clamp(15px, 6.5cqh, 22px); }
+}
+@container reb-card (max-height: 220px) {
+  .reb-game .reb-problem-card .reb-story-card .mg-problem-body { font-size: 15px; }
+}
+.reb-game .reb-problem-card .reb-story-card,
+.reb-game .reb-problem-card .reb-problem-art,
+.reb-game .reb-problem-card .reb-equation-slot {
+  padding: 6px;
+}
+@container reb-card (max-height: 220px) {
+  .reb-game .reb-problem-card .reb-story-card,
+  .reb-game .reb-problem-card .reb-problem-art,
+  .reb-game .reb-problem-card .reb-equation-slot { padding: 3px; }
+}
+/* Equation type uses its own allocated height, including the slot chrome. */
+.reb-game .reb-problem-card .reb-equation-line {
+  container: reb-equation / size;
+  --reb-equation-chrome: calc(12px + 2 * var(--mg-expression-slot-border-width));
+}
+@container reb-card (max-height: 220px) {
+  .reb-game .reb-problem-card .reb-equation-line {
+    --reb-equation-chrome: calc(6px + 2 * var(--mg-expression-slot-border-width));
+  }
+}
+@container reb-equation (min-height: 0px) {
+  .reb-game .reb-problem-card .reb-equation-line .mg-expression-value {
+    font-size: clamp(12px, calc((100cqh - var(--reb-equation-chrome) - 1px) / 1.15 * var(--reb-play-type-scale, 1)), var(--reb-play-value-cap, var(--mg-expression-value-size)));
+  }
+  .reb-game .reb-problem-card .reb-equation-line .mg-expression-label {
+    font-size: clamp(12px, calc((100cqh - var(--reb-equation-chrome) - 1px) / 1.05 * var(--reb-play-type-scale, 1)), var(--reb-play-label-cap, var(--mg-expression-label-size)));
+  }
+}
+/* Normal play uses available card space, including windows with browser chrome. */
+@container reb-card (min-width: 650px) and (min-height: 221px) {
+  .reb-group-equation { --reb-item-width: 28px; --reb-item-height: 34px; font-size: 26px; }
+  .reb-group-equation-row { max-width: none; gap: 8px; }
+  .reb-group-equation-text { flex: 0 0 auto; white-space: nowrap; }
+  .reb-group-equation-operator { flex: 0 0 auto; }
+  .reb-group-equation-row > span { font-size: inherit; }
+  .reb-game .reb-problem-card .reb-story-card .mg-problem-body { font-size: 28px; }
+  .reb-game .reb-problem-card .reb-equation-line {
+    --reb-play-type-scale: .9;
+    --reb-play-value-cap: calc(var(--mg-expression-value-size) * .9);
+    --reb-play-label-cap: calc(var(--mg-expression-label-size) * .9);
+  }
+}
+@container reb-card (min-width: 650px) and (min-height: 221px) and (max-height: 320px) {
+  .reb-game .reb-problem-card .reb-story-card .mg-problem-body { font-size: clamp(15px, 6cqh, 20px); }
+}
+@media (width: 1920px) and (height: 1080px), (width: 768px) and (height: 1024px) {
+  .reb-group-equation { --reb-item-width: 28px; --reb-item-height: 34px; font-size: 24px; }
+  .reb-group-equation-row { max-width: 760px; gap: 8px; }
+  .reb-group-equation-text { flex: 0 0 auto; white-space: nowrap; }
+  .reb-group-equation-text--unknown { flex-basis: auto; }
+  .reb-group-equation-operator { flex-basis: 20px; }
+}
+@media (width: 1920px) and (height: 1080px) {
+  .reb-group-equation { --reb-item-width: 56px; --reb-item-height: 68px; font-size: 32px; }
+  .reb-group-equation-row { max-width: none; }
+  .reb-countable-pile,
+  .reb-pile-collection { grid-template-columns: repeat(var(--reb-columns), 56px); }
+  .reb-group-equation-text { flex: 0 0 auto; white-space: nowrap; }
+}
+@media (width: 320px) and (height: 568px) {
+  .reb-group-equation { --reb-item-width: 16px; --reb-item-height: 20px; font-size: 15px; }
+  .reb-countable-pile { padding: 1px; border-width: 1px; }
+  .reb-countable-pile,
+  .reb-pile-collection { gap: 2px; }
+  .reb-group-equation-row { gap: 3px; }
+  .reb-game .reb-problem-card .reb-story-card .mg-problem-body { font-size: 13px; line-height: 1.2; }
+  .reb-game .reb-problem-card .reb-story-card,
+  .reb-game .reb-problem-card .reb-problem-art,
+  .reb-game .reb-problem-card .reb-equation-slot { padding: 2px; border-width: 2px; }
+  .reb-game .reb-problem-card .reb-equation-line .mg-expression-value { font-size: 16px; }
+  .reb-game .reb-problem-card .reb-equation-line .mg-expression-label { font-size: 14px; }
+}
+/* A wide card below this height cannot retain the short-landscape picture's
+   39.1px two-line label plus roughly 20px clearance on both sides in its 2/5 track.
+   18px card chrome + 12px gaps + 31px feedback + (39.1 + 40 + 4) / .4 = 268.75px.
+   Narrow portrait keeps its separately approved countable picture layout. */
+@container reb-visual (min-width: 561px) and (max-height: 270px) {
+  .reb-game .reb-problem-card.mg-card-column {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    grid-auto-rows: auto;
+    gap: 4px 8px;
+  }
+  .reb-game .reb-problem-card > .reb-problem-art,
+  .reb-game .reb-problem-card .reb-equation-slot,
+  .reb-game .reb-problem-card .reb-feedback:empty { display: none; }
+  .reb-game .reb-problem-card .reb-feedback { grid-column: 1 / -1; }
+  .reb-game .reb-problem-card .reb-compact-equation {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    align-content: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 3px;
+    border: 2px dashed #3156d8;
+    border-radius: 10px;
+    background: #e5f8f5;
+    font-family: var(--mg-font-read);
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1.15;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reb-example-value,
+  .reb-tray--animated,
+  .reb-tray--animated .reb-part { animation: none; opacity: 1; transform: none; }
+  .reb-game .mg-chip-streak.mg-hot { animation: none !important; transition: none !important; }
+  .reb-game :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake) {
+    animation-duration: .001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  .reb-game .mg-toast { opacity: 1 !important; }
+  .reb-game .mg-progress > i { transition: none !important; }
+}
+
+.reb-help-panel.reb-help-panel--counting {
+  grid-template-columns: minmax(0, 1fr);
+  padding-block: 24px;
+  gap: 16px;
+  overflow-y: auto;
+}
+.reb-help-panel--counting .reb-help-retry { grid-column: 1; }
+
+.reb-help-panel--counting .reb-help-sequence {
+  display: grid;
+  width: max-content;
+  max-width: 100%;
+  min-width: 0;
+  padding: 12px 20px;
+  background: #fff;
+  border: 3px solid transparent;
+  border-radius: 14px;
+}
+/* Invisible sizing text doubles the original intrinsic border-box width:
+   2 * text width + 46px here + 46px outer padding/border. */
+.reb-help-sequence::before {
+  content: attr(data-sequence) attr(data-sequence);
+  visibility: hidden;
+  white-space: pre;
+  padding-inline: 23px;
+  grid-area: 1 / 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.reb-help-sequence-terms {
+  grid-area: 1 / 1;
+  align-self: center;
+  justify-self: center;
+}
+.reb-help-sequence-terms > span {
+  display: inline-block;
+  opacity: 0;
+  animation: reb-part-in 180ms var(--reb-sequence-delay) ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .reb-help-sequence-terms > span { animation: none; opacity: 1; }
+}</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>
