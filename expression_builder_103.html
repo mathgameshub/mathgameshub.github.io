@@ -809,27 +809,23 @@ const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty(
 }, Symbol.toStringTag, { value: "Module" }));
 const SESSION_QUESTIONS = 6;
 const slot = (key, label) => expressionSlot({ key, label, unknown: true, mark: true, className: `eb-expression-slot eb-expression-slot--${key}` });
-const expressionBuilder = () => `<div class="eb-expression mg-expression-row mg-expression-row--readable-numerals" aria-label="Multiplication expression">${slot("groups", "groups")}<span class="eb-times mg-expression-operator">×</span>${slot("each", "in each group")}</div><p class="eb-feedback mg-feedback-line" aria-live="polite"></p>`;
+const expressionBuilder = () => `<div class="eb-expression mg-expression-row mg-expression-row--readable-numerals" aria-label="Multiplication expression">${slot("groups", "groups")}<span class="eb-times mg-expression-operator">×</span>${slot("each", "in each group")}</div>`;
 function groupDiagram(problem, { example = false } = {}) {
   const { groups, each } = problem.params;
   const { object } = problem.context;
   const columns = Math.min(groups, 4);
+  const size = patchSize(groups, columns);
   const art = example ? examplePatchSvg(groups, each, columns) : patchSvg(groups, each, columns);
-  return `<div class="eb-diagram mg-problem-body mg-card-picture" role="img" aria-label="${groups} equal groups with ${each} ${object} in each group">${art}</div>`;
+  return `<div class="eb-diagram mg-problem-body mg-card-picture" style="--eb-patch-ratio: ${size.w} / ${size.h}" role="img" aria-label="${groups} equal groups with ${each} ${object} in each group">${art}</div>`;
 }
 function setSlot(root, key, value) {
   fillExpressionSlot(root, key, String(value))?.classList.add("eb-expression-slot--filled");
-}
-function feedback(root, message, warm = false) {
-  const target = root.querySelector(".eb-feedback");
-  if (!target) return;
-  target.textContent = message;
-  target.classList.toggle("eb-feedback--warm", warm);
 }
 let hintHelp = null;
 function clearHintHelp() {
   if (!hintHelp) return;
   hintHelp.timers.forEach(clearTimeout);
+  hintHelp.stage?.removeAttribute("inert");
   hintHelp.panel.remove();
   hintHelp = null;
 }
@@ -874,7 +870,7 @@ function resumeAnswerTiles(root) {
     tile.disabled = false;
   });
 }
-function helpPanel(step, params) {
+function helpPanel(step, params, firstMiss = false) {
   const visual = hintVisual(step, params);
   const panel = document.createElement("section");
   panel.className = "eb-help-panel mg-help-panel";
@@ -894,7 +890,10 @@ function helpPanel(step, params) {
   retry.type = "button";
   retry.className = "eb-help-retry";
   retry.textContent = "TRY AGAIN";
-  panel.append(instruction, picture, retry);
+  if (firstMiss) {
+    instruction.textContent = step.key === "groups" ? "Count the groups." : "Count how many are in each group.";
+    panel.append(instruction, retry);
+  } else panel.append(instruction, picture, retry);
   return { panel, retry, groups: visual.groups, each: visual.each };
 }
 const game = defineGame({
@@ -931,7 +930,6 @@ const game = defineGame({
     const root = tile.closest(".mg-root");
     clearHintHelp();
     resumeAnswerTiles(root);
-    feedback(root, "");
     setSlot(root, step.key, step.choices.find((choice) => choice.id === step.answer).value);
     return { delayMs: 500 };
   },
@@ -939,26 +937,32 @@ const game = defineGame({
     const root = tile.closest(".mg-root");
     clearHintHelp();
     resumeAnswerTiles(root);
-    feedback(root, "");
     const step = state.problem.steps[state.stepIndex];
     setSlot(root, step.key, step.choices.find((choice) => choice.id === step.answer).value);
   },
   onWrong({ state, tile, step, fx }) {
     const root = tile.closest(".mg-root");
     const currentStep = step ?? state?.problem?.steps?.[state?.stepIndex ?? 0] ?? { key: "groups" };
-    feedback(root, currentStep.key === "groups" ? "Count the groups." : "Count how many are in each group.", true);
-    if ((state?.wrongAttempts ?? 1) < 2) {
-      return {
-        showToast: false,
-        shakeStage: false
-      };
-    }
+    const firstMiss = (state?.wrongAttempts ?? 1) < 2;
     clearHintHelp();
     pauseAnswerTiles(root);
-    const help = helpPanel(currentStep, state.problem.params);
+    const help = helpPanel(currentStep, state.problem.params, firstMiss);
     (fx ?? root?.querySelector?.(".mg-fx"))?.append(help.panel);
-    const timers = prefersReducedMotion() ? [] : scheduleHintSounds(currentStep, help.groups, help.each);
+    const timers = firstMiss || prefersReducedMotion() ? [] : scheduleHintSounds(currentStep, help.groups, help.each);
     setHintHelp(help.panel, timers);
+    const stage = root.querySelector(".mg-stage");
+    stage?.setAttribute("inert", "");
+    hintHelp.stage = stage;
+    help.panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        help.retry.click();
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        help.retry.focus();
+      }
+    });
     help.retry.focus();
     return {
       showToast: false,
@@ -967,6 +971,7 @@ const game = defineGame({
       onRetry: () => {
         clearHintHelp();
         resumeAnswerTiles(root);
+        tile.focus();
       }
     };
   },
@@ -1308,7 +1313,7 @@ body {
   font-family: var(--mg-font-read);
   font-size: var(--mg-expression-label-size);
   font-weight: 700;
-  line-height: 1.05;
+  line-height: var(--mg-expression-label-line-height, 1.05);
 }
 .mg-shell-standard .mg-expression-value {
   display: flex;
@@ -1321,7 +1326,7 @@ body {
   font-family: var(--mg-font-shout);
   font-size: var(--mg-expression-value-size);
   font-weight: 400;
-  line-height: 1.15;
+  line-height: var(--mg-expression-value-line-height, 1.15);
 }
 .mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
   font-family: var(--mg-font-read);
@@ -1533,9 +1538,6 @@ body {
   --mg-expression-slot-bg-filled: #dff7e6;
 }
 .eb-expression { color: #1a1a2e; }
-.eb-feedback { height: 31px; white-space: nowrap; color: #176b3a; }
-.eb-feedback:empty { visibility: hidden; }
-.eb-feedback--warm { color: #a56300; }
 
 /* Keep 103's accepted padding and centering, but use the safe visual area
    on tall screens instead of the shared content-height ceiling. */
@@ -1603,10 +1605,6 @@ body {
   .eb-diagram { height: 82.8px; }
 }
 
-@media (min-width: 561px) and (max-width: 900px) and (min-height: 501px) {
-  .eb-feedback { height: 77px; white-space: normal; }
-}
-
 @media (max-width: 560px) {
   .mg-root.eb-game {
     --mg-expression-label-size: 10.8px;
@@ -1621,7 +1619,6 @@ body {
     grid-template-columns: minmax(61.2px, 1fr) auto minmax(79.2px, 1.25fr);
     gap: 5.4px;
   }
-  .eb-feedback { height: 39px; white-space: normal; }
   .eb-help-panel { width: min(560px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
   .eb-help-picture { height: clamp(92px, 20vh, 140px); }
 }
@@ -1648,7 +1645,6 @@ body {
   .eb-game > .mg-screen:first-child .mg-big-btn { max-width: 100%; min-height: 48px; padding: 8px 14px; font-size: 19px; letter-spacing: 1px; white-space: nowrap; }
   .eb-teaching-card { padding: 8px; border-radius: 16px; }
   .eb-diagram { height: 64.8px; }
-  .eb-feedback { height: 32px; white-space: normal; }
 }
 
 @media (orientation: landscape) and (max-height: 500px) {
@@ -1664,7 +1660,6 @@ body {
     grid-template-columns: minmax(61.2px, 1fr) auto minmax(79.2px, 1.25fr);
     gap: 5.4px;
   }
-  .eb-feedback { height: 15px; white-space: normal; }
   .eb-help-panel { width: min(560px, calc(100% - 16px)); max-height: calc(100% - 16px); gap: 6px; padding: 10px; }
   .eb-help-picture { height: 72px; padding: 2px 4px; }
   .eb-help-retry { min-height: 44px; padding: 6px 16px; font-size: 19px; }
@@ -1708,6 +1703,90 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .eb-game :is(.cc-example-bush, .cc-example-critter, .eb-example-value) { animation: none; opacity: 1; transform: none; }
   .eb-game .eb-help-picture :is(.cc-hint-bush, .cc-hint-critter) { animation: none; opacity: 1; transform: none; }
+}
+
+/* Preview: larger labels; boxes gain 20% over their rendered baseline. */
+.mg-root.eb-game { --mg-expression-label-size: 32.4px; --mg-expression-slot-min-height: 127.425px; }
+.mg-shell-standard .eb-teaching-card.mg-card-column {
+  display: grid; grid-template-rows: minmax(0, 1fr) auto;
+  height: 100%; min-height: 0; flex: 1 1 auto; margin-block: 0;
+}
+.mg-shell-standard .eb-teaching-card > .eb-diagram { width: 100%; height: 100%; min-height: 0; max-height: none; }
+.mg-shell-standard .eb-expression.mg-expression-row {
+  width: 100%; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.4fr);
+}
+.mg-root.eb-game { --mg-expression-label-line-height: 1; --mg-expression-value-line-height: 1; }
+.eb-situation-lines { display: flex; flex-direction: column; justify-content: center; }
+@media (min-width: 561px) and (min-height: 501px) and (max-height: 800px) {
+  .mg-root.eb-game { --mg-expression-slot-min-height: 96.50625px; }
+}
+@media (max-width: 560px) {
+  .mg-root.eb-game { --mg-expression-label-size: 16.2px; --mg-expression-slot-min-height: 61.85625px; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-root.eb-game { --mg-expression-label-size: 10.8px; --mg-expression-slot-min-height: 54px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-root.eb-game { --mg-expression-label-size: 10.8px; --mg-expression-slot-min-height: 39.95625px; }
+  .eb-game .mg-stage { padding-bottom: 20px; }
+}
+
+/* Equal breathing room around the picture and below the expression row. */
+.mg-shell-standard .eb-teaching-card.mg-card-column {
+  container-type: size;
+  display: flex;
+  justify-content: space-evenly;
+  gap: 0;
+  padding-block: 0;
+}
+.mg-shell-standard .eb-teaching-card > .eb-diagram {
+  flex: 0 1 auto;
+  height: auto;
+  aspect-ratio: var(--eb-patch-ratio);
+  max-height: calc((100cqh - var(--mg-expression-slot-min-height)) * .6);
+}
+.mg-shell-standard .eb-teaching-card > .eb-expression { flex: 0 0 auto; }
+
+.mg-shell-standard .eb-expression.mg-expression-row {
+  justify-content: stretch;
+  justify-items: center;
+}
+.mg-shell-standard .eb-expression.mg-expression-row .mg-expression-slot {
+  width: 66%;
+  min-width: max-content;
+  padding-inline: clamp(6px, 1vw, 12px);
+}
+
+/* Center the operator and each section within its half of the row. */
+.mg-shell-standard .eb-expression.mg-expression-row {
+  grid-template-columns: minmax(0, 1fr) 0 minmax(0, 1fr);
+  gap: 0;
+}
+.mg-shell-standard .eb-expression.mg-expression-row .mg-expression-operator { justify-self: center; }
+.mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--groups {
+  width: calc((100% - var(--mg-expression-operator-size) * .5 - 14.4px) * .55);
+}
+.mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--each {
+  width: calc((100% - var(--mg-expression-operator-size) * .5 - 14.4px) * .77);
+}
+@media (max-width: 560px), (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--groups {
+    width: calc((100% - var(--mg-expression-operator-size) * .5 - 5.4px) * .55);
+  }
+  .mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--each {
+    width: calc((100% - var(--mg-expression-operator-size) * .5 - 5.4px) * .77);
+  }
+}
+
+/* Mirror the larger box's inner edge while keeping its center fixed. */
+.mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--groups {
+  justify-self: end;
+  margin-right: calc((100% - (100% - var(--mg-expression-operator-size) * .5 - 14.4px) * .77) / 2);
+}
+@media (max-width: 560px), (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--groups {
+    margin-right: calc((100% - (100% - var(--mg-expression-operator-size) * .5 - 5.4px) * .77) / 2);
+  }
 }</style>
 </head>
 <body>

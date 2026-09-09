@@ -829,26 +829,29 @@ function factTrail({ groups, each }, { example = false } = {}) {
       <span class="ct-equals mg-expression-operator">=</span>
       ${slot("total", example ? "altogether" : "all together")}
     </div>
-    ${example ? "" : '<p class="ct-feedback mg-feedback-line" aria-live="polite"></p>'}
   </section>`;
 }
 function fillSlot(root, key, label) {
   fillExpressionSlot(root, key, label)?.classList.add("ct-slot--filled");
 }
-function setFeedback(root, text) {
-  const feedback = root.querySelector(".ct-feedback");
-  if (feedback) feedback.textContent = text;
-}
 let teachingHelp = null;
+let firstMissFeedback = null;
+function clearFirstMissFeedback() {
+  if (!firstMissFeedback) return;
+  firstMissFeedback.timers?.forEach(clearTimeout);
+  firstMissFeedback.panel?.removeEventListener?.("keydown", firstMissFeedback.keyHandler);
+  firstMissFeedback.panel?.remove?.();
+  resumeAnswerTiles(firstMissFeedback.root);
+  firstMissFeedback = null;
+}
 function clearTeachingHelp() {
   if (!teachingHelp) return;
   teachingHelp.timers.forEach(clearTimeout);
-  teachingHelp.panel.remove();
+  teachingHelp.panel?.removeEventListener?.("keydown", teachingHelp.keyHandler);
+  teachingHelp.panel?.remove?.();
+  teachingHelp.stage?.removeAttribute?.("inert");
+  teachingHelp.stage?.removeAttribute?.("aria-hidden");
   teachingHelp = null;
-}
-function setTeachingHelp(panel, timers = []) {
-  clearTeachingHelp();
-  teachingHelp = { panel, timers };
 }
 function prefersReducedMotion() {
   return Boolean(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches);
@@ -916,11 +919,103 @@ function pauseAnswerTiles(root) {
   root?.querySelectorAll?.(".mg-tile").forEach((tile) => {
     tile.disabled = true;
   });
+  const stage = root?.classList?.contains?.("mg-stage") ? root : root?.querySelector?.(".mg-stage");
+  stage?.setAttribute?.("inert", "");
+  stage?.setAttribute?.("aria-hidden", "true");
+  return stage;
 }
 function resumeAnswerTiles(root) {
   root?.querySelectorAll?.(".mg-tile").forEach((tile) => {
     tile.disabled = false;
   });
+  const stage = root?.classList?.contains?.("mg-stage") ? root : root?.querySelector?.(".mg-stage");
+  stage?.removeAttribute?.("inert");
+  stage?.removeAttribute?.("aria-hidden");
+}
+function firstMissCopy(step) {
+  return step.key === "expression" ? "Count the bushes first. Then critters on each bush" : "Count every critter in the equal groups.";
+}
+function trapHelpFocus(panel, retry, onEscape) {
+  const keyHandler = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onEscape();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    event.preventDefault();
+    retry.focus();
+  };
+  panel.addEventListener("keydown", keyHandler);
+  return keyHandler;
+}
+function showFirstMissFeedback({ root, fx, tile, step }) {
+  clearFirstMissFeedback();
+  const stage = pauseAnswerTiles(root);
+  const panel = document.createElement("section");
+  panel.className = "ct-help-panel ct-first-miss";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "ct-first-miss-copy");
+  const instruction = document.createElement("p");
+  instruction.id = "ct-first-miss-copy";
+  instruction.textContent = firstMissCopy(step);
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "ct-help-retry";
+  retry.textContent = "TRY AGAIN";
+  retry.setAttribute("aria-label", "Try this problem again");
+  panel.append(instruction, retry);
+  (fx ?? root?.querySelector?.(".mg-fx"))?.append(panel);
+  const onEscape = () => {
+    const activeFeedback = firstMissFeedback;
+    retry.click();
+    if (firstMissFeedback === activeFeedback) {
+      clearFirstMissFeedback();
+      tile?.focus?.();
+    }
+  };
+  const keyHandler = trapHelpFocus(panel, retry, onEscape);
+  firstMissFeedback = { panel, root, stage, keyHandler, timers: [] };
+  retry.focus();
+  return {
+    retryElement: retry,
+    onRetry: () => {
+      clearFirstMissFeedback();
+      tile?.focus?.();
+    },
+    shakeStage: false,
+    showToast: false
+  };
+}
+function showTeachingHelp({ root, fx, tile, step, params }) {
+  clearTeachingHelp();
+  const stage = pauseAnswerTiles(root);
+  const help = makeHelpPanel(step, params);
+  const host = fx ?? root?.querySelector?.(".mg-fx");
+  host?.append(help.panel);
+  const timers = prefersReducedMotion() ? [] : help.cues.map((cue) => setTimeout(() => playHint(cue.kind, cue.index), cue.delay));
+  const finishHelp = () => {
+    clearTeachingHelp();
+    resumeAnswerTiles(root);
+    tile?.focus?.();
+  };
+  help.retry.addEventListener("click", finishHelp, { once: true });
+  const onEscape = () => {
+    const activeHelp = teachingHelp;
+    help.retry.click();
+    if (teachingHelp === activeHelp) {
+      finishHelp();
+      tile?.focus?.();
+    }
+  };
+  const keyHandler = trapHelpFocus(help.panel, help.retry, onEscape);
+  teachingHelp = { panel: help.panel, timers, stage, keyHandler, tile };
+  help.retry.focus();
+  return {
+    retryElement: help.retry,
+    onRetry: finishHelp
+  };
 }
 const game = defineGame({
   layout: "standard",
@@ -952,50 +1047,32 @@ const game = defineGame({
   },
   onStepCorrect({ tile, step }) {
     const root = tile.closest(".mg-stage") || tile.closest(".mg-root");
+    clearFirstMissFeedback();
     clearTeachingHelp();
     resumeAnswerTiles(root);
     const choice = step.choices.find((item) => item.id === step.answer);
     fillSlot(root, "expression", choice.label);
-    setFeedback(root, "");
     return { delayMs: 550 };
   },
   onCorrect({ state, tile, tier }) {
     const root = tile.closest(".mg-stage") || tile.closest(".mg-root");
+    clearFirstMissFeedback();
     clearTeachingHelp();
     resumeAnswerTiles(root);
     const step = state.problem.steps[state.stepIndex];
     const choice = step.choices.find((item) => item.id === step.answer);
     fillSlot(root, "total", String(choice.value));
-    setFeedback(root, "");
     if (tier) return { delayMs: STREAK_TOAST_ADVANCE_MS };
   },
   onWrong({ state, tile, step, fx }) {
-    const root = tile.closest(".mg-stage") || tile.closest(".mg-root");
-    setFeedback(root, step.key === "expression" ? "Count the bushes first. Then critters on each bush" : "Count every critter in the equal groups.");
-    if ((state?.wrongAttempts ?? 1) < 2) {
-      return {
-        showToast: false,
-        shakeStage: false
-      };
-    }
-    clearTeachingHelp();
-    pauseAnswerTiles(root);
-    const help = makeHelpPanel(step, state.problem.params);
-    (fx ?? root?.querySelector?.(".mg-fx"))?.append(help.panel);
-    const timers = prefersReducedMotion() ? [] : help.cues.map((cue) => setTimeout(() => playHint(cue.kind, cue.index), cue.delay));
-    setTeachingHelp(help.panel, timers);
-    help.retry.focus();
-    return {
-      showToast: false,
-      shakeStage: false,
-      retryElement: help.retry,
-      onRetry: () => {
-        clearTeachingHelp();
-        resumeAnswerTiles(root);
-      }
-    };
+    const root = tile.closest(".mg-root") || tile.closest(".mg-stage");
+    if ((state?.wrongAttempts ?? 1) < 2) return showFirstMissFeedback({ root, fx, tile, step });
+    clearFirstMissFeedback();
+    const help = showTeachingHelp({ root, fx, tile, step, params: state.problem.params });
+    return { showToast: false, shakeStage: false, ...help };
   },
   onDestroy() {
+    clearFirstMissFeedback();
     clearTeachingHelp();
   }
 });
@@ -1315,7 +1392,7 @@ body {
   font-family: var(--mg-font-read);
   font-size: var(--mg-expression-label-size);
   font-weight: 700;
-  line-height: 1.05;
+  line-height: var(--mg-expression-label-line-height, 1.05);
 }
 .mg-shell-standard .mg-expression-value {
   display: flex;
@@ -1328,7 +1405,7 @@ body {
   font-family: var(--mg-font-shout);
   font-size: var(--mg-expression-value-size);
   font-weight: 400;
-  line-height: 1.15;
+  line-height: var(--mg-expression-value-line-height, 1.15);
 }
 .mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
   font-family: var(--mg-font-read);
@@ -1486,16 +1563,10 @@ body {
 
 .ct-game .mg-visual { flex: 1 1 auto; align-items: stretch; }
 .ct-game .mg-tiles { align-self: center; }
-/* At laptop height, leave room for the countable picture above the answers. */
-@media (min-width: 561px) and (min-height: 600px) and (max-height: 899px) {
-  .ct-game { --mg-standard-answer-min-height: 64px; }
-}
 .ct-game .mg-toast-tier { animation-duration: 1.4s; }
 .ct-game :is(.mg-tile, .mg-big-btn):focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
 
-/* The card grid stays defined so the start-screen example (which does not opt
-   into the shell spacing classes) keeps its layout. On the in-game card the
-   shell's .mg-card-column wins on specificity and owns the distribution. */
+/* The start-screen example keeps its existing card layout. */
 .ct-trail-card { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 10px; width: min(920px, 100%); height: 100%; padding: clamp(10px, 2vw, 18px); align-content: stretch; color: #1a1a2e; background: #f7fff9; border: 4px solid #1a1a2e; border-radius: 22px; box-shadow: 0 6px 0 #1a1a2e; text-align: center; }
 .ct-game .mg-visual .ct-trail-card { min-height: 0; }
 .ct-story { display: flex; align-items: center; justify-content: center; margin: 0; font-weight: 700; }
@@ -1515,8 +1586,6 @@ body {
   --mg-expression-slot-bg-filled: #dff7e6;
 }
 .ct-fact { margin: 0; color: #1a1a2e; }
-.ct-feedback { height: 31px; min-height: 31px; margin: 0; overflow: hidden; white-space: nowrap; color: #a56300; }
-.ct-feedback:empty { visibility: hidden; }
 .ct-game .mg-example { padding: 10px; }
 .ct-game .mg-example .ct-story { font-size: 17px; }
 .ct-game .mg-example .ct-patch-wrap { height: 83px; }
@@ -1534,7 +1603,7 @@ body {
 
 /* The tall-screen shell's auto-height card can outgrow the visual region.
    Keep this play card inside that region and give the SVG only the space
-   left after the story, wide expression row, feedback and shell gaps. */
+   left after the story, expression row and gaps. */
 @media (min-height: 900px) {
   .ct-game .mg-visual .ct-trail-card {
     height: 100%;
@@ -1542,7 +1611,6 @@ body {
     margin-top: 0;
     margin-bottom: 0;
   }
-  .ct-game .mg-visual .ct-patch-wrap { flex: 1 1 0; }
 }
 
 .ct-game .cc-example-bush,
@@ -1608,13 +1676,8 @@ body {
   .ct-game .mg-visual .ct-patch-wrap { min-height: 45px; }
 }
 
-@media (min-width: 561px) and (max-width: 900px) and (min-height: 501px) {
-  .ct-feedback { width: auto; height: 63px; min-height: 63px; white-space: normal; }
-}
-
 @media (max-width: 560px) {
   .ct-game .mg-visual .ct-trail-card { min-height: 0; }
-  .ct-feedback { height: 42px; min-height: 42px; overflow: hidden; white-space: normal; }
   .ct-help-panel { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
   .ct-help-picture { height: clamp(110px, 24vh, 160px); }
 }
@@ -1632,11 +1695,9 @@ body {
   .ct-game > .mg-screen:first-child .ct-patch-wrap { height: 63px; padding: 3px; border-width: 2px; border-radius: 10px; }
   .ct-game > .mg-screen:first-child .ct-fact { margin-top: 6px; }
   .ct-game > .mg-screen:first-child .mg-big-btn { min-height: 50px; padding: 8px 22px; font-size: 25px; }
-  .ct-game .mg-tile { padding: 6px; }
   .ct-trail-card { padding: 8px; border-radius: 16px; }
   .ct-story { line-height: 1.3; }
   .ct-patch-wrap { min-height: 35px; padding: 2px 4px; }
-  .ct-feedback { height: 36px; min-height: 36px; }
   .ct-game .mg-visual .ct-trail-card { padding: 4px; }
   .ct-game .mg-visual .ct-story { line-height: 1.1; }
   .ct-game .mg-visual .ct-patch-wrap { min-height: 30px; }
@@ -1667,13 +1728,11 @@ body {
   .ct-game > .mg-screen:first-child .mg-example { grid-area: example; min-width: 0; margin: 0; padding: 6px; }
   .ct-game > .mg-screen:first-child .ct-trail-card { min-width: 0; }
   .ct-game > .mg-screen:first-child .mg-big-btn { grid-area: button; align-self: end; justify-self: center; min-height: 50px; padding: 8px 22px; font-size: 25px; }
-  .ct-game .mg-tile { padding: 4px 6px; line-height: 1; }
   .ct-game .mg-visual .ct-trail-card { min-height: 0; }
   .ct-trail-card { display: grid; grid-template-columns: minmax(250px, 1fr) minmax(230px, .9fr); grid-template-rows: 19px minmax(0, 1fr) 28px; grid-template-areas: 'story fact' 'patch fact' 'feedback feedback'; align-items: center; gap: 3px 12px; padding: 6px; border-radius: 16px; }
   .ct-fact { grid-area: fact; align-self: stretch; margin: 0; }
   .ct-story { grid-area: story; margin: 0; line-height: 1.1; }
   .ct-patch-wrap { grid-area: patch; min-height: 0; }
-  .ct-feedback { grid-area: feedback; height: 31px; min-height: 31px; margin: 0; padding: 0 3px; white-space: normal; }
   .ct-help-panel { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); grid-template-columns: minmax(0, 1.5fr) minmax(180px, .8fr); gap: 8px 12px; padding: 10px; }
   .ct-help-panel > p { font-size: clamp(17px, 3vw, 22px); }
   .ct-help-picture { grid-column: 1; grid-row: 1 / span 2; height: 112px; padding: 2px 4px; }
@@ -1684,6 +1743,35 @@ body {
   .ct-game :is(.cc-example-bush, .cc-example-critter) { animation: none; opacity: 1; transform: none; }
   .ct-game .mg-example .ct-slot--filled { animation: none; opacity: 1; transform: none; }
   .ct-game .ct-help-picture :is(.cc-hint-bush, .cc-hint-critter) { animation: none; opacity: 1; transform: none; }
+}
+
+/* Give the former feedback space to the story and a slightly taller row. */
+.ct-game .mg-visual .ct-trail-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(min-content, 2fr) minmax(30px, 3fr) auto;
+  align-items: stretch;
+}
+.ct-game .mg-visual .ct-story { min-height: 0; padding-block: 4px; }
+.ct-game .mg-visual .ct-fact { min-height: calc(var(--mg-expression-slot-min-height) + 16px); }
+.ct-game .mg-visual .ct-patch-wrap { max-height: none; }
+@media (orientation: landscape) and (max-height: 500px) {
+  .ct-game .mg-stage { padding-bottom: 20px; }
+  .ct-game .mg-tile { padding-inline: 0; white-space: nowrap; }
+  .ct-game .mg-visual .ct-trail-card {
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    grid-template-rows: minmax(24px, 1fr) minmax(24px, 2fr);
+    grid-template-areas: 'story fact' 'patch fact';
+    padding: 4px 8px;
+    gap: 4px 12px;
+  }
+  .ct-game .mg-visual .ct-fact { min-height: calc(var(--mg-expression-slot-min-height) + 16px); align-self: center; }
+  .ct-first-miss { grid-template-columns: minmax(0, 1fr); }
+  .ct-first-miss .ct-help-retry { grid-column: 1; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .ct-game .mg-stage { padding-bottom: 42px; }
+  .ct-game .mg-tile { padding: 0 6px; line-height: 1; }
 }</style>
 </head>
 <body>
