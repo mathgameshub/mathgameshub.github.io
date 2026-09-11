@@ -1378,7 +1378,7 @@ body {
   font-family: var(--mg-font-read);
   font-size: var(--mg-expression-label-size);
   font-weight: 700;
-  line-height: 1.05;
+  line-height: var(--mg-expression-label-line-height, 1.05);
 }
 .mg-shell-standard .mg-expression-value {
   display: flex;
@@ -1391,7 +1391,7 @@ body {
   font-family: var(--mg-font-shout);
   font-size: var(--mg-expression-value-size);
   font-weight: 400;
-  line-height: 1.15;
+  line-height: var(--mg-expression-value-line-height, 1.15);
 }
 .mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
   font-family: var(--mg-font-read);
