@@ -3946,7 +3946,7 @@ function helpCopy(step, params) {
     }
     return "Match each diagram or situation with its equation.";
   }
-  if (activeParams.unknownKind === "total") return `Count by ${activeParams.each} once for each ${c.group} to find the total number of ${c.items}.`;
+  if (activeParams.unknownKind === "total") return `Count by ${activeParams.each} for each ${c.group} to find the total number of ${c.items}.`;
   if (activeParams.unknownKind === "groups") return `Make groups of ${activeParams.each} ${c.items} until all ${activeParams.total} ${c.items} are used. How many ${c.groups} are needed?`;
   return `Share ${activeParams.total} ${c.items} equally among ${activeParams.groups} ${c.groups}. How many ${c.items} go in each ${c.group}?`;
 }
@@ -4010,7 +4010,7 @@ const game = defineGame({
   renderExample(el2) {
     const lesson = createStartLesson({
       composition: "story-cue-equation",
-      statement: SOURCE_STEMS.model,
+      statement: SOURCE_STEMS.model.split(/(?<=\.)\s+/),
       startMode: "diagram-equation",
       groups: 4,
       each: 5,
@@ -4019,6 +4019,7 @@ const game = defineGame({
       theme: "robot",
       context: "trays-gears"
     });
+    lesson.querySelector(".mf-statement").classList.add("mp-start-instructions");
     const modelParams = { groups: 4, each: 5, total: 20, unknownKind: "each", contextId: "trays-gears" };
     const oldPicture = lesson.querySelector?.(".mf-group-display");
     if (oldPicture) {
@@ -6476,6 +6477,17 @@ body {
 .mp-game .mp-start-diagram { display: grid; min-height: 0; place-items: center; }
 .mp-game .mp-start-diagram .mp-diagram-svg { width: min(310px, 100%); height: 116px; }
 .mp-game .mf-start-lesson:has(.mp-start-diagram) > .mf-statement { font-size: 18px; line-height: 1.2; }
+.mp-game .mp-start-instructions { counter-reset: instruction; text-align: left; }
+.mp-game .mp-start-instructions > p { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; width: 100%; margin: 0; }
+.mp-game .mp-start-instructions > p + p { margin-top: 8px; }
+.mp-game .mp-start-instructions > p::before {
+  counter-increment: instruction; content: counter(instruction);
+  display: grid; place-items: center; width: 22px; height: 22px;
+  border: 2px solid var(--mf-ink); border-radius: 50%;
+  background: #28cbd0; color: var(--mf-ink); font-size: 14px; line-height: 1;
+}
+.mp-game .mp-start-instructions > p:nth-child(2)::before { background: #ffd93d; }
+.mp-game .mp-start-instructions > p:nth-child(3)::before { background: #bca5f6; }
 .mp-game .mf-start-lesson:has(.mp-start-diagram) .mf-start-note { font-size: 17px; }
 
 @media (max-width: 560px) {
