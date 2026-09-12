@@ -1,0 +1,3364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+const CONFETTI_COLORS = ["#ffd93d", "#2ed573", "#6bcbff", "#b28dff", "#ff8fab", "#ff9f43"];
+function confetti(root, count = 24) {
+  for (let i = 0; i < count; i += 1) {
+    const p = document.createElement("i");
+    p.className = "mg-confetti";
+    p.style.left = `${Math.random() * 100}%`;
+    p.style.background = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
+    p.style.animationDelay = `${Math.random() * 0.4}s`;
+    p.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    p.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.appendChild(p);
+    p.addEventListener("animationend", () => p.remove());
+  }
+}
+function flyEmoji(root, from, emoji = "⭐", count = 5) {
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const e = document.createElement("span");
+    e.className = "mg-fly";
+    e.textContent = emoji;
+    e.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    e.style.top = `${r.top - base.top + r.height / 2}px`;
+    e.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    e.style.animationDelay = `${i * 0.05}s`;
+    root.appendChild(e);
+    e.addEventListener("animationend", () => e.remove());
+  }
+}
+function toast(root, text, kind = "good", { removeAfterMs } = {}) {
+  const t = document.createElement("div");
+  t.className = `mg-toast mg-toast-${kind}`;
+  t.textContent = text;
+  root.appendChild(t);
+  let removalTimer = null;
+  let removed = false;
+  const remove = () => {
+    if (removed) return;
+    removed = true;
+    if (removalTimer != null) clearTimeout(removalTimer);
+    removalTimer = null;
+    t.remove();
+  };
+  t.addEventListener("animationend", remove, { once: true });
+  if (Number.isFinite(removeAfterMs) && removeAfterMs >= 0) {
+    removalTimer = setTimeout(remove, removeAfterMs);
+  }
+}
+const PRAISE = ["NICE!", "YES!", "GOT IT!", "NO CAP!", "GOATED!", "W!", "SLAY!", "BOOM!"];
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+const END_TITLE = "You're a Mathematician!";
+const TRY_AGAIN = "TRY AGAIN";
+function checkGenerator(game, { count = 500, seed = 1, choiceCounts = [3, 4] } = {}) {
+  const rng = createRng(seed);
+  const errors = [];
+  const seenParams = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i += 1) {
+    let params;
+    let problem;
+    try {
+      params = game.generate(rng);
+      problem = game.build(params, rng);
+    } catch (e) {
+      errors.push(`#${i}: threw ${e.message}`);
+      continue;
+    }
+    const tag = `#${i} ${JSON.stringify(params)}`;
+    if (JSON.stringify(JSON.parse(JSON.stringify(params))) !== JSON.stringify(params)) errors.push(`${tag}: params must be JSON-safe`);
+    if (!problem || typeof problem !== "object") {
+      errors.push(`${tag}: build returned nothing`);
+      continue;
+    }
+    if (JSON.stringify(problem.params) !== JSON.stringify(params)) errors.push(`${tag}: problem.params must equal the input params`);
+    const validateStep = (step, label, requireValue = false) => {
+      if (typeof step?.prompt !== "string" || !step.prompt.trim()) errors.push(`${tag}: ${label} prompt must be non-empty text`);
+      const choices = step?.choices;
+      if (!Array.isArray(choices) || !choiceCounts.includes(choices.length)) errors.push(`${tag}: ${label} expected ${choiceCounts.join(" or ")} choices, got ${choices && choices.length}`);
+      else {
+        const ids = choices.map((c2) => c2 && c2.id);
+        const labels = choices.map((c2) => c2 && String(c2.label));
+        if (new Set(ids).size !== ids.length) errors.push(`${tag}: ${label} choice ids must be unique`);
+        if (new Set(labels).size !== labels.length) errors.push(`${tag}: ${label} choice labels must be unique (${labels.join(" | ")})`);
+        if (!ids.includes(step.answer)) errors.push(`${tag}: ${label} answer ${step.answer} is not a choice id`);
+        if (choices.some((c2) => !c2 || c2.label == null)) errors.push(`${tag}: ${label} every choice needs a label`);
+        if (requireValue && choices.some((c2) => typeof c2?.value !== "number" || !Number.isFinite(c2.value))) errors.push(`${tag}: ${label} every choice needs a finite numeric value`);
+      }
+    };
+    if (problem.steps) {
+      if (!Array.isArray(problem.steps) || problem.steps.length === 0) errors.push(`${tag}: steps must be a non-empty array`);
+      else {
+        const keys = problem.steps.map((step) => step && step.key);
+        if (keys.some((key) => typeof key !== "string" || !key)) errors.push(`${tag}: every step needs a key`);
+        if (new Set(keys).size !== keys.length) errors.push(`${tag}: step keys must be unique`);
+        problem.steps.forEach((step, index) => validateStep(step, `step ${index + 1}`, true));
+      }
+    } else {
+      validateStep(problem, "problem");
+    }
+    if (game.ranges) {
+      for (const [k, [min, max]] of Object.entries(game.ranges)) {
+        const v = params[k];
+        if (typeof v !== "number" || v < min || v > max) errors.push(`${tag}: ${k}=${v} outside [${min}, ${max}]`);
+      }
+    }
+    if (typeof game.check === "function") {
+      for (const msg of game.check(problem) || []) errors.push(`${tag}: ${msg}`);
+    }
+    const again = game.build(JSON.parse(JSON.stringify(params)), createRng(seed + i));
+    const answerLabels = (p) => (p.steps || [p]).map((step) => step.choices.find((c2) => c2.id === step.answer)?.label);
+    if (JSON.stringify(answerLabels(again)) !== JSON.stringify(answerLabels(problem))) errors.push(`${tag}: rebuilding from params changed the correct answer`);
+    seenParams.add(JSON.stringify(params));
+  }
+  return { count, distinct: seenParams.size, errors };
+}
+function makeChoices(rng, { correct, distractors, count = 4, key = (c2) => String(c2.label) }) {
+  if (!correct || correct.id == null) throw new Error("makeChoices: correct needs an id");
+  const seen = /* @__PURE__ */ new Set([key(correct)]);
+  const picked = [];
+  for (const d of distractors) {
+    const k = key(d);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    picked.push({ ...d, id: d.id ?? `d${picked.length}` });
+    if (picked.length === count - 1) break;
+  }
+  if (picked.length < count - 1) {
+    throw new Error(`makeChoices: needed ${count - 1} distinct distractors, got ${picked.length}`);
+  }
+  const choices = rng.shuffle([correct, ...picked]);
+  return { choices, answer: correct.id };
+}
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+const CHART_SIZE = 10;
+const PROMPT = "Determine the product.";
+const ranges = { row: [1, CHART_SIZE], col: [1, CHART_SIZE] };
+function product(row, col) {
+  return row * col;
+}
+function generate(rng) {
+  return { row: rng.int(1, CHART_SIZE), col: rng.int(1, CHART_SIZE), seed: rng.int(1, 2147483646) };
+}
+function distractorsFor(row, col) {
+  const p = product(row, col);
+  const big = Math.max(row, col);
+  const candidates = [
+    { value: (row + 1) * col, why: "next row" },
+    { value: row * (col + 1), why: "next column" },
+    { value: (row - 1) * col, why: "previous row" },
+    { value: row * (col - 1), why: "previous column" },
+    { value: p - big, why: "one jump short" },
+    { value: p + big, why: "one jump past" },
+    { value: row + col, why: "added the factors" },
+    { value: big, why: "confused a factor with the product" },
+    { value: p + 1, why: "one more" },
+    { value: p - 1, why: "one less" },
+    { value: p + 2, why: "two more" },
+    { value: p + 3, why: "three more" },
+    { value: p + 4, why: "four more" }
+  ];
+  const seen = /* @__PURE__ */ new Set([p]);
+  const out = [];
+  for (const c2 of candidates) {
+    if (!Number.isInteger(c2.value) || c2.value < 1 || c2.value > 120 || seen.has(c2.value)) continue;
+    seen.add(c2.value);
+    out.push({ label: String(c2.value), value: c2.value, why: c2.why });
+  }
+  return out;
+}
+function build(params, rng) {
+  const { row, col } = params;
+  const p = product(row, col);
+  const shuffleRng = Number.isInteger(params.seed) ? createRng(params.seed) : rng;
+  const { choices, answer } = makeChoices(shuffleRng, {
+    correct: { id: "correct", label: String(p), value: p },
+    distractors: distractorsFor(row, col),
+    count: 4
+  });
+  return {
+    params,
+    prompt: PROMPT,
+    equation: `${row} × ${col} = ?`,
+    product: p,
+    choices,
+    answer
+  };
+}
+function check(problem) {
+  const errors = [];
+  const { row, col } = problem.params;
+  const correct = problem.choices.find((c2) => c2.id === problem.answer);
+  if (correct.value !== row * col) errors.push(`answer ${correct.value} is not ${row} × ${col}`);
+  const values = problem.choices.map((c2) => c2.value);
+  if (values.filter((v) => v === row * col).length !== 1) errors.push("more than one choice equals the product");
+  if (values.some((v) => !Number.isInteger(v) || v < 1)) errors.push("choice values must be positive integers");
+  if (problem.choices.length !== 4) errors.push("four choices are required");
+  return errors;
+}
+function helpSequence(row, col) {
+  const step = Math.max(row, col);
+  const jumps = Math.min(row, col);
+  const shown = [];
+  for (let i = 1; i < jumps; i += 1) shown.push(i * step);
+  return {
+    step,
+    jumps,
+    shown,
+    startsAtZero: jumps === 1,
+    equation: `${row} × ${col}`
+  };
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  CHART_SIZE,
+  PROMPT,
+  build,
+  check,
+  distractorsFor,
+  generate,
+  helpSequence,
+  product,
+  ranges
+}, Symbol.toStringTag, { value: "Module" }));
+const MILESTONES = Object.freeze([6, 36, 64, 100]);
+const SAVE_VERSION = 2;
+const PHASES = Object.freeze(["question", "reward", "decision"]);
+const CHOICE_SEED_MAX = 2147483646;
+const cellKey = (row, col) => `${row}x${col}`;
+const parseKey = (key) => {
+  const [row, col] = String(key).split("x").map(Number);
+  return { row, col };
+};
+const isCanonicalKey = (key) => {
+  const { row, col } = parseKey(key);
+  return Number.isInteger(row) && Number.isInteger(col) && row >= 1 && row <= CHART_SIZE && col >= 1 && col <= CHART_SIZE && cellKey(row, col) === key;
+};
+function lineCells(family, direction) {
+  const cells = [];
+  for (let n = 1; n <= CHART_SIZE; n += 1) {
+    cells.push(direction === "row" ? { row: family, col: n } : { row: n, col: family });
+  }
+  return cells;
+}
+function pushNew(list, seen, cell, stage, direction, family) {
+  const key = cellKey(cell.row, cell.col);
+  if (seen.has(key)) return false;
+  seen.add(key);
+  list.push({ row: cell.row, col: cell.col, key, stage, direction, family });
+  return true;
+}
+function planSession(rng) {
+  const numbers = rng.shuffle(Array.from({ length: CHART_SIZE }, (_, i) => i + 1));
+  const [f1, f2, g1, g2] = numbers;
+  const families = { opening: [f1, f2], next: [g1, g2] };
+  const seen = /* @__PURE__ */ new Set();
+  const schedule = [];
+  const others = numbers.slice(2);
+  const partner = () => rng.pick(others);
+  const rowQuestions = [
+    { row: f1, col: partner() },
+    { row: f2, col: partner() }
+  ];
+  const colQuestions = [
+    { row: partner(), col: f1 },
+    { row: partner(), col: f2 }
+  ];
+  const rowPool = rng.shuffle([...lineCells(f1, "row"), ...lineCells(f2, "row")]);
+  const colPool = rng.shuffle([...lineCells(f1, "col"), ...lineCells(f2, "col")]);
+  const openingRows = rng.shuffle(rowQuestions);
+  const openingCols = rng.shuffle(colQuestions);
+  openingRows.forEach((cell) => pushNew(schedule, seen, cell, 1, "row", cell.row));
+  for (const cell of rowPool) {
+    if (schedule.length >= 3) break;
+    pushNew(schedule, seen, cell, 1, "row", cell.row);
+  }
+  openingCols.forEach((cell) => pushNew(schedule, seen, cell, 1, "col", cell.col));
+  for (const cell of colPool) {
+    if (schedule.length >= 6) break;
+    pushNew(schedule, seen, cell, 1, "col", cell.col);
+  }
+  const finishFamilies = (pair, stage) => {
+    for (const family of pair) lineCells(family, "row").forEach((cell) => pushNew(schedule, seen, cell, stage, "row", family));
+    for (const family of pair) lineCells(family, "col").forEach((cell) => pushNew(schedule, seen, cell, stage, "col", family));
+  };
+  finishFamilies(families.opening, 2);
+  finishFamilies(families.next, 3);
+  for (let row = 1; row <= CHART_SIZE; row += 1) {
+    for (let col = 1; col <= CHART_SIZE; col += 1) pushNew(schedule, seen, { row, col }, 4, "row", row);
+  }
+  return { families, schedule };
+}
+function stageBounds(completed) {
+  let start = 0;
+  for (const end of MILESTONES) {
+    if (completed < end) return { start, end, stage: MILESTONES.indexOf(end) + 1 };
+    start = end;
+  }
+  return { start: MILESTONES[MILESTONES.length - 2], end: 100, stage: 4 };
+}
+function milestoneReached(completed) {
+  return MILESTONES.includes(completed) ? completed : null;
+}
+function equipmentFor(completed) {
+  return {
+    powered: completed >= 6,
+    skates: completed >= 36,
+    jetpack: completed >= 64,
+    launched: completed >= 100
+  };
+}
+function rivalProgress(completed) {
+  return Math.max(0, completed - 1);
+}
+function activeFamilies(plan, stage) {
+  if (stage <= 2) return plan.families.opening;
+  if (stage === 3) return plan.families.next;
+  return [];
+}
+function continuationOptions(completed) {
+  if (completed >= 100) return [];
+  const remaining = 100 - completed;
+  const options = [{ id: "stop", label: "STOP HERE", detail: "See your results" }];
+  if (completed === 6) {
+    options.push({ id: "continue", label: "FINISH THESE ROWS AND COLUMNS", detail: "30 more squares" });
+    options.push({ id: "all", label: "FILL THE WHOLE CHART", detail: `${remaining} more squares` });
+  } else if (completed === 36) {
+    options.push({ id: "continue", label: "ADD TWO NEW NUMBERS", detail: "28 more squares" });
+    options.push({ id: "all", label: "FILL THE WHOLE CHART", detail: `${remaining} more squares` });
+  } else {
+    options.push({ id: "all", label: "FILL THE WHOLE CHART", detail: `${remaining} more squares` });
+  }
+  return options;
+}
+function derivePlan(seed) {
+  const rng = createRng(seed);
+  const plan = planSession(rng);
+  return {
+    families: plan.families,
+    schedule: plan.schedule.map((c2) => c2.key),
+    choiceSeed: rng.int(1, CHOICE_SEED_MAX)
+  };
+}
+const nextChoiceSeed = (seed) => seed * 48271 % 2147483647 || 7;
+function choiceSeedAt(seed, completed) {
+  let value = derivePlan(seed).choiceSeed;
+  for (let i = 0; i < completed; i += 1) value = nextChoiceSeed(value);
+  return value;
+}
+function newSession(seed = Date.now()) {
+  const plan = derivePlan(seed);
+  return {
+    version: SAVE_VERSION,
+    seed,
+    families: plan.families,
+    schedule: plan.schedule,
+    completed: 0,
+    phase: "question",
+    // 'reward' = milestone reward owed, 'decision' = continuation choice open
+    mode: "ask",
+    // 'ask' pauses at milestones; 'all' plays straight through
+    score: 0,
+    streak: 0,
+    bestStreak: 0,
+    questionsAnswered: 0,
+    wrongAttempts: 0,
+    choiceSeed: plan.choiceSeed,
+    performanceIndex: -1,
+    finished: false
+  };
+}
+function jumpTo(session, completed) {
+  session.completed = completed;
+  session.questionsAnswered = completed;
+  session.streak = 0;
+  session.bestStreak = Math.min(session.bestStreak, completed);
+  session.score = Math.max(Math.min(session.score, maxScore(completed)), minScore(completed));
+  session.wrongAttempts = 0;
+  session.choiceSeed = choiceSeedAt(session.seed, completed);
+  session.phase = "question";
+  session.mode = "ask";
+  return session;
+}
+const minScore = (completed) => 11 * completed;
+const maxScore = (completed) => 10 * completed + completed * (completed + 1) / 2;
+function currentCell(session) {
+  if (session.completed >= session.schedule.length || session.phase !== "question") return null;
+  const { row, col } = parseKey(session.schedule[session.completed]);
+  return { row, col, seed: session.choiceSeed };
+}
+function applyCorrect(session, basePoints = 10) {
+  session.completed += 1;
+  session.streak += 1;
+  session.bestStreak = Math.max(session.bestStreak, session.streak);
+  session.score += basePoints + session.streak;
+  session.questionsAnswered += 1;
+  session.wrongAttempts = 0;
+  session.choiceSeed = nextChoiceSeed(session.choiceSeed);
+  const milestone = milestoneReached(session.completed);
+  session.phase = milestone ? "reward" : "question";
+  return milestone;
+}
+function applyReplayCorrect(session) {
+  session.questionsAnswered += 1;
+  session.wrongAttempts = 0;
+}
+function applyWrong(session) {
+  session.streak = 0;
+  session.wrongAttempts += 1;
+}
+function settleReward(session) {
+  if (session.phase !== "reward") return session.phase;
+  if (session.completed >= 100) return "reward";
+  session.phase = session.mode === "all" ? "question" : "decision";
+  return session.phase;
+}
+function applyDecision(session, decision) {
+  if (decision === "all") session.mode = "all";
+  if (decision === "stop") session.finished = true;
+  session.phase = "question";
+  return session;
+}
+function displayBounds(session) {
+  const completed = session?.completed ?? 0;
+  if (session && session.phase !== "question" && completed > 0) return stageBounds(completed - 1);
+  return stageBounds(Math.min(completed, 99));
+}
+const isInt = (v, min, max) => Number.isInteger(v) && v >= min && v <= max;
+const sameFamilies = (saved, derived) => Array.isArray(saved) && saved.length === derived.length && saved.every((n, i) => Number.isInteger(n) && n === derived[i]);
+function parseSaved(raw) {
+  try {
+    const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!data || data.version !== SAVE_VERSION) return null;
+    if (!Number.isSafeInteger(data.seed) || data.seed < 0) return null;
+    if (!Array.isArray(data.schedule) || data.schedule.length !== 100) return null;
+    const keys = /* @__PURE__ */ new Set();
+    for (const key of data.schedule) {
+      if (typeof key !== "string" || !isCanonicalKey(key) || keys.has(key)) return null;
+      keys.add(key);
+    }
+    const expected = derivePlan(data.seed);
+    if (data.schedule.some((key, index) => key !== expected.schedule[index])) return null;
+    const opening = data.families?.opening;
+    const next = data.families?.next;
+    if (!sameFamilies(opening, expected.families.opening) || !sameFamilies(next, expected.families.next)) return null;
+    if (!isInt(data.completed, 0, 100) || !isInt(data.questionsAnswered, data.completed, 1e7)) return null;
+    if (!isInt(data.streak, 0, 100) || !isInt(data.bestStreak, 0, 100)) return null;
+    if (data.streak > data.completed || data.bestStreak > data.completed || data.streak > data.bestStreak) return null;
+    if (!isInt(data.score, 0, 1e7) || data.score < minScore(data.completed) || data.score > maxScore(data.completed)) return null;
+    if (!isInt(data.wrongAttempts, 0, 1e3) || data.wrongAttempts > 0 && data.streak !== 0) return null;
+    if (!isInt(data.choiceSeed, 1, CHOICE_SEED_MAX) || data.choiceSeed !== choiceSeedAt(data.seed, data.completed)) return null;
+    if (!["ask", "all"].includes(data.mode) || !PHASES.includes(data.phase)) return null;
+    if (data.finished === true) return null;
+    if (data.phase === "question" && data.completed >= 100) return null;
+    if (data.phase !== "question" && !MILESTONES.includes(data.completed)) return null;
+    if (data.phase === "decision" && (data.completed >= 100 || data.mode === "all")) return null;
+    if (data.phase !== "question" && data.wrongAttempts !== 0) return null;
+    return {
+      version: SAVE_VERSION,
+      seed: data.seed,
+      families: { opening: [...opening], next: [...next] },
+      schedule: [...data.schedule],
+      completed: data.completed,
+      phase: data.phase,
+      mode: data.mode,
+      score: data.score,
+      streak: data.streak,
+      bestStreak: data.bestStreak,
+      questionsAnswered: data.questionsAnswered,
+      wrongAttempts: data.wrongAttempts,
+      choiceSeed: data.choiceSeed,
+      performanceIndex: isInt(data.performanceIndex, -1, 100) ? data.performanceIndex : -1,
+      finished: false
+    };
+  } catch {
+    return null;
+  }
+}
+function serialize(session) {
+  return JSON.stringify(session);
+}
+function chartMarkup({ size = CHART_SIZE, idPrefix = "fg" } = {}) {
+  const rows = [];
+  let header = `<div class="fg-cell fg-cell--corner" role="columnheader" aria-label="row times column"><span>×</span></div>`;
+  for (let col = 1; col <= size; col += 1) {
+    header += `<div class="fg-cell fg-cell--head fg-cell--col-head" role="columnheader" data-col="${col}" id="${idPrefix}-col-${col}"><span>${col}</span></div>`;
+  }
+  rows.push(`<div class="fg-chart-row" role="row">${header}</div>`);
+  for (let row = 1; row <= size; row += 1) {
+    let line = `<div class="fg-cell fg-cell--head fg-cell--row-head" role="rowheader" data-row="${row}" id="${idPrefix}-row-${row}"><span>${row}</span></div>`;
+    for (let col = 1; col <= size; col += 1) {
+      line += `<div class="fg-cell fg-cell--product" role="cell" data-row="${row}" data-col="${col}" data-key="${cellKey(row, col)}" aria-label="row ${row} column ${col}, empty"><span></span></div>`;
+    }
+    rows.push(`<div class="fg-chart-row" role="row">${line}</div>`);
+  }
+  return `<div class="fg-chart" role="table" aria-label="Multiplication chart, factors 1 through 10" style="--fg-size:${size}">${rows.join("")}</div>`;
+}
+function createChartView(container) {
+  const cells = /* @__PURE__ */ new Map();
+  container.querySelectorAll(".fg-cell--product").forEach((cell) => cells.set(cell.dataset.key, cell));
+  const heads = {
+    row: /* @__PURE__ */ new Map(),
+    col: /* @__PURE__ */ new Map()
+  };
+  container.querySelectorAll(".fg-cell--row-head").forEach((cell) => heads.row.set(Number(cell.dataset.row), cell));
+  container.querySelectorAll(".fg-cell--col-head").forEach((cell) => heads.col.set(Number(cell.dataset.col), cell));
+  function fill(row, col, value, { animate = true } = {}) {
+    const cell = cells.get(cellKey(row, col));
+    if (!cell) return;
+    cell.classList.add("fg-cell--done");
+    cell.classList.toggle("fg-cell--just", animate);
+    cell.querySelector("span").textContent = String(value);
+    cell.setAttribute("aria-label", `row ${row} column ${col}, ${value}`);
+  }
+  function clearJust() {
+    container.querySelectorAll(".fg-cell--just").forEach((cell) => cell.classList.remove("fg-cell--just"));
+  }
+  function setFamilies(families) {
+    const set = new Set(families);
+    heads.row.forEach((head, n) => head.classList.toggle("fg-cell--family", set.has(n)));
+    heads.col.forEach((head, n) => head.classList.toggle("fg-cell--family", set.has(n)));
+    cells.forEach((cell) => {
+      const r = Number(cell.dataset.row);
+      const c2 = Number(cell.dataset.col);
+      cell.classList.toggle("fg-cell--family", set.has(r) || set.has(c2));
+    });
+  }
+  function setTarget(row, col) {
+    clearJust();
+    cells.forEach((cell) => {
+      const r = Number(cell.dataset.row);
+      const c2 = Number(cell.dataset.col);
+      cell.classList.toggle("fg-cell--active-line", row != null && (r === row || c2 === col));
+      const isTarget = row != null && r === row && c2 === col;
+      cell.classList.toggle("fg-cell--target", isTarget);
+      if (isTarget) {
+        cell.querySelector("span").textContent = "?";
+        cell.setAttribute("aria-label", `row ${row} column ${col}, this square, unknown`);
+        cell.setAttribute("aria-current", "true");
+      } else {
+        cell.removeAttribute("aria-current");
+        if (!cell.classList.contains("fg-cell--done")) cell.querySelector("span").textContent = "";
+      }
+    });
+    heads.row.forEach((head, n) => head.classList.toggle("fg-cell--active-head", n === row));
+    heads.col.forEach((head, n) => head.classList.toggle("fg-cell--active-head", n === col));
+  }
+  function reset() {
+    cells.forEach((cell) => {
+      cell.className = "fg-cell fg-cell--product";
+      cell.querySelector("span").textContent = "";
+      cell.setAttribute("aria-label", `row ${cell.dataset.row} column ${cell.dataset.col}, empty`);
+      cell.removeAttribute("aria-current");
+    });
+    heads.row.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head"));
+    heads.col.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head"));
+  }
+  function cellElement(row, col) {
+    return cells.get(cellKey(row, col)) ?? null;
+  }
+  return { fill, setFamilies, setTarget, reset, cellElement, clearJust, cells };
+}
+const ROBOT = Object.freeze({
+  ink: "#13213f",
+  shell: "#7fe3d2",
+  shellDark: "#3fbfae",
+  face: "#fff4d6",
+  trim: "#f29b38",
+  eye: "#13213f",
+  glow: "#ffd93d",
+  flame: "#ff7a3d",
+  flameCore: "#ffe27a",
+  chrome: "#dfe7f2"
+});
+const PERFORMANCES = Object.freeze([
+  { id: "shuffle", label: "Shuffle", ms: 1150 },
+  { id: "heelclick", label: "Heel-click hop", ms: 1100 },
+  { id: "spin", label: "Spin", ms: 1150 },
+  { id: "fistpump", label: "Fist pump", ms: 1e3 },
+  { id: "cartwheel", label: "Cartwheel", ms: 1250 },
+  { id: "star", label: "Holo star", ms: 1200 }
+]);
+const MILESTONE_SCENES = Object.freeze({
+  6: { id: "powerup", label: "Power-up dance", ms: 5200, title: "POWER UP!", line: "The antenna lights up. Dance time!" },
+  36: { id: "skate", label: "Roller-skate dance", ms: 5600, title: "ROLLER SKATES!", line: "Skates pop out for a skating dance." },
+  64: { id: "jetpack", label: "Jetpack dance", ms: 6e3, title: "JETPACK!", line: "The jetpack lifts off for a flying dance." },
+  100: { id: "finale", label: "Grand finale", ms: 8200, title: "WHOLE CHART!", line: "The chart becomes a launchpad. Blast off!" }
+});
+const c = ROBOT;
+function robotSvg({ idPrefix = "fg" } = {}) {
+  return `<svg class="fg-robot-svg" viewBox="0 0 140 170" preserveAspectRatio="xMidYMax meet" focusable="false" aria-hidden="true">
+  <defs>
+    <radialGradient id="${idPrefix}-bulb" cx="40%" cy="35%" r="70%">
+      <stop offset="0" stop-color="#fff7c2"/>
+      <stop offset="1" stop-color="${c.glow}"/>
+    </radialGradient>
+    <linearGradient id="${idPrefix}-shell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9df0e2"/>
+      <stop offset="1" stop-color="${c.shell}"/>
+    </linearGradient>
+    <linearGradient id="${idPrefix}-metal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f4f8ff"/>
+      <stop offset="1" stop-color="${c.chrome}"/>
+    </linearGradient>
+  </defs>
+  <g class="fg-robot-shadow"><ellipse cx="70" cy="162" rx="34" ry="5" fill="${c.ink}" opacity=".18"/></g>
+  <g class="fg-robot-rig">
+    <g class="fg-jetpack">
+      <rect x="28" y="84" width="16" height="40" rx="7" fill="url(#${idPrefix}-metal)" stroke="${c.ink}" stroke-width="3"/>
+      <rect x="96" y="84" width="16" height="40" rx="7" fill="url(#${idPrefix}-metal)" stroke="${c.ink}" stroke-width="3"/>
+      <rect x="31" y="90" width="10" height="6" rx="2" fill="${c.trim}"/>
+      <rect x="99" y="90" width="10" height="6" rx="2" fill="${c.trim}"/>
+      <g class="fg-jet-flame">
+        <path d="M31 124 Q36 146 41 124 Z" fill="${c.flame}"/>
+        <path d="M33 124 Q36 138 39 124 Z" fill="${c.flameCore}"/>
+        <path d="M99 124 Q104 146 109 124 Z" fill="${c.flame}"/>
+        <path d="M101 124 Q104 138 107 124 Z" fill="${c.flameCore}"/>
+      </g>
+    </g>
+    <g class="fg-leg fg-leg--left">
+      <rect x="46" y="126" width="16" height="24" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+      <path class="fg-foot" d="M40 148 h28 a6 6 0 0 1 6 6 v3 a3 3 0 0 1 -3 3 h-34 a3 3 0 0 1 -3 -3 v-3 a6 6 0 0 1 6 -6 z" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
+      <g class="fg-skate">
+        <rect x="36" y="158" width="38" height="5" rx="2.5" fill="${c.chrome}" stroke="${c.ink}" stroke-width="2"/>
+        <circle class="fg-wheel" cx="44" cy="164" r="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2"/>
+        <circle class="fg-wheel" cx="66" cy="164" r="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2"/>
+      </g>
+    </g>
+    <g class="fg-leg fg-leg--right">
+      <rect x="78" y="126" width="16" height="24" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+      <path class="fg-foot" d="M72 148 h28 a6 6 0 0 1 6 6 v3 a3 3 0 0 1 -3 3 h-34 a3 3 0 0 1 -3 -3 v-3 a6 6 0 0 1 6 -6 z" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
+      <g class="fg-skate">
+        <rect x="68" y="158" width="38" height="5" rx="2.5" fill="${c.chrome}" stroke="${c.ink}" stroke-width="2"/>
+        <circle class="fg-wheel" cx="76" cy="164" r="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2"/>
+        <circle class="fg-wheel" cx="98" cy="164" r="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2"/>
+      </g>
+    </g>
+    <g class="fg-torso">
+      <rect x="40" y="82" width="60" height="50" rx="16" fill="url(#${idPrefix}-shell)" stroke="${c.ink}" stroke-width="3.5"/>
+      <rect x="52" y="92" width="36" height="22" rx="6" fill="${c.ink}"/>
+      <rect x="55" y="95" width="30" height="16" rx="4" fill="#5cd8ff" opacity=".9"/>
+      <path class="fg-chest-star" d="M70 97 l2.4 5 5.4 .6 -4 3.7 1.1 5.4 -4.9 -2.7 -4.9 2.7 1.1 -5.4 -4 -3.7 5.4 -.6z" fill="${c.glow}" stroke="${c.ink}" stroke-width="1.2"/>
+      <rect x="44" y="118" width="52" height="8" rx="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2.5"/>
+      <circle cx="70" cy="122" r="3" fill="${c.face}" stroke="${c.ink}" stroke-width="1.5"/>
+    </g>
+    <g class="fg-arm fg-arm--left">
+      <rect x="18" y="88" width="22" height="13" rx="6.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+      <g class="fg-forearm fg-forearm--left">
+        <rect x="8" y="98" width="14" height="22" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+        <circle class="fg-hand" cx="15" cy="124" r="8" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
+        <g class="fg-holo">
+          <path d="M15 84 l4.5 9.3 10.2 1.2 -7.5 7 2 10.1 -9.2 -5 -9.2 5 2 -10.1 -7.5 -7 10.2 -1.2z" fill="${c.glow}" stroke="${c.ink}" stroke-width="2.5" stroke-linejoin="round"/>
+          <path d="M15 92 l2.4 5 5.4 .6 -4 3.7 1.1 5.4 -4.9 -2.7 -4.9 2.7 1.1 -5.4 -4 -3.7 5.4 -.6z" fill="#fff9d6"/>
+        </g>
+      </g>
+    </g>
+    <g class="fg-arm fg-arm--right">
+      <rect x="100" y="88" width="22" height="13" rx="6.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+      <g class="fg-forearm fg-forearm--right">
+        <rect x="118" y="98" width="14" height="22" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+        <circle class="fg-hand" cx="125" cy="124" r="8" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
+      </g>
+    </g>
+    <g class="fg-head">
+      <g class="fg-antenna">
+        <rect x="67" y="12" width="6" height="18" rx="3" fill="${c.chrome}" stroke="${c.ink}" stroke-width="2.5"/>
+        <circle class="fg-bulb-glow" cx="70" cy="10" r="14" fill="${c.glow}" opacity="0"/>
+        <circle class="fg-bulb" cx="70" cy="10" r="7" fill="url(#${idPrefix}-bulb)" stroke="${c.ink}" stroke-width="2.5"/>
+      </g>
+      <rect x="28" y="26" width="84" height="58" rx="20" fill="url(#${idPrefix}-shell)" stroke="${c.ink}" stroke-width="3.5"/>
+      <rect x="36" y="34" width="68" height="42" rx="14" fill="${c.face}" stroke="${c.ink}" stroke-width="2.5"/>
+      <rect x="22" y="44" width="8" height="18" rx="3" fill="${c.trim}" stroke="${c.ink}" stroke-width="2.5"/>
+      <rect x="110" y="44" width="8" height="18" rx="3" fill="${c.trim}" stroke="${c.ink}" stroke-width="2.5"/>
+      <g class="fg-eye fg-eye--left">
+        <circle cx="55" cy="52" r="9" fill="#fff" stroke="${c.ink}" stroke-width="2.5"/>
+        <circle class="fg-pupil" cx="56" cy="53" r="4.5" fill="${c.eye}"/>
+        <circle cx="58" cy="50" r="1.6" fill="#fff"/>
+        <rect class="fg-lid" x="45" y="42" width="20" height="0" rx="4" fill="${c.face}"/>
+      </g>
+      <g class="fg-eye fg-eye--right">
+        <circle cx="85" cy="52" r="9" fill="#fff" stroke="${c.ink}" stroke-width="2.5"/>
+        <circle class="fg-pupil" cx="86" cy="53" r="4.5" fill="${c.eye}"/>
+        <circle cx="88" cy="50" r="1.6" fill="#fff"/>
+        <rect class="fg-lid" x="75" y="42" width="20" height="0" rx="4" fill="${c.face}"/>
+      </g>
+      <g class="fg-mouth">
+        <path class="fg-mouth-smile" d="M58 66 Q70 75 82 66" fill="none" stroke="${c.ink}" stroke-width="3" stroke-linecap="round"/>
+        <path class="fg-mouth-open" d="M60 65 Q70 79 80 65 Z" fill="${c.ink}"/>
+        <path class="fg-mouth-oh" d="M65 64 a5 6 0 1 0 10 0 a5 6 0 1 0 -10 0" fill="${c.ink}"/>
+        <path class="fg-mouth-hm" d="M60 68 Q70 64 80 68" fill="none" stroke="${c.ink}" stroke-width="3" stroke-linecap="round"/>
+      </g>
+      <g class="fg-cheeks">
+        <circle cx="44" cy="63" r="3.5" fill="#ffb3a7" opacity=".8"/>
+        <circle cx="96" cy="63" r="3.5" fill="#ffb3a7" opacity=".8"/>
+      </g>
+    </g>
+  </g>
+</svg>`;
+}
+function robotBadgeSvg() {
+  return `<svg viewBox="0 0 40 40" focusable="false" aria-hidden="true">
+    <rect x="18" y="2" width="4" height="8" rx="2" fill="${c.chrome}" stroke="${c.ink}" stroke-width="1.5"/>
+    <circle cx="20" cy="4" r="3.2" fill="${c.glow}" stroke="${c.ink}" stroke-width="1.5"/>
+    <rect x="4" y="10" width="32" height="26" rx="9" fill="${c.shell}" stroke="${c.ink}" stroke-width="2.5"/>
+    <rect x="8" y="14" width="24" height="17" rx="6" fill="${c.face}" stroke="${c.ink}" stroke-width="1.5"/>
+    <circle cx="15" cy="22" r="3" fill="#fff" stroke="${c.ink}" stroke-width="1.5"/>
+    <circle cx="25" cy="22" r="3" fill="#fff" stroke="${c.ink}" stroke-width="1.5"/>
+    <circle cx="15.5" cy="22.5" r="1.4" fill="${c.ink}"/>
+    <circle cx="25.5" cy="22.5" r="1.4" fill="${c.ink}"/>
+    <path d="M15 27 Q20 30.5 25 27" fill="none" stroke="${c.ink}" stroke-width="1.6" stroke-linecap="round"/>
+  </svg>`;
+}
+const MUTE_KEY = "fact_grid_107.muted";
+function readMuted(storage) {
+  try {
+    return storage?.getItem?.(MUTE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function createSound({ storage = null } = {}) {
+  let muted = readMuted(storage);
+  let ctx2 = null;
+  let gate = null;
+  let hidden = false;
+  const nodes = /* @__PURE__ */ new Set();
+  const ready = () => Boolean(ctx2 && gate);
+  const tone = ({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.14 }) => {
+    if (!ready() || muted) return;
+    const t0 = ctx2.currentTime + at;
+    const osc = ctx2.createOscillator();
+    const g = ctx2.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+    osc.connect(g).connect(gate);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    const entry = { osc, g };
+    nodes.add(entry);
+    osc.onended = () => {
+      nodes.delete(entry);
+      try {
+        osc.disconnect();
+        g.disconnect();
+      } catch {
+      }
+    };
+  };
+  const SOUNDS = {
+    // The engine's canonical set, same frequencies and shapes.
+    correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09, gain: 0.18 })),
+    wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+    complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16, gain: 0.18 })),
+    tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle", gain: 0.18 })),
+    tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+    // Fact Grid's own signature sounds.
+    count: (index = 0) => tone({ freq: 330 * 2 ** (index / 12), type: "triangle", dur: 0.14, gain: 0.08 }),
+    unknown: () => tone({ freq: 330, to: 520, type: "triangle", dur: 0.22, gain: 0.07 }),
+    fill: () => [660, 990].forEach((f, i) => tone({ freq: f, at: i * 0.05, dur: 0.08, gain: 0.07 })),
+    powerup: () => {
+      tone({ freq: 180, to: 720, type: "sawtooth", dur: 0.6, gain: 0.07 });
+      [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: 0.55 + i * 0.09, dur: 0.14, type: "triangle" }));
+    },
+    skate: () => [0, 0.16, 0.32, 0.48, 0.64].forEach((at, i) => tone({ freq: 392 + i % 2 * 98, at, dur: 0.1, type: "triangle", gain: 0.08 })),
+    jetpack: () => {
+      tone({ freq: 90, to: 260, type: "sawtooth", dur: 0.8, gain: 0.08 });
+      tone({ freq: 784, to: 1568, type: "triangle", at: 0.5, dur: 0.5, gain: 0.06 });
+    },
+    launch: () => {
+      tone({ freq: 120, to: 900, type: "sawtooth", dur: 1.2, gain: 0.09 });
+      [1, 1.35, 1.7, 2.1].forEach((at) => tone({ freq: 1200, to: 300, type: "triangle", at, dur: 0.3, gain: 0.06 }));
+    },
+    dance: (beat = 0) => tone({ freq: [523, 659, 784, 659][beat % 4], type: "square", dur: 0.09, gain: 0.05 }),
+    fanfare: () => [523, 659, 784, 1047, 1319].forEach((f, i) => tone({ freq: f, at: i * 0.1, dur: 0.18, type: "triangle", gain: 0.1 }))
+  };
+  function stopAll() {
+    if (!ctx2) return;
+    const now = ctx2.currentTime;
+    nodes.forEach(({ osc, g }) => {
+      try {
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(0, now);
+      } catch {
+      }
+      try {
+        osc.stop(now);
+      } catch {
+      }
+    });
+    nodes.clear();
+  }
+  function applyGate() {
+    if (!ready()) return;
+    const now = ctx2.currentTime;
+    gate.gain.cancelScheduledValues(now);
+    gate.gain.setValueAtTime(muted ? 0 : 1, now);
+    if (muted || hidden) ctx2.suspend?.()?.catch?.(() => {
+    });
+    else ctx2.resume?.()?.catch?.(() => {
+    });
+  }
+  return {
+    get muted() {
+      return muted;
+    },
+    get context() {
+      return ctx2;
+    },
+    // Called from the user's START tap; creates the context and the gate.
+    unlock() {
+      ctx2 = initAudio();
+      if (ctx2 && !gate) {
+        gate = ctx2.createGain();
+        gate.gain.value = muted ? 0 : 1;
+        gate.connect(ctx2.destination);
+      }
+      applyGate();
+      return ctx2;
+    },
+    setMuted(value) {
+      muted = Boolean(value);
+      try {
+        storage?.setItem?.(MUTE_KEY, muted ? "1" : "0");
+      } catch {
+      }
+      if (muted) stopAll();
+      applyGate();
+    },
+    toggle() {
+      this.setMuted(!muted);
+      return muted;
+    },
+    // The page is hidden: stop scheduled sound and suspend the context.
+    setHidden(value) {
+      hidden = Boolean(value);
+      if (hidden) stopAll();
+      applyGate();
+    },
+    play(name, ...args) {
+      if (muted || hidden) return;
+      SOUNDS[name]?.(...args);
+    },
+    stopAll,
+    destroy() {
+      stopAll();
+      try {
+        gate?.disconnect();
+      } catch {
+      }
+      gate = null;
+    }
+  };
+}
+const SAVE_KEY = "fact_grid_107.session";
+const TITLE = "FACT GRID";
+const LESSON_TAG = "ML 1.07 · MULTIPLICATION FLUENCY";
+const SUBTITLE = "Multiply the row and the column.";
+const REDUCED_SCENE_MS = 2600;
+const REDUCED_SKIP_MS = 300;
+const SKIP_MS = 1e3;
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+function safeStorage(getStorage) {
+  try {
+    const candidate = typeof getStorage === "function" ? getStorage() : getStorage;
+    if (!candidate) return null;
+    const probe = "__fg_probe__";
+    candidate.setItem(probe, "1");
+    candidate.removeItem(probe);
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+function firstMissCopy(row, col) {
+  return `Find row ${row} and column ${col}. Multiply: ${row} × ${col}.`;
+}
+function teachingCopy(row, col) {
+  const help = helpSequence(row, col);
+  if (help.startsAtZero) return `Count by ${help.step} one time. Start at 0 and make one jump of ${help.step}.`;
+  const times = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][help.jumps];
+  return `Count by ${help.step}s ${times} times. ${help.shown.join(", ")}, then one more jump.`;
+}
+function helpVisualMarkup(row, col) {
+  const help = helpSequence(row, col);
+  const stops = help.startsAtZero ? [0] : help.shown;
+  const chips = stops.map((value, index) => `<span class="fg-jump" style="--fg-delay:${index * 320}ms"><b>${value}</b><i aria-hidden="true">+${help.step}</i></span>`).join("");
+  const unknown = `<span class="fg-jump fg-jump--unknown" style="--fg-delay:${stops.length * 320}ms"><b>?</b></span>`;
+  const label = help.startsAtZero ? `Start at 0. One jump of ${help.step} lands on the unknown product.` : `Count by ${help.step}: ${help.shown.join(", ")}, then one more jump of ${help.step} lands on the unknown product.`;
+  return `<div class="fg-help-line" role="img" aria-label="${label}">
+    <div class="fg-help-equation">${row} × ${col} = ?</div>
+    <div class="fg-help-jumps">${chips}${unknown}</div>
+  </div>`;
+}
+function startSession(root, options = {}) {
+  const opt = {
+    basePoints: 10,
+    hotStreak: 5,
+    nextDelayMs: 900,
+    autoSaveInterval: 3,
+    startButton: "START",
+    playAgain: "PLAY AGAIN",
+    seed: void 0,
+    ...options
+  };
+  if (!opt.gameFile) throw new Error("startSession: options.gameFile is required (must equal the output filename)");
+  const view = root.ownerDocument?.defaultView ?? globalThis;
+  const storage = opt.storage === void 0 ? safeStorage(() => view.localStorage) : safeStorage(opt.storage);
+  const rng = createRng(opt.seed);
+  const tracker = connectTracker({ gameFile: opt.gameFile, interval: opt.autoSaveInterval });
+  const sound = createSound({ storage });
+  const dev = opt.dev ?? /[?&]dev=1/.test(view.location?.search ?? "");
+  const reducedMotion = () => opt.reducedMotion ?? Boolean(view.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+  let session = null;
+  let problem = null;
+  const state = { score: 0, streak: 0, bestStreak: 0, questionsAnswered: 0, canAnswer: false, firstTry: true, wrongAttempts: 0, isReplay: false };
+  const timers = /* @__PURE__ */ new Set();
+  const later = (fn, ms) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const cancelLater = (id) => {
+    clearTimeout(id);
+    timers.delete(id);
+  };
+  const cancelTimers = () => {
+    timers.forEach(clearTimeout);
+    timers.clear();
+  };
+  const sync = () => tracker.publish(state);
+  const tokens = {
+    "--mg-bg-a": "#3156D8",
+    "--mg-bg-b": "#13213F",
+    "--mg-card": "#FFF4D6",
+    "--mg-ink": "#13213F",
+    "--mg-accent": "#F29B38",
+    "--mg-good": "#37C8C5",
+    "--mg-warm": "#E8A838",
+    "--mg-shadow": "0 6px 0 #13213F",
+    "--mf-bg-a": "#3156D8",
+    "--mf-bg-b": "#13213F",
+    "--mf-card": "#FFF4D6",
+    "--mf-ink": "#13213F",
+    "--mf-accent": "#F29B38",
+    "--mf-good": "#37C8C5",
+    "--mf-warm": "#E8A838",
+    "--mf-dotted-border": "#37C8C5",
+    "--mf-picture": "#E5F8F5",
+    "--mf-picture-alt": "#fffdf4"
+  };
+  for (const [k, v] of Object.entries(tokens)) root.style.setProperty(k, v);
+  root.classList.add("mg-root", "mg-shell-standard", "mf-game", "fg-game");
+  root.setAttribute("data-mf-theme", "robot");
+  root.setAttribute("data-mf-composition", "fact-grid");
+  root.replaceChildren();
+  const fx = el("div", "mg-fx");
+  const start = el("div", "mg-screen");
+  const hud = el("div", "mg-hud");
+  const progress = el("div", "mg-progress");
+  const stage = el("div", "mg-stage");
+  const end = el("div", "mg-screen mg-hidden");
+  root.append(start, hud, progress, stage, end, fx);
+  const playParts = [hud, progress, stage];
+  function setPlayInert(inert) {
+    playParts.forEach((part) => {
+      if (inert) {
+        part.setAttribute("inert", "");
+        part.setAttribute("aria-hidden", "true");
+      } else {
+        part.removeAttribute("inert");
+        part.removeAttribute("aria-hidden");
+      }
+    });
+  }
+  const startCard = el("div", "mg-card");
+  const icon = el("div", "mg-emoji fg-start-icon");
+  icon.innerHTML = robotBadgeSvg();
+  startCard.append(icon, el("h1", "mg-title", TITLE), el("p", "mg-subtitle", SUBTITLE), el("p", "mg-tag", LESSON_TAG));
+  const example = el("div", "mg-example");
+  example.innerHTML = introMarkup();
+  const startBtn = el("button", "mg-big-btn", opt.startButton);
+  startBtn.type = "button";
+  const resumeBtn = el("button", "mg-big-btn fg-resume-btn", "CONTINUE");
+  resumeBtn.type = "button";
+  const freshBtn = el("button", "fg-fresh-btn", "START OVER");
+  freshBtn.type = "button";
+  const startActions = el("div", "fg-start-actions");
+  startActions.append(startBtn);
+  startCard.append(example, startActions);
+  start.append(startCard);
+  const hudTitle = el("div", "mg-hud-title", TITLE);
+  const chips = el("div", "mg-chips");
+  const scoreChip = el("div", "mg-chip mg-chip-score", "Score 0");
+  const streakChip = el("div", "mg-chip mg-chip-streak", "0🔥");
+  chips.append(scoreChip, streakChip);
+  hud.append(hudTitle, chips);
+  const bar = el("i");
+  progress.append(bar);
+  progress.setAttribute("role", "progressbar");
+  progress.setAttribute("aria-label", "Progress toward the next checkpoint");
+  const overflows = () => hudTitle.scrollWidth > hudTitle.clientWidth + 0.5;
+  function fitHudTitle() {
+    if (typeof view?.getComputedStyle !== "function") return;
+    const style = view.getComputedStyle(hudTitle);
+    const max = parseFloat(style.getPropertyValue("--mg-hud-title-max")) || 40;
+    const min = parseFloat(style.getPropertyValue("--mg-hud-title-min")) || 15;
+    delete hudTitle.dataset.hudTitleLines;
+    let size = max;
+    hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+    if (overflows()) {
+      const room = hudTitle.clientWidth / hudTitle.scrollWidth;
+      size = Math.max(min, Math.min(max, Math.floor(size * room * 10) / 10));
+      hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      while (size > min && overflows()) {
+        size = Math.max(min, size - 0.5);
+        hudTitle.style.setProperty("--mg-hud-title-size", `${size}px`);
+      }
+      if (overflows()) hudTitle.dataset.hudTitleLines = "2";
+    }
+  }
+  let fittedWidth = -1;
+  const refitHudTitle = () => {
+    const width = hud.clientWidth;
+    if (width === fittedWidth) return;
+    fittedWidth = width;
+    fitHudTitle();
+  };
+  refitHudTitle();
+  const resizeObserver = typeof view?.ResizeObserver === "function" ? new view.ResizeObserver(refitHudTitle) : null;
+  if (resizeObserver) resizeObserver.observe(hud);
+  else view?.addEventListener?.("resize", refitHudTitle);
+  document.fonts?.ready?.then(fitHudTitle);
+  const prompt = el("div", "mg-prompt");
+  prompt.setAttribute("role", "heading");
+  prompt.setAttribute("aria-level", "2");
+  prompt.setAttribute("aria-live", "polite");
+  prompt.setAttribute("tabindex", "-1");
+  prompt.textContent = PROMPT;
+  const visual = el("div", "mg-visual");
+  const tiles = el("div", "mg-tiles");
+  tiles.dataset.count = "4";
+  tiles.setAttribute("aria-label", "Answer choices");
+  stage.append(prompt, visual, tiles);
+  const announce = el("div", "fg-announce");
+  announce.setAttribute("aria-live", "polite");
+  announce.setAttribute("aria-atomic", "true");
+  stage.append(announce);
+  const card = el("section", "mf-card mg-problem-card fg-card");
+  card.setAttribute("aria-label", "Multiplication chart and robot");
+  card.innerHTML = `
+    <div class="fg-toy">
+      <div class="fg-toy-shell"><div class="fg-toy-screen">${chartMarkup()}</div></div>
+    </div>
+    <div class="fg-side">
+      <div class="fg-equation" aria-live="off">
+        <span class="fg-factor fg-factor--row"><b class="fg-factor-value">1</b><i>row</i></span>
+        <span class="fg-op" aria-hidden="true">×</span>
+        <span class="fg-factor fg-factor--col"><b class="fg-factor-value">1</b><i>column</i></span>
+        <span class="fg-op" aria-hidden="true">=</span>
+        <span class="fg-factor fg-factor--product"><b class="fg-factor-value fg-product-value">?</b><i>product</i></span>
+      </div>
+      <div class="fg-robot-stage">
+        <div class="fg-robot" data-perf="" data-mood="idle">${robotSvg()}</div>
+        <div class="fg-fireworks" aria-hidden="true"></div>
+      </div>
+      <div class="fg-race" aria-label="Squares filled">
+        <div class="fg-race-track">
+          <span class="fg-race-marker fg-race-marker--you"><b>★</b></span>
+          <span class="fg-race-marker fg-race-marker--robot">${robotBadgeSvg()}</span>
+        </div>
+        <div class="fg-race-legend"><span>You <b class="fg-race-you">0</b></span><span>Robot <b class="fg-race-robot">0</b></span><span>Next <b class="fg-race-next">6</b></span></div>
+      </div>
+      <div class="fg-scene-banner" aria-hidden="true"><b class="fg-scene-title"></b><span class="fg-scene-line"></span></div>
+      <button type="button" class="fg-skip mg-hidden">SKIP</button>
+    </div>
+    <button type="button" class="fg-sound" aria-pressed="false" aria-label="Sound on"><span aria-hidden="true">🔊</span></button>
+  `;
+  visual.append(card);
+  const chart = createChartView(card.querySelector(".fg-toy-screen"));
+  const robot = card.querySelector(".fg-robot");
+  const banner = card.querySelector(".fg-scene-banner");
+  const skipBtn = card.querySelector(".fg-skip");
+  const fireworks = card.querySelector(".fg-fireworks");
+  const soundBtn = card.querySelector(".fg-sound");
+  const equationRow = card.querySelector(".fg-factor--row .fg-factor-value");
+  const equationCol = card.querySelector(".fg-factor--col .fg-factor-value");
+  const equationProduct = card.querySelector(".fg-product-value");
+  const equation = card.querySelector(".fg-equation");
+  const raceYou = card.querySelector(".fg-race-you");
+  const raceRobot = card.querySelector(".fg-race-robot");
+  const raceNext = card.querySelector(".fg-race-next");
+  const markerYou = card.querySelector(".fg-race-marker--you");
+  const markerRobot = card.querySelector(".fg-race-marker--robot");
+  const renderSound = () => {
+    soundBtn.setAttribute("aria-pressed", sound.muted ? "true" : "false");
+    soundBtn.setAttribute("aria-label", sound.muted ? "Sound off. Turn sound on" : "Sound on. Turn sound off");
+    soundBtn.querySelector("span").textContent = sound.muted ? "🔇" : "🔊";
+  };
+  soundBtn.addEventListener("click", () => {
+    sound.unlock();
+    sound.toggle();
+    renderSound();
+    if (!sound.muted) sound.play("tap");
+  });
+  renderSound();
+  function save() {
+    if (!storage || !session || session.finished) return;
+    try {
+      storage.setItem(SAVE_KEY, serialize(session));
+    } catch {
+    }
+  }
+  function clearSave() {
+    try {
+      storage?.removeItem(SAVE_KEY);
+    } catch {
+    }
+  }
+  function loadSave() {
+    try {
+      return parseSaved(storage?.getItem(SAVE_KEY));
+    } catch {
+      return null;
+    }
+  }
+  function showToast(text, kind = "good") {
+    if (!reducedMotion()) {
+      toast(fx, text, kind);
+      return;
+    }
+    const t = el("div", `mg-toast mg-toast-${kind} fg-toast-static`, text);
+    fx.append(t);
+    later(() => t.remove(), 900);
+  }
+  function celebrate(tile, tier) {
+    showToast(rng.pick(PRAISE));
+    if (!reducedMotion()) flyEmoji(fx, tile, "⭐", 4);
+    if (tier) {
+      sound.play("tier");
+      if (!reducedMotion()) confetti(fx, tier.burst);
+      later(() => showToast(tier.word, "tier"), 250);
+    }
+  }
+  const renderHud = () => {
+    state.score = session?.score ?? 0;
+    state.streak = session?.streak ?? 0;
+    state.bestStreak = session?.bestStreak ?? 0;
+    state.questionsAnswered = session?.questionsAnswered ?? 0;
+    scoreChip.textContent = `Score ${state.score}`;
+    streakChip.textContent = `${state.streak}🔥`;
+    streakChip.classList.toggle("mg-hot", state.streak >= opt.hotStreak);
+    fitHudTitle();
+    const completed = session?.completed ?? 0;
+    const { start: s0, end: s1 } = displayBounds(session);
+    const done = (completed - s0) / (s1 - s0);
+    bar.style.width = `${Math.min(100, Math.max(0, done * 100))}%`;
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(s1));
+    progress.setAttribute("aria-valuenow", String(completed));
+    progress.setAttribute("aria-valuetext", `${completed} of ${s1} squares`);
+    sync();
+  };
+  const renderRace = () => {
+    const completed = session?.completed ?? 0;
+    const rival = rivalProgress(completed);
+    const { start: s0, end: s1 } = displayBounds(session);
+    const pct = (n) => `${Math.min(100, Math.max(0, (n - s0) / (s1 - s0) * 100))}%`;
+    raceYou.textContent = String(completed);
+    raceRobot.textContent = String(rival);
+    raceNext.textContent = String(s1);
+    markerYou.style.left = pct(completed);
+    markerRobot.style.left = pct(rival);
+    markerYou.setAttribute("aria-label", `You: ${completed} squares`);
+    markerRobot.setAttribute("aria-label", `Robot: ${rival} squares`);
+  };
+  const renderEquipment = () => {
+    const eq = equipmentFor(session?.completed ?? 0);
+    robot.classList.toggle("fg-robot--powered", eq.powered);
+    robot.classList.toggle("fg-robot--skates", eq.skates);
+    robot.classList.toggle("fg-robot--jetpack", eq.jetpack);
+  };
+  const activeFamilies$1 = () => activeFamilies({ families: session.families }, displayBounds(session).stage);
+  const renderChartState = () => {
+    chart.reset();
+    for (let i = 0; i < session.completed; i += 1) {
+      const { row, col } = parseKey(session.schedule[i]);
+      chart.fill(row, col, row * col, { animate: false });
+    }
+    chart.setFamilies(activeFamilies$1());
+  };
+  function showEquation(row, col, productValue) {
+    equationRow.textContent = String(row);
+    equationCol.textContent = String(col);
+    equationProduct.textContent = productValue == null ? "?" : String(productValue);
+    equation.classList.toggle("fg-equation--filled", productValue != null);
+  }
+  function showCompletedEquation() {
+    if (!session?.completed) return;
+    const { row, col } = parseKey(session.schedule[session.completed - 1]);
+    chart.setTarget(null, null);
+    showEquation(row, col, row * col);
+  }
+  function parkTiles() {
+    if (!tiles.children.length) {
+      for (let i = 0; i < 4; i += 1) {
+        const b = el("button", "mg-tile mf-answer-button mp-number-choice");
+        b.type = "button";
+        b.append(el("span", "mf-answer-content mf-answer-content--number", ""));
+        tiles.append(b);
+      }
+    }
+    tiles.querySelectorAll(".mg-tile").forEach((b) => {
+      b.disabled = true;
+      b.tabIndex = -1;
+    });
+    tiles.classList.add("fg-tiles--parked");
+    tiles.setAttribute("aria-hidden", "true");
+    state.canAnswer = false;
+  }
+  function renderQuestion({ focus = true } = {}) {
+    const missed = tracker.getMissedProblem();
+    const replay = missed && Number.isInteger(missed.row) && Number.isInteger(missed.col) ? missed : null;
+    const cell = replay ?? currentCell(session);
+    if (!cell) return;
+    problem = build(cell, rng);
+    state.firstTry = session.wrongAttempts === 0;
+    state.wrongAttempts = session.wrongAttempts;
+    state.isReplay = Boolean(replay);
+    chart.setFamilies(activeFamilies$1());
+    chart.setTarget(cell.row, cell.col);
+    showEquation(cell.row, cell.col, null);
+    prompt.textContent = PROMPT;
+    tiles.replaceChildren();
+    tiles.classList.remove("fg-tiles--parked");
+    tiles.removeAttribute("aria-hidden");
+    tiles.dataset.count = String(problem.choices.length);
+    for (const choice of problem.choices) {
+      const b = el("button", "mg-tile mf-answer-button mp-number-choice");
+      b.type = "button";
+      b.dataset.choiceId = choice.id;
+      b.dataset.factoryKind = "number";
+      const content = el("span", "mf-answer-content mf-answer-content--number", choice.label);
+      b.append(content);
+      b.setAttribute("aria-label", `Choose ${choice.label}`);
+      b.addEventListener("click", () => answer(choice, b));
+      tiles.append(b);
+    }
+    announce.textContent = `Row ${cell.row}, column ${cell.col}. ${cell.row} times ${cell.col} equals what? Tap the product.`;
+    setMood("idle");
+    state.canAnswer = true;
+    if (focus) prompt.focus?.({ preventScroll: true });
+  }
+  let perfTimer = null;
+  const setMood = (mood) => {
+    robot.dataset.mood = mood;
+  };
+  function cancelPerformance() {
+    if (perfTimer) {
+      cancelLater(perfTimer);
+      perfTimer = null;
+    }
+  }
+  function performRandom() {
+    const last = session?.performanceIndex ?? -1;
+    let index = rng.int(0, PERFORMANCES.length - 1);
+    if (index === last) index = (index + 1 + rng.int(0, PERFORMANCES.length - 2)) % PERFORMANCES.length;
+    if (session) session.performanceIndex = index;
+    return perform(PERFORMANCES[index].id, PERFORMANCES[index].ms);
+  }
+  function perform(id, ms) {
+    cancelPerformance();
+    if (scene) return null;
+    robot.dataset.perf = "";
+    void robot.offsetWidth;
+    robot.dataset.perf = id;
+    setMood("happy");
+    perfTimer = later(() => {
+      perfTimer = null;
+      if (scene) return;
+      robot.dataset.perf = "";
+      setMood("idle");
+    }, ms);
+    return perfTimer;
+  }
+  function encourage() {
+    cancelPerformance();
+    if (scene) return;
+    robot.dataset.perf = "";
+    void robot.offsetWidth;
+    robot.dataset.perf = "encourage";
+    setMood("kind");
+    perfTimer = later(() => {
+      perfTimer = null;
+      robot.dataset.perf = "";
+      setMood("idle");
+    }, 900);
+  }
+  let scene = null;
+  let sceneSequence = 0;
+  function spawnFireworks(count) {
+    fireworks.replaceChildren();
+    const colors = ["#ffd93d", "#37c8c5", "#f29b38", "#ff8fab", "#6bcbff", "#fff4d6"];
+    for (let i = 0; i < count; i += 1) {
+      const burst = el("i", "fg-firework");
+      burst.style.left = `${12 + rng.int(0, 76)}%`;
+      burst.style.top = `${10 + rng.int(0, 55)}%`;
+      burst.style.setProperty("--fg-color", colors[i % colors.length]);
+      burst.style.setProperty("--fg-delay", `${i * 260 % 2400}ms`);
+      burst.style.setProperty("--fg-size", `${60 + rng.int(0, 70)}px`);
+      fireworks.append(burst);
+    }
+  }
+  function runScene(milestone, onDone, { preview = false } = {}) {
+    const spec = MILESTONE_SCENES[milestone];
+    if (!spec) {
+      onDone?.();
+      return null;
+    }
+    finishScene(false);
+    cancelPerformance();
+    parkTiles();
+    sceneSequence += 1;
+    const current = { id: spec.id, seq: sceneSequence, preview, onDone, timers: /* @__PURE__ */ new Set() };
+    const sceneLater = (fn, ms) => {
+      const id = setTimeout(() => {
+        current.timers.delete(id);
+        if (scene === current) fn();
+      }, ms);
+      current.timers.add(id);
+      return id;
+    };
+    current.done = () => {
+      if (scene === current) finishScene(true);
+    };
+    scene = current;
+    card.dataset.scene = spec.id;
+    robot.dataset.perf = spec.id;
+    if (spec.id === "powerup") robot.classList.add("fg-robot--powered");
+    if (spec.id === "skate") robot.classList.add("fg-robot--powered", "fg-robot--skates");
+    if (spec.id === "jetpack") robot.classList.add("fg-robot--powered", "fg-robot--skates", "fg-robot--jetpack");
+    if (spec.id === "finale") {
+      robot.classList.add("fg-robot--powered", "fg-robot--skates", "fg-robot--jetpack");
+      card.querySelector(".fg-toy").classList.add("fg-toy--launchpad");
+      spawnFireworks(reducedMotion() ? 10 : 14);
+    }
+    setMood("joy");
+    banner.querySelector(".fg-scene-title").textContent = spec.title;
+    banner.querySelector(".fg-scene-line").textContent = spec.line;
+    banner.setAttribute("aria-hidden", "false");
+    banner.setAttribute("role", "status");
+    announce.textContent = `${spec.title} ${spec.line}`;
+    sound.play(spec.id === "finale" ? "launch" : spec.id);
+    if (!reducedMotion()) {
+      if (spec.id !== "finale") for (let beat = 0; beat < 8; beat += 1) sceneLater(() => sound.play("dance", beat), 900 + beat * 330);
+      else sceneLater(() => sound.play("fanfare"), 1400);
+    }
+    const total = reducedMotion() ? REDUCED_SCENE_MS : spec.ms;
+    sceneLater(() => {
+      skipBtn.classList.remove("mg-hidden");
+      skipBtn.focus?.({ preventScroll: true });
+    }, reducedMotion() ? REDUCED_SKIP_MS : SKIP_MS);
+    sceneLater(current.done, total);
+    return current;
+  }
+  function finishScene(callDone = true) {
+    if (!scene) return;
+    const current = scene;
+    scene = null;
+    current.timers.forEach(clearTimeout);
+    current.timers.clear();
+    sound.stopAll();
+    skipBtn.classList.add("mg-hidden");
+    banner.setAttribute("aria-hidden", "true");
+    banner.removeAttribute("role");
+    delete card.dataset.scene;
+    robot.dataset.perf = "";
+    fireworks.replaceChildren();
+    card.querySelector(".fg-toy").classList.remove("fg-toy--launchpad");
+    if (current.preview) renderEquipment();
+    setMood("idle");
+    if (callDone) current.onDone?.();
+  }
+  skipBtn.addEventListener("click", () => {
+    if (scene) {
+      scene.done();
+      sound.play("tap");
+    }
+  });
+  let popup = null;
+  const focusableIn = (node) => Array.from(node.querySelectorAll('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])')).filter((n) => !n.disabled && n.getAttribute("aria-hidden") !== "true");
+  let popupSequence = 0;
+  function openPopup({ kind = "cue", message, content = null, actions = null, returnFocus = null, escapeAction = null }) {
+    closePopup();
+    const panel = el("section", `mf-popup mg-help-panel mf-popup--${kind}`);
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    const title = el("p", "mf-popup-message", message ?? "");
+    popupSequence += 1;
+    title.id = `mf-popup-title-${popupSequence}`;
+    panel.setAttribute("aria-labelledby", title.id);
+    panel.append(title);
+    if (content) {
+      const host = el("div", "mf-popup-content");
+      if (typeof content === "string") host.innerHTML = content;
+      else host.append(content);
+      panel.append(host);
+    }
+    let primary = null;
+    const buttons = [];
+    if (actions) {
+      const list = el("div", "fg-popup-actions");
+      actions.forEach((action, index) => {
+        const b = el("button", index === 0 ? "mf-retry fg-choice-btn" : "fg-choice-btn fg-choice-btn--secondary");
+        b.type = "button";
+        b.dataset.action = action.id;
+        b.append(el("b", null, action.label));
+        if (action.detail) b.append(el("span", "fg-choice-detail", action.detail));
+        b.addEventListener("click", () => action.onSelect?.(b));
+        list.append(b);
+        buttons.push(b);
+      });
+      primary = buttons[0];
+      panel.append(list);
+    } else {
+      primary = el("button", "mf-retry", TRY_AGAIN);
+      primary.type = "button";
+      primary.setAttribute("aria-label", "Try this problem again");
+      panel.append(primary);
+    }
+    fx.append(panel);
+    stage.setAttribute("inert", "");
+    stage.setAttribute("aria-hidden", "true");
+    const previousFocus = returnFocus ?? document.activeElement;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        (escapeAction ?? primary)?.click?.();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = focusableIn(panel);
+      if (!focusable.length) {
+        event.preventDefault();
+        return;
+      }
+      const current = focusable.indexOf(document.activeElement);
+      const next = event.shiftKey ? focusable[(current <= 0 ? focusable.length : current) - 1] : focusable[(current + 1) % focusable.length];
+      event.preventDefault();
+      next.focus();
+    };
+    panel.addEventListener("keydown", onKeyDown);
+    const close = () => {
+      if (popup?.panel !== panel) return;
+      popup = null;
+      panel.removeEventListener("keydown", onKeyDown);
+      panel.remove();
+      stage.removeAttribute("inert");
+      stage.removeAttribute("aria-hidden");
+      if (previousFocus?.focus && previousFocus.isConnected !== false) {
+        try {
+          previousFocus.focus({ preventScroll: true });
+        } catch {
+          previousFocus.focus();
+        }
+      }
+    };
+    popup = { panel, primary, buttons, close };
+    primary.focus?.();
+    return popup;
+  }
+  function closePopup() {
+    popup?.close();
+    popup = null;
+  }
+  let helpTimers = [];
+  const clearHelpTimers = () => {
+    helpTimers.forEach(cancelLater);
+    helpTimers = [];
+  };
+  function openHelp(tile) {
+    const { row, col } = problem.params;
+    const teaching = session.wrongAttempts >= 2;
+    tiles.querySelectorAll(".mg-tile").forEach((b) => {
+      b.disabled = true;
+      b.setAttribute("aria-disabled", "true");
+    });
+    const p = openPopup({
+      kind: teaching ? "teaching" : "cue",
+      message: teaching ? "Let us count together" : firstMissCopy(row, col),
+      content: teaching ? `<p class="fg-help-instruction">${teachingCopy(row, col)}</p><div class="fg-help-picture">${helpVisualMarkup(row, col)}</div>` : null,
+      returnFocus: tile
+    });
+    if (teaching && !reducedMotion()) {
+      const help = helpSequence(row, col);
+      const stops = help.startsAtZero ? 1 : help.shown.length;
+      for (let i = 0; i < stops; i += 1) helpTimers.push(later(() => sound.play("count", i), 300 + i * 320));
+      helpTimers.push(later(() => sound.play("unknown"), 300 + stops * 320));
+    }
+    const retry = () => {
+      clearHelpTimers();
+      closePopup();
+      tiles.querySelectorAll(".mg-tile").forEach((b) => {
+        b.disabled = false;
+        b.removeAttribute("aria-disabled");
+      });
+      tile.classList.remove("mg-wrong");
+      setMood("idle");
+      state.canAnswer = true;
+      tile.focus?.({ preventScroll: true });
+    };
+    p.primary.addEventListener("click", retry, { once: true });
+  }
+  function answer(choice, tile) {
+    if (!state.canAnswer || !problem || scene) return;
+    state.canAnswer = false;
+    const correct = choice.id === problem.answer;
+    tracker.recordQuestion({
+      question: `${problem.params.row} × ${problem.params.col}`,
+      params: problem.params,
+      answer: String(choice.label),
+      correctAnswer: String(problem.product),
+      correct,
+      firstTry: state.firstTry,
+      replay: state.isReplay
+    });
+    if (correct) onCorrect(tile);
+    else onWrong(tile);
+  }
+  function onWrong(tile) {
+    sound.play("wrong");
+    tile.classList.add("mg-wrong");
+    applyWrong(session);
+    state.firstTry = false;
+    state.wrongAttempts = session.wrongAttempts;
+    tracker.markMissed(problem.params);
+    renderHud();
+    save();
+    encourage();
+    openHelp(tile);
+  }
+  function onCorrect(tile) {
+    const { row, col } = problem.params;
+    sound.play("correct");
+    tile.classList.add("mg-right");
+    tiles.querySelectorAll(".mg-tile").forEach((b) => {
+      b.disabled = true;
+    });
+    if (state.isReplay) tracker.markCorrected(problem.params);
+    const milestone = state.isReplay ? applyReplayCorrect(session) : applyCorrect(session, opt.basePoints);
+    problem = null;
+    chart.fill(row, col, row * col);
+    showEquation(row, col, row * col);
+    announce.textContent = `${row} times ${col} equals ${row * col}. Square filled.`;
+    later(() => sound.play("fill"), 180);
+    renderHud();
+    renderRace();
+    tracker.checkAutoSave();
+    const tier = STREAK_TIERS.find((t) => t.at === session.streak);
+    celebrate(tile, tier);
+    save();
+    performRandom();
+    let advanced = false;
+    const advance = () => {
+      if (advanced) return;
+      advanced = true;
+      if (milestone) reward(milestone);
+      else renderQuestion();
+    };
+    later(advance, opt.nextDelayMs + (tier ? 500 : 0));
+  }
+  function reward(milestone) {
+    renderEquipment();
+    runScene(milestone, () => {
+      renderEquipment();
+      if (milestone >= 100) {
+        finish();
+        return;
+      }
+      const phase = settleReward(session);
+      save();
+      if (phase === "question") {
+        renderHud();
+        renderRace();
+        renderQuestion();
+        return;
+      }
+      askContinue(milestone);
+    });
+  }
+  function askContinue(milestone) {
+    parkTiles();
+    const options2 = continuationOptions(milestone);
+    const actions = options2.filter((o) => o.id !== "stop").concat(options2.filter((o) => o.id === "stop")).map((o) => ({
+      ...o,
+      onSelect: () => {
+        sound.play("tap");
+        closePopup();
+        applyDecision(session, o.id);
+        if (o.id === "stop") {
+          finish();
+          return;
+        }
+        save();
+        renderHud();
+        renderRace();
+        renderQuestion();
+      }
+    }));
+    openPopup({
+      kind: "teaching",
+      message: `${milestone} squares filled! What next?`,
+      content: `<p class="fg-help-instruction">${milestone === 6 ? "Both highlighted rows and columns still have empty squares." : milestone === 36 ? "Two new numbers light up next." : "Only the last block is left."}</p>`,
+      actions
+    });
+  }
+  function finish() {
+    cancelTimers();
+    clearHelpTimers();
+    finishScene(false);
+    session.finished = true;
+    clearSave();
+    sound.play("complete");
+    fx.replaceChildren();
+    closePopup();
+    parkTiles();
+    end.replaceChildren();
+    const endCard = el("div", "mg-card fg-end-card");
+    const endIcon = el("div", "mg-emoji fg-end-robot");
+    const eq = equipmentFor(session.completed);
+    const endRobot = el("div", `fg-robot fg-robot--end${eq.powered ? " fg-robot--powered" : ""}${eq.skates ? " fg-robot--skates" : ""}${eq.jetpack ? " fg-robot--jetpack" : ""}`);
+    endRobot.dataset.mood = "joy";
+    endRobot.dataset.perf = session.completed >= 100 ? "finale-pose" : "end-pose";
+    endRobot.innerHTML = robotSvg({ idPrefix: "fg-end" });
+    endIcon.append(endRobot);
+    endCard.append(endIcon, el("h1", "mg-title", END_TITLE));
+    const line = session.completed >= 100 ? "You filled the whole multiplication chart: 100 squares!" : `You filled ${session.completed} squares of the multiplication chart.`;
+    endCard.append(el("p", "mg-subtitle fg-end-line", line));
+    const stats = el("div", "mg-stats");
+    for (const [label, v] of [["Score", session.score], ["Best Streak", session.bestStreak], ["Squares", session.completed]]) {
+      const s = el("div", "mg-stat", label);
+      s.prepend(el("b", null, String(v)));
+      stats.append(s);
+    }
+    const again = el("button", "mg-big-btn", opt.playAgain);
+    again.type = "button";
+    again.addEventListener("click", () => {
+      sound.play("tap");
+      end.classList.add("mg-hidden");
+      beginFresh();
+    });
+    endCard.append(stats, again);
+    end.append(endCard);
+    end.classList.remove("mg-hidden");
+    setPlayInert(true);
+    again.focus?.({ preventScroll: true });
+    renderHud();
+  }
+  function beginWith(saved) {
+    cancelTimers();
+    clearHelpTimers();
+    closePopup();
+    finishScene(false);
+    session = saved;
+    problem = null;
+    setPlayInert(false);
+    renderChartState();
+    renderEquipment();
+    renderHud();
+    renderRace();
+    if (session.phase === "reward") {
+      showCompletedEquation();
+      parkTiles();
+      reward(session.completed);
+    } else if (session.phase === "decision") {
+      showCompletedEquation();
+      askContinue(session.completed);
+    } else {
+      renderQuestion();
+    }
+    save();
+  }
+  function beginFresh() {
+    clearSave();
+    beginWith(newSession(opt.seed ?? Date.now()));
+  }
+  function refreshStartActions() {
+    const saved = loadSave();
+    startActions.replaceChildren();
+    if (saved) {
+      resumeBtn.textContent = `CONTINUE (${saved.completed} FILLED)`;
+      startActions.append(resumeBtn, freshBtn);
+    } else {
+      startActions.append(startBtn);
+    }
+  }
+  const onStartTap = (mode) => {
+    sound.unlock();
+    sound.play("tap");
+    example.querySelector(".fg-intro")?.classList.add("fg-intro--settled");
+    start.classList.add("mg-hidden");
+    if (mode === "resume") {
+      const saved = loadSave();
+      if (saved) {
+        beginWith(saved);
+        return;
+      }
+    }
+    beginFresh();
+  };
+  startBtn.addEventListener("click", () => onStartTap("fresh"));
+  freshBtn.addEventListener("click", () => onStartTap("fresh"));
+  resumeBtn.addEventListener("click", () => onStartTap("resume"));
+  refreshStartActions();
+  setPlayInert(true);
+  const onVisibility = () => {
+    const isHidden = document.visibilityState === "hidden";
+    if (isHidden) save();
+    root.classList.toggle("fg-inactive", isHidden);
+    sound.setHidden(isHidden);
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  view.addEventListener?.("pagehide", save);
+  const onKey = (e) => {
+    if (e.ctrlKey && e.key.toLowerCase() === "t") {
+      e.preventDefault();
+      const r = checkGenerator(gen, { count: 500 });
+      console.log(`[${opt.gameFile}] generator check: ${r.count} problems, ${r.distinct} distinct, ${r.errors.length} errors`, r.errors.slice(0, 20));
+    }
+  };
+  view.addEventListener?.("keydown", onKey);
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  renderHud();
+  let devPanel = null;
+  if (dev) {
+    devPanel = el("div", "fg-dev");
+    devPanel.setAttribute("aria-label", "Development controls");
+    const add = (label, fn) => {
+      const b = el("button", "fg-dev-btn", label);
+      b.type = "button";
+      b.addEventListener("click", fn);
+      devPanel.append(b);
+    };
+    PERFORMANCES.forEach((p) => add(p.label, () => perform(p.id, p.ms)));
+    add("Encourage", encourage);
+    [6, 36, 64, 100].forEach((m) => add(`Scene ${m}`, () => runScene(m, () => {
+      if (session && !session.finished && session.phase === "question") renderQuestion();
+    }, { preview: true })));
+    add("First miss", () => {
+      if (problem) {
+        session.wrongAttempts = 1;
+        openHelp(tiles.querySelector(".mg-tile"));
+      }
+    });
+    add("Teaching", () => {
+      if (problem) {
+        session.wrongAttempts = 2;
+        openHelp(tiles.querySelector(".mg-tile"));
+      }
+    });
+    [5, 35, 63, 99].forEach((n) => add(`Jump to ${n}`, () => {
+      if (!session || session.finished) return;
+      closePopup();
+      finishScene(false);
+      jumpTo(session, n);
+      renderChartState();
+      renderEquipment();
+      renderHud();
+      renderRace();
+      renderQuestion();
+      save();
+    }));
+    add("Set all mode", () => {
+      if (session) {
+        session.mode = "all";
+        save();
+      }
+    });
+    add("Fresh", () => {
+      start.classList.add("mg-hidden");
+      end.classList.add("mg-hidden");
+      beginFresh();
+    });
+    root.append(devPanel);
+  }
+  const api = {
+    state,
+    tracker,
+    sound,
+    get session() {
+      return session;
+    },
+    get problem() {
+      return problem;
+    },
+    get scene() {
+      return scene;
+    },
+    root,
+    answerCurrent(correct = true) {
+      const tile = Array.from(tiles.querySelectorAll(".mg-tile")).find((b) => b.dataset.choiceId === problem.answer === correct);
+      tile?.click();
+      return tile;
+    },
+    perform,
+    runScene,
+    finishScene,
+    destroy() {
+      cancelTimers();
+      clearHelpTimers();
+      closePopup();
+      finishScene(false);
+      sound.destroy();
+      view.removeEventListener?.("keydown", onKey);
+      view.removeEventListener?.("pagehide", save);
+      document.removeEventListener("visibilitychange", onVisibility);
+      resizeObserver?.disconnect?.();
+      view.removeEventListener?.("resize", refitHudTitle);
+      devPanel?.remove();
+      root.replaceChildren();
+      root.classList.remove("mg-root", "mg-shell-standard", "mf-game", "fg-game");
+    }
+  };
+  if (dev) root.fgSession = api;
+  return api;
+}
+function introMarkup() {
+  const size = 4;
+  let rows = `<div class="fg-intro-row"><span class="fg-intro-cell fg-intro-cell--corner">×</span>${[1, 2, 3, 4].map((c2) => `<span class="fg-intro-cell fg-intro-cell--head${c2 === 3 ? " fg-intro-cell--col" : ""}">${c2}</span>`).join("")}</div>`;
+  for (let r = 1; r <= size; r += 1) {
+    rows += `<div class="fg-intro-row"><span class="fg-intro-cell fg-intro-cell--head${r === 2 ? " fg-intro-cell--row" : ""}">${r}</span>${[1, 2, 3, 4].map((c2) => {
+      const cls = ["fg-intro-cell", "fg-intro-cell--product"];
+      if (r === 2) cls.push("fg-intro-cell--in-row");
+      if (c2 === 3) cls.push("fg-intro-cell--in-col");
+      if (r === 2 && c2 === 3) cls.push("fg-intro-cell--target");
+      return `<span class="${cls.join(" ")}">${r === 2 && c2 === 3 ? '<b class="fg-intro-unknown">?</b><b class="fg-intro-answer">6</b>' : ""}</span>`;
+    }).join("")}</div>`;
+  }
+  return `<div class="fg-intro mf-start-lesson" role="group" aria-label="How to fill one square">
+    <ol class="fg-intro-steps">
+      <li><span class="fg-step-num">1</span>Find the row number and the column number.</li>
+      <li><span class="fg-step-num">2</span>Multiply them: row × column.</li>
+      <li><span class="fg-step-num">3</span>Tap the product. It fills the square.</li>
+    </ol>
+    <div class="fg-intro-chart" role="img" aria-label="A small multiplication chart. Row 2 and column 3 meet at one square. 2 times 3 equals 6, so 6 fills that square.">${rows}</div>
+    <div class="fg-intro-equation" aria-hidden="true"><span class="fg-intro-eq-a">2</span> × <span class="fg-intro-eq-b">3</span> = <span class="fg-intro-eq-slot"><b class="fg-intro-eq-q">?</b><b class="fg-intro-eq-p">6</b></span></div>
+  </div>`;
+}
+defineGame({
+  meta: {
+    name: "fact_grid",
+    lesson: "107",
+    title: TITLE,
+    subtitle: SUBTITLE,
+    emoji: "🤖",
+    tag: LESSON_TAG,
+    questions: 100
+  },
+  ...gen
+});
+function mount(element, options = {}) {
+  if (element?.setAttribute) {
+    element.setAttribute("role", "main");
+    element.setAttribute("aria-label", "Fact Grid game");
+  }
+  if (globalThis.document) globalThis.document.title = "Fact Grid | Math Games";
+  return startSession(element, options);
+}
+mount(document.getElementById("game"), { gameFile: "fact_grid_107.html" });</script>
+  <style rel="stylesheet" crossorigin>/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: var(--mg-expression-label-line-height, 1.05);
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: var(--mg-expression-value-line-height, 1.15);
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+/* Reproduced Game 106 surrounding frame for FACT GRID. Values and class
+   names follow the pinned reference (outputs/game107-fable/control/
+   reference106: src/engine/styles.css Standard Shell, src/factory/styles.css
+   and the 106 numeric answer rule). The root checkout engine predates the
+   Standard Shell, so these rules travel with the game. They only match a
+   root carrying .mg-shell-standard and .mf-game, which this game sets. */
+
+.fg-game {
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+  --mf-picture-border: var(--mf-ink);
+  --mf-card-radius: 22px;
+  --mf-card-shadow: 0 6px 0 var(--mf-ink);
+  --mf-card-gap: 12px;
+  --mf-popup-title-size: 28px;
+  --mf-popup-body-size: 24px;
+  --mf-popup-focus-size: 36px;
+  --mf-popup-value-size: 40px;
+  --mf-popup-label-size: 18px;
+}
+@media (max-width: 560px) {
+  .fg-game { --mg-hud-title-max: 30px; }
+}
+@media (max-width: 560px), (max-height: 500px) {
+  .fg-game {
+    --mf-popup-title-size: 24px;
+    --mf-popup-body-size: 20px;
+    --mf-popup-focus-size: 28px;
+    --mf-popup-value-size: 32px;
+    --mf-popup-label-size: 16px;
+  }
+}
+
+/* Robot family background. */
+.mf-game[data-mf-theme="robot"] {
+  background:
+    radial-gradient(circle at 12% 18%, rgba(55, 200, 197, .22) 0 8%, transparent 9%),
+    radial-gradient(circle at 88% 80%, rgba(242, 155, 56, .24) 0 12%, transparent 13%),
+    linear-gradient(155deg, var(--mf-bg-a) 0%, #243d9f 48%, var(--mf-bg-b) 100%);
+}
+
+/* Header: the game name fits one line, down to the floor, never truncates. */
+.mg-shell-standard .mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0; text-overflow: clip;
+}
+.mg-shell-standard .mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+.mf-game .mg-hud-title { padding-inline: 0.15em; }
+.mg-shell-standard .mg-chip-score { min-height: var(--mg-chip-box-height); }
+
+/* Standard Shell v1 frame. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card { flex: 1 1 auto; min-width: 0; min-height: 0; }
+.mg-shell-standard .mg-tiles { width: min(686px, 85%); align-self: center; gap: 10.8px; }
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-shell-standard .mg-tile:focus-visible { outline: 4px solid #ffd93d; outline-offset: 3px; }
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm { font-size: clamp(15px, 3vw, 28px); line-height: 1.1; }
+.mg-shell-standard .mg-toast-good { font-size: clamp(45px, 9vw, 84px); line-height: 1.1; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint { font-size: 15px; }
+
+/* 106 numeric answer content. */
+.mf-game .mf-answer-button { display: grid; place-items: center; }
+.mf-game .mp-number-choice .mf-answer-content--number {
+  display: block;
+  color: var(--mf-ink);
+  font-family: var(--mg-font-read);
+  font-size: clamp(24px, 4vw, 32px);
+  font-weight: 700;
+  line-height: .9;
+}
+
+/* Problem Card surface. */
+.mf-game .mf-card {
+  width: min(920px, 100%);
+  height: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: clamp(10px, 1.5vw, 16px);
+  color: var(--mf-ink);
+  background: var(--mf-card);
+  border: 4px solid var(--mf-ink);
+  border-radius: var(--mf-card-radius);
+  box-shadow: var(--mf-card-shadow);
+  text-align: center;
+}
+
+/* Start card: the example panel takes the family palette. */
+.mf-game .mg-example { border-color: var(--mf-dotted-border); background: var(--mf-picture); margin-block: 8px; padding: 8px; }
+.mg-shell-standard .mg-big-btn:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+
+/* Retry control and popup frame. */
+.mf-game .mf-retry {
+  min-height: 44px;
+  margin-top: 2px;
+  padding: 7px 20px;
+  color: var(--mf-ink);
+  background: #ffd93d;
+  border: 3px solid var(--mf-ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 0 var(--mf-ink);
+  font-family: var(--mg-font-shout);
+  font-size: clamp(18px, 2.2vw, 27px);
+  letter-spacing: 1px;
+  cursor: pointer;
+}
+.mf-game .mf-retry:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mf-ink); }
+.mf-game .mf-retry:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+
+.mf-game .mf-popup {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 4;
+  display: grid;
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 32px);
+  width: min(600px, calc(100% - 32px));
+  align-content: center;
+  justify-items: center;
+  gap: clamp(8px, 1.8vh, 16px);
+  padding: clamp(14px, 2vh, 20px) clamp(14px, 2vw, 24px);
+  overflow-y: auto;
+  color: var(--mf-ink);
+  background: var(--mf-card);
+  border: 4px solid var(--mf-ink);
+  border-radius: 20px;
+  box-shadow: 0 8px 0 var(--mf-ink);
+  text-align: center;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  animation: mf-popup-in var(--mf-popup-enter-ms, 240ms) ease-out;
+}
+.mf-game .mf-popup-message { max-width: 30ch; margin: 0; font-weight: 800; font-size: var(--mf-popup-title-size); line-height: 1.15; }
+.mf-game .mf-popup-content { font-weight: 700; display: grid; width: 100%; min-width: 0; justify-items: center; font-size: var(--mf-popup-body-size); line-height: 1.2; }
+.mf-game .mf-popup--cue { padding-block: clamp(16px, 2.5vh, 24px); padding-inline: clamp(18px, 2.5vw, 30px); }
+.mf-game .mf-popup--cue .mf-popup-message {
+  width: 100%;
+  max-width: 570px;
+  padding-block: clamp(12px, 2vh, 18px);
+  padding-inline: clamp(12px, 2vw, 24px);
+  background: var(--mf-picture);
+  border: 3px solid var(--mf-dotted-border);
+  border-radius: 15px;
+}
+.mf-game .mf-popup--teaching { padding-block: clamp(16px, 2.5vh, 24px); padding-inline: clamp(18px, 2.5vw, 30px); }
+.mf-game .mf-popup-content > p { max-width: 570px; margin: 0 0 10px; font-size: clamp(18px, 3vw, 25px); font-weight: 700; line-height: 1.16; text-align: center; }
+.mf-game .fg-help-instruction { margin: 0 0 12px; }
+.mf-game .fg-help-picture {
+  width: 100%;
+  min-height: 118px;
+  display: grid;
+  place-items: center;
+  padding: clamp(12px, 2.5vh, 18px) 8px;
+  background: var(--mf-picture);
+  border: 3px solid var(--mf-dotted-border);
+  border-radius: 15px;
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mf-game .mp-number-choice .mf-answer-content--number { font-size: 24px; }
+  .mf-game .mf-card { padding: 8px; border-radius: 18px; }
+  .mf-game .mf-popup { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
+  .mf-game .fg-help-picture { min-height: 92px; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mf-game .mf-card { padding: 4px; border-radius: 16px; }
+  .mf-game .mf-popup { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); padding: 10px; }
+  .mf-game .mf-popup-content > p { font-size: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) { animation: none !important; }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+  .mf-game .mf-popup { animation: none; }
+  .mf-game .mf-retry { transition: none; }
+}
+
+@keyframes mf-popup-in {
+  from { opacity: 0; transform: translate(-50%, -42%) scale(.9); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+/* FACT GRID Problem Card interior, robot and rewards. Everything is scoped
+   to .fg-game. The surrounding frame lives in shell.css. */
+
+.fg-game {
+  --fg-red: #e5352b;
+  --fg-red-dark: #b8241c;
+  --fg-screen: #d7dbde;
+  --fg-screen-line: #aeb6bc;
+  --fg-head: #b9c2c9;
+  --fg-mint: #7fe3d2;
+  --fg-mint-deep: #2fb3a3;
+  --fg-orange: #f29b38;
+  --fg-yellow: #ffd93d;
+  --fg-ink: #13213f;
+  --fg-cream: #fff4d6;
+}
+
+.fg-announce {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+/* While no answer is possible (reward, decision, finished chart) the answer
+   grid keeps its exact measured space but is invisible and inert, so the
+   Problem Card never grows into the established answer area. */
+.fg-game .mg-tiles.fg-tiles--parked { visibility: hidden; }
+.fg-game .mg-tiles.fg-tiles--parked .mg-tile { pointer-events: none; }
+
+/* Reduced motion: one static praise toast on a timer instead of the
+   animated engine effects. */
+.fg-game .fg-toast-static { animation: none !important; opacity: 1; transform: translate(-50%, -50%); }
+
+/* ---------- Problem Card ---------- */
+.fg-game .fg-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(200px, .9fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: clamp(8px, 1.4vw, 14px);
+  overflow: hidden;
+}
+
+/* The drawing toy: red casing, gray screen, the chart etched on it. */
+.fg-game .fg-toy {
+  position: relative;
+  container-type: size;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+}
+/* The casing is a square that fits the smaller side of its cell, so the
+   red frame always hugs the screen. */
+.fg-game .fg-toy-shell {
+  width: min(100cqw, 100cqh);
+  height: min(100cqw, 100cqh);
+  padding: 8px;
+  background: linear-gradient(180deg, #f0473c, var(--fg-red) 55%, var(--fg-red-dark));
+  border: 3px solid var(--fg-ink);
+  border-radius: 20px;
+  box-shadow: inset 0 3px 0 rgba(255, 255, 255, .28), inset 0 -4px 0 rgba(0, 0, 0, .22);
+}
+.fg-game .fg-toy-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  container-type: size;
+  background: var(--fg-screen);
+  border: 3px solid var(--fg-ink);
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 3px #c4cacf, inset 0 4px 10px rgba(0, 0, 0, .18);
+  overflow: hidden;
+}
+.fg-game .fg-chart {
+  display: grid;
+  grid-template-rows: repeat(calc(var(--fg-size) + 1), minmax(0, 1fr));
+  width: 100%;
+  height: 100%;
+  padding: 2%;
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  color: var(--fg-ink);
+}
+.fg-game .fg-chart-row { display: grid; grid-template-columns: repeat(calc(var(--fg-size) + 1), minmax(0, 1fr)); min-height: 0; }
+.fg-game .fg-cell {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  font-size: max(8px, 5cqh);
+  line-height: 1;
+  border: 1px solid var(--fg-screen-line);
+  margin: -0.5px;
+  background: rgba(255, 255, 255, .28);
+  transition: background .18s;
+}
+.fg-game .fg-cell > span { display: block; min-width: 0; }
+.fg-game .fg-cell--corner { background: var(--fg-head); color: #4b5563; font-size: max(7px, 3.6cqh); }
+.fg-game .fg-cell--head { background: var(--fg-head); color: var(--fg-ink); font-weight: 800; }
+/* Highlighted families: mint headers with a marker bar, tinted lines. */
+.fg-game .fg-cell--head.fg-cell--family { background: var(--fg-mint); }
+.fg-game .fg-cell--col-head.fg-cell--family::after,
+.fg-game .fg-cell--row-head.fg-cell--family::after {
+  content: ''; position: absolute; background: var(--fg-mint-deep); border-radius: 2px;
+}
+.fg-game .fg-cell--col-head.fg-cell--family::after { left: 15%; right: 15%; bottom: 6%; height: 12%; }
+.fg-game .fg-cell--row-head.fg-cell--family::after { top: 15%; bottom: 15%; right: 6%; width: 12%; }
+.fg-game .fg-cell--product.fg-cell--family { background: rgba(127, 227, 210, .38); }
+/* Active row and column: brighter band plus a dotted trail. */
+.fg-game .fg-cell--product.fg-cell--active-line { background: rgba(255, 217, 61, .48); }
+.fg-game .fg-cell--product.fg-cell--active-line:not(.fg-cell--done)::before {
+  content: ''; position: absolute; inset: 30%; border-radius: 50%; background: rgba(19, 33, 63, .18);
+}
+.fg-game .fg-cell--head.fg-cell--active-head { background: var(--fg-yellow); box-shadow: inset 0 0 0 2px var(--fg-ink); z-index: 1; }
+/* The square being filled: yellow, outlined, with a question mark. */
+.fg-game .fg-cell--target {
+  z-index: 2;
+  background: var(--fg-yellow);
+  box-shadow: 0 0 0 2px var(--fg-ink), 0 0 0 5px rgba(255, 217, 61, .9);
+  border-radius: 3px;
+  font-size: max(9px, 5.4cqh);
+  animation: fg-target-pulse 1.4s ease-in-out infinite;
+}
+.fg-game .fg-cell--target::before { display: none; }
+@keyframes fg-target-pulse { 50% { box-shadow: 0 0 0 2px var(--fg-ink), 0 0 0 7px rgba(255, 217, 61, .55); } }
+/* Completed squares: white with the product, so progress reads as numbers. */
+.fg-game .fg-cell--done { background: #fff; color: var(--fg-ink); }
+.fg-game .fg-cell--done.fg-cell--family { background: #f4fffc; }
+.fg-game .fg-cell--just { animation: fg-cell-pop .5s cubic-bezier(.2, .9, .3, 1.3); }
+@keyframes fg-cell-pop { 0% { transform: scale(.4); background: var(--fg-yellow); } 60% { transform: scale(1.25); } 100% { transform: none; } }
+
+/* Launchpad: the finished chart lights up row by row. */
+.fg-game .fg-toy--launchpad .fg-cell--done { animation: fg-launch-glow 1.2s ease-in-out infinite; animation-delay: calc(var(--fg-r, 0) * 110ms); }
+.fg-game .fg-chart-row:nth-child(2) { --fg-r: 9; } .fg-game .fg-chart-row:nth-child(3) { --fg-r: 8; }
+.fg-game .fg-chart-row:nth-child(4) { --fg-r: 7; } .fg-game .fg-chart-row:nth-child(5) { --fg-r: 6; }
+.fg-game .fg-chart-row:nth-child(6) { --fg-r: 5; } .fg-game .fg-chart-row:nth-child(7) { --fg-r: 4; }
+.fg-game .fg-chart-row:nth-child(8) { --fg-r: 3; } .fg-game .fg-chart-row:nth-child(9) { --fg-r: 2; }
+.fg-game .fg-chart-row:nth-child(10) { --fg-r: 1; } .fg-game .fg-chart-row:nth-child(11) { --fg-r: 0; }
+@keyframes fg-launch-glow { 50% { background: var(--fg-yellow); box-shadow: 0 0 6px 2px rgba(255, 217, 61, .8); } }
+
+/* ---------- side panel ---------- */
+.fg-game .fg-side {
+  container-type: inline-size;
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+}
+.fg-game .fg-equation {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: clamp(4px, 1.6cqw, 10px);
+  padding: 6px 4px 2px;
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  color: var(--fg-ink);
+}
+.fg-game .fg-factor { display: grid; justify-items: center; gap: 2px; min-width: 2ch; }
+.fg-game .fg-factor-value {
+  display: grid; place-items: center;
+  min-width: 1.6em; min-height: 1.3em; padding: 0 .2em;
+  font-size: clamp(26px, 9cqw, 44px); line-height: 1.15;
+  border-radius: 12px; border: 3px solid var(--fg-ink); background: #fff;
+}
+.fg-game .fg-factor i { font-style: normal; font-size: clamp(11px, 3.4cqw, 14px); font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: #355080; }
+.fg-game .fg-factor--row .fg-factor-value { border-color: var(--fg-mint-deep); box-shadow: inset 0 -5px 0 var(--fg-mint); }
+.fg-game .fg-factor--col .fg-factor-value { border-color: var(--fg-mint-deep); box-shadow: inset 5px 0 0 var(--fg-mint); }
+.fg-game .fg-factor--product .fg-factor-value { border-style: dashed; background: var(--fg-yellow); }
+.fg-game .fg-equation--filled .fg-factor--product .fg-factor-value { border-style: solid; background: #fff; animation: fg-cell-pop .5s cubic-bezier(.2, .9, .3, 1.3); }
+.fg-game .fg-op { font-size: clamp(26px, 8cqw, 40px); line-height: 1.3; padding-top: .1em; }
+
+.fg-game .fg-robot-stage {
+  position: relative;
+  min-height: 90px;
+  min-width: 0;
+  display: grid;
+  place-items: end center;
+  overflow: hidden;
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, transparent 0 82%, rgba(19, 33, 63, .12) 82% 84%, transparent 84%),
+    radial-gradient(ellipse at 50% 100%, rgba(127, 227, 210, .35), transparent 62%);
+}
+/* The robot stands on the stage floor with headroom above it: 20% in play
+   so hops and the cartwheel stay inside the stage, 28% during a milestone
+   so the jetpack loop fits. The final launch alone leaves the card on
+   purpose. */
+.fg-game .fg-robot { position: absolute; inset: 0; top: 20%; }
+.fg-game .fg-card[data-scene] .fg-robot { top: 28%; }
+.fg-game .fg-robot-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; display: block; }
+
+/* Race strip: the child and the rival robot, one square behind. */
+.fg-game .fg-race { display: grid; gap: 2px; padding: 4px 8px 2px; }
+.fg-game .fg-race-track { position: relative; height: 10px; margin: 10px 18px 12px; border-radius: 999px; background: rgba(19, 33, 63, .16); border: 2px solid rgba(19, 33, 63, .35); }
+.fg-game .fg-race-marker { position: absolute; top: 50%; width: 24px; height: 24px; transform: translate(-50%, -50%); display: grid; place-items: center; border-radius: 50%; border: 2px solid var(--fg-ink); transition: left .5s cubic-bezier(.3, .8, .3, 1); }
+.fg-game .fg-race-marker--you { background: var(--fg-yellow); color: var(--fg-ink); font-size: 14px; z-index: 2; margin-top: -7px; }
+.fg-game .fg-race-marker--robot { background: var(--fg-cream); margin-top: 7px; }
+.fg-game .fg-race-marker--robot svg { width: 18px; height: 18px; }
+.fg-game .fg-race-legend { display: flex; justify-content: space-between; gap: 6px; font-size: clamp(11px, 3.4cqw, 14px); font-weight: 700; color: #355080; }
+.fg-game .fg-race-legend b { color: var(--fg-ink); font-size: 1.15em; }
+
+/* Sound toggle lives on the toy casing. */
+.fg-game .fg-sound {
+  position: absolute; top: 8px; right: 8px; z-index: 3;
+  width: 44px; height: 44px; border-radius: 50%;
+  border: 3px solid var(--fg-ink); background: var(--fg-cream); box-shadow: 0 3px 0 var(--fg-ink);
+  font-size: 20px; cursor: pointer; display: grid; place-items: center;
+}
+.fg-game .fg-sound:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--fg-ink); }
+.fg-game .fg-sound:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 2px; }
+
+/* ---------- robot rig ---------- */
+.fg-game .fg-robot-svg * { transform-box: view-box; }
+.fg-game .fg-robot-rig { transform-origin: 70px 160px; }
+.fg-game .fg-head { transform-origin: 70px 84px; }
+.fg-game .fg-antenna { transform-origin: 70px 30px; }
+.fg-game .fg-arm--left { transform-origin: 38px 94px; }
+.fg-game .fg-arm--right { transform-origin: 102px 94px; }
+.fg-game .fg-forearm--left { transform-origin: 15px 100px; }
+.fg-game .fg-forearm--right { transform-origin: 125px 100px; }
+.fg-game .fg-leg--left { transform-origin: 54px 128px; }
+.fg-game .fg-leg--right { transform-origin: 86px 128px; }
+.fg-game .fg-torso { transform-origin: 70px 128px; }
+.fg-game .fg-skate { transform-origin: 70px 158px; opacity: 0; transform: scaleY(0); transition: opacity .3s, transform .4s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-jetpack { transform-origin: 70px 100px; opacity: 0; transform: scale(.4); transition: opacity .3s, transform .4s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-jet-flame { transform-origin: 70px 124px; opacity: 0; }
+.fg-game .fg-holo { transform-origin: 15px 100px; opacity: 0; transform: scale(0); }
+.fg-game .fg-bulb-glow { transition: opacity .4s; }
+.fg-game .fg-robot--powered .fg-bulb-glow { opacity: .55; animation: fg-bulb 2.4s ease-in-out infinite; }
+.fg-game .fg-robot--skates .fg-skate { opacity: 1; transform: none; }
+.fg-game .fg-robot--jetpack .fg-jetpack { opacity: 1; transform: none; }
+@keyframes fg-bulb { 50% { opacity: .2; } }
+
+/* Expressions. */
+.fg-game .fg-mouth-open, .fg-game .fg-mouth-oh, .fg-game .fg-mouth-hm { opacity: 0; }
+.fg-game .fg-robot[data-mood="happy"] .fg-mouth-smile,
+.fg-game .fg-robot[data-mood="joy"] .fg-mouth-smile,
+.fg-game .fg-robot[data-mood="kind"] .fg-mouth-smile { opacity: 0; }
+.fg-game .fg-robot[data-mood="happy"] .fg-mouth-open { opacity: 1; }
+.fg-game .fg-robot[data-mood="joy"] .fg-mouth-oh { opacity: 1; }
+.fg-game .fg-robot[data-mood="kind"] .fg-mouth-hm { opacity: 1; }
+.fg-game .fg-robot[data-mood="joy"] .fg-pupil { transform: scale(1.3); transform-origin: center; transform-box: fill-box; }
+.fg-game .fg-cheeks { opacity: 0; transition: opacity .3s; }
+.fg-game .fg-robot[data-mood="joy"] .fg-cheeks, .fg-game .fg-robot[data-mood="happy"] .fg-cheeks { opacity: 1; }
+
+/* Idle: a slow breath and a blink, away from the reading focus. */
+.fg-game .fg-robot[data-perf=""] .fg-robot-rig { animation: fg-idle 3.2s ease-in-out infinite; }
+.fg-game .fg-robot[data-perf=""] .fg-antenna { animation: fg-antenna-sway 3.2s ease-in-out infinite; }
+.fg-game .fg-lid { animation: fg-blink 4.6s linear infinite; }
+/* Hidden page: the root carries fg-inactive and every animation inside the
+   game pauses (idle breath, antenna sway, blink, target pulse, scenes,
+   fireworks, toasts). !important beats every animation shorthand that
+   would otherwise reset the play state, whatever its specificity. */
+.fg-game.fg-inactive, .fg-game.fg-inactive * { animation-play-state: paused !important; }
+@keyframes fg-idle { 50% { transform: translateY(-2px); } }
+@keyframes fg-antenna-sway { 50% { transform: rotate(-6deg); } }
+@keyframes fg-blink { 0%, 92%, 100% { height: 0; } 95%, 97% { height: 19px; } }
+
+/* ---------- correct-answer performances (about one second each) ---------- */
+/* 1 Shuffle: side-to-side slide with alternating steps and swinging arms. */
+.fg-game .fg-robot[data-perf="shuffle"] .fg-robot-rig { animation: fg-shuffle 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-leg--left { animation: fg-step-l 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-leg--right { animation: fg-step-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-arm--left { animation: fg-swing-l 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-arm--right { animation: fg-swing-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-head { animation: fg-head-bob 1.1s ease-in-out; }
+@keyframes fg-shuffle { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-12px) rotate(-4deg); } 50% { transform: translateX(0); } 75% { transform: translateX(12px) rotate(4deg); } }
+@keyframes fg-step-l { 0%, 50%, 100% { transform: rotate(0); } 25% { transform: rotate(-22deg) translateY(-4px); } 75% { transform: rotate(10deg); } }
+@keyframes fg-step-r { 0%, 50%, 100% { transform: rotate(0); } 25% { transform: rotate(-10deg); } 75% { transform: rotate(22deg) translateY(-4px); } }
+@keyframes fg-swing-l { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(35deg); } 75% { transform: rotate(-35deg); } }
+@keyframes fg-swing-r { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(35deg); } 75% { transform: rotate(-35deg); } }
+@keyframes fg-head-bob { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(6deg) translateY(2px); } 75% { transform: rotate(-6deg) translateY(2px); } }
+
+/* 2 Heel-click hop: crouch, jump, kick both heels together, land with squash. */
+.fg-game .fg-robot[data-perf="heelclick"] .fg-robot-rig { animation: fg-hop 1.05s cubic-bezier(.3, .6, .3, 1); }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-leg--left { animation: fg-kick-l 1.05s ease-in-out; }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-leg--right { animation: fg-kick-r 1.05s ease-in-out; }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-arm--left { animation: fg-arms-up-l 1.05s ease-in-out; }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-arm--right { animation: fg-arms-up-r 1.05s ease-in-out; }
+@keyframes fg-hop { 0% { transform: none; } 18% { transform: scaleY(.86) scaleX(1.08); } 45% { transform: translateY(-34px) scaleY(1.05); } 62% { transform: translateY(-28px); } 82% { transform: translateY(0) scaleY(.9) scaleX(1.08); } 100% { transform: none; } }
+@keyframes fg-kick-l { 0%, 25%, 80%, 100% { transform: rotate(0); } 45%, 60% { transform: rotate(-40deg) translateX(6px); } }
+@keyframes fg-kick-r { 0%, 25%, 80%, 100% { transform: rotate(0); } 45%, 60% { transform: rotate(40deg) translateX(-6px); } }
+@keyframes fg-arms-up-l { 0%, 100% { transform: rotate(0); } 40%, 70% { transform: rotate(150deg); } }
+@keyframes fg-arms-up-r { 0%, 100% { transform: rotate(0); } 40%, 70% { transform: rotate(-150deg); } }
+
+/* 3 Spin: a full turn on the spot, arms out, small hop. */
+.fg-game .fg-robot[data-perf="spin"] .fg-robot-rig { animation: fg-spin 1.1s cubic-bezier(.4, 0, .3, 1); }
+.fg-game .fg-robot[data-perf="spin"] .fg-arm--left { animation: fg-arms-out-l 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="spin"] .fg-arm--right { animation: fg-arms-out-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="spin"] .fg-antenna { animation: fg-antenna-whip 1.1s ease-in-out; }
+@keyframes fg-spin { 0% { transform: scaleX(1); } 15% { transform: translateY(-6px) scaleX(1); } 40% { transform: translateY(-10px) scaleX(-1); } 65% { transform: translateY(-10px) scaleX(1); } 90% { transform: translateY(0) scaleX(-1); } 100% { transform: scaleX(1); } }
+@keyframes fg-arms-out-l { 0%, 100% { transform: rotate(0); } 30%, 80% { transform: rotate(80deg); } }
+@keyframes fg-arms-out-r { 0%, 100% { transform: rotate(0); } 30%, 80% { transform: rotate(-80deg); } }
+@keyframes fg-antenna-whip { 30% { transform: rotate(18deg); } 60% { transform: rotate(-18deg); } }
+
+/* 4 Fist pump: anticipation lean, a fast punch up, held, then release. */
+.fg-game .fg-robot[data-perf="fistpump"] .fg-arm--right { animation: fg-pump 1s cubic-bezier(.2, .9, .3, 1.2); }
+.fg-game .fg-robot[data-perf="fistpump"] .fg-forearm--right { animation: fg-pump-fore 1s ease-out; }
+.fg-game .fg-robot[data-perf="fistpump"] .fg-robot-rig { animation: fg-pump-body 1s ease-in-out; }
+.fg-game .fg-robot[data-perf="fistpump"] .fg-head { animation: fg-pump-head 1s ease-in-out; }
+.fg-game .fg-robot[data-perf="fistpump"] .fg-leg--left { animation: fg-pump-leg 1s ease-in-out; }
+@keyframes fg-pump { 0% { transform: rotate(0); } 20% { transform: rotate(30deg); } 40%, 75% { transform: rotate(-165deg); } 100% { transform: rotate(0); } }
+@keyframes fg-pump-fore { 0%, 20% { transform: rotate(0); } 40%, 75% { transform: rotate(40deg); } 100% { transform: rotate(0); } }
+@keyframes fg-pump-body { 0% { transform: none; } 20% { transform: scaleY(.94) rotate(4deg); } 40%, 75% { transform: translateY(-6px) rotate(-7deg); } 100% { transform: none; } }
+@keyframes fg-pump-head { 40%, 75% { transform: rotate(-10deg); } }
+@keyframes fg-pump-leg { 40%, 75% { transform: rotate(-20deg) translateY(-6px); } }
+
+/* 5 Cartwheel: a full sideways wheel, limbs spread, landing settle. The
+   wheel turns about the body's centre (not the floor pivot the other moves
+   use), lifted a little at the top of the arc, so head, antenna, hands and
+   feet all stay inside the stage through the whole turn. */
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-robot-rig { transform-origin: 70px 92px; animation: fg-cartwheel 1.25s cubic-bezier(.45, .05, .35, 1); }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--left { animation: fg-spread-l 1.25s ease-in-out; }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--right { animation: fg-spread-r 1.25s ease-in-out; }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-leg--left { animation: fg-spread-leg-l 1.25s ease-in-out; }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-leg--right { animation: fg-spread-leg-r 1.25s ease-in-out; }
+@keyframes fg-cartwheel { 0% { transform: none; } 12% { transform: translateX(6px) rotate(-8deg); } 30% { transform: translateX(-6px) translateY(-18px) rotate(90deg); } 55% { transform: translateX(-4px) translateY(-32px) rotate(200deg); } 78% { transform: translateY(-6px) rotate(330deg); } 88% { transform: translateY(4px) rotate(360deg) scaleY(.94); } 100% { transform: translateX(0) rotate(360deg); } }
+@keyframes fg-spread-l { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(150deg); } }
+@keyframes fg-spread-r { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(-150deg); } }
+@keyframes fg-spread-leg-l { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(-35deg); } }
+@keyframes fg-spread-leg-r { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(35deg); } }
+
+/* 6 Holo star: raises a hand and projects a spinning star. */
+.fg-game .fg-robot[data-perf="star"] .fg-arm--left { animation: fg-present 1.2s cubic-bezier(.2, .9, .3, 1.2); }
+.fg-game .fg-robot[data-perf="star"] .fg-holo { animation: fg-holo 1.2s ease-out; }
+.fg-game .fg-robot[data-perf="star"] .fg-head { animation: fg-look-up 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="star"] .fg-robot-rig { animation: fg-lean 1.2s ease-in-out; }
+@keyframes fg-present { 0% { transform: rotate(0); } 30%, 80% { transform: rotate(110deg); } 100% { transform: rotate(0); } }
+@keyframes fg-holo { 0%, 25% { opacity: 0; transform: scale(0) rotate(0); } 45% { opacity: 1; transform: scale(1.25) rotate(90deg); } 80% { opacity: 1; transform: scale(1) rotate(360deg); } 100% { opacity: 0; transform: scale(.4) rotate(420deg); } }
+@keyframes fg-look-up { 30%, 80% { transform: rotate(-8deg) translateY(-2px); } }
+@keyframes fg-lean { 30%, 80% { transform: rotate(5deg); } }
+
+/* Encouragement after a miss: a soft head tilt and a thumbs-up. */
+.fg-game .fg-robot[data-perf="encourage"] .fg-head { animation: fg-tilt .9s ease-in-out; }
+.fg-game .fg-robot[data-perf="encourage"] .fg-arm--right { animation: fg-thumb .9s ease-in-out; }
+@keyframes fg-tilt { 30%, 70% { transform: rotate(9deg); } }
+@keyframes fg-thumb { 30%, 70% { transform: rotate(-70deg); } }
+
+/* ---------- milestone scenes ---------- */
+/* During a milestone the race strip yields its space to the banner (the
+   strip keeps its layout, so nothing shifts) and the SKIP control sits in
+   the strip's right end. The robot stage keeps its full height. */
+.fg-game .fg-scene-banner {
+  position: absolute; left: 0; right: 84px; bottom: 0; z-index: 3;
+  display: grid; align-content: center; gap: 2px; min-height: 56px; padding: 2px 8px; pointer-events: none;
+  opacity: 0; transform: translateY(8px); transition: opacity .3s, transform .3s;
+  text-align: center;
+}
+.fg-game .fg-card[data-scene] .fg-scene-banner { opacity: 1; transform: none; }
+.fg-game .fg-card[data-scene] .fg-race { visibility: hidden; }
+.fg-game .fg-scene-title { font-family: var(--mg-font-shout); font-size: clamp(20px, 7cqw, 32px); letter-spacing: 2px; line-height: 1.05; color: var(--fg-ink); text-shadow: 3px 3px 0 var(--fg-yellow); }
+.fg-game .fg-scene-line { font-size: clamp(12px, 3.4cqw, 15px); font-weight: 700; line-height: 1.15; color: #355080; }
+.fg-game .fg-card[data-scene] .fg-robot-stage { background: radial-gradient(ellipse at 50% 100%, rgba(255, 217, 61, .45), rgba(127, 227, 210, .25) 50%, transparent 72%); }
+/* The finale is the one scene that leaves its stage: the launch flies up
+   over the rest of the Problem Card (the completed chart is the launchpad
+   on a phone, the equation panel on a desktop) and exits at the card's own
+   clipped edge. The stage stops clipping and paints above its neighbours;
+   the fireworks layer keeps its own bounds. */
+.fg-game .fg-card[data-scene="finale"] .fg-robot-stage { overflow: visible; z-index: 4; }
+.fg-game .fg-skip {
+  position: absolute; right: 0; bottom: 6px; z-index: 4;
+  min-width: 64px; min-height: 44px; padding: 6px 16px;
+  font-family: var(--mg-font-shout); font-size: 20px; letter-spacing: 1px;
+  color: var(--fg-ink); background: var(--fg-cream); border: 3px solid var(--fg-ink); border-radius: 999px; box-shadow: 0 3px 0 var(--fg-ink); cursor: pointer;
+}
+.fg-game .fg-skip:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 2px; }
+
+/* 6: power-up. Antenna flares, eyes flash, then a stomping wave dance. */
+.fg-game .fg-robot[data-perf="powerup"] .fg-bulb-glow { opacity: 1; animation: fg-flare 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-bulb { animation: fg-bulb-pop 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-robot-rig { animation: fg-powerup-body 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-arm--left { animation: fg-wave-l 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-arm--right { animation: fg-wave-r 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-leg--left { animation: fg-stomp-l 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-leg--right { animation: fg-stomp-r 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-head { animation: fg-powerup-head 5.2s ease-in-out; }
+@keyframes fg-flare { 0% { opacity: 0; transform: scale(.5); } 8%, 14% { opacity: 1; transform: scale(2.2); } 20% { opacity: .6; transform: scale(1); } 100% { opacity: .6; transform: scale(1); } }
+@keyframes fg-bulb-pop { 6%, 12% { transform: scale(1.5); } }
+@keyframes fg-powerup-body { 0%, 12% { transform: none; } 14% { transform: translateX(-3px); } 16% { transform: translateX(3px); } 18% { transform: translateX(-3px); } 20% { transform: none; } 26%, 42%, 58%, 74% { transform: translateY(-14px) rotate(-5deg); } 34%, 50%, 66% { transform: translateY(0) rotate(5deg); } 82% { transform: translateY(0); } 88% { transform: translateY(-22px) scaleY(1.06); } 94%, 100% { transform: translateY(0); } }
+@keyframes fg-wave-l { 0%, 20% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(160deg); } 36%, 52%, 68% { transform: rotate(40deg); } 88%, 100% { transform: rotate(150deg); } }
+@keyframes fg-wave-r { 0%, 20% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(-40deg); } 36%, 52%, 68% { transform: rotate(-160deg); } 88%, 100% { transform: rotate(-150deg); } }
+@keyframes fg-stomp-l { 0%, 20%, 82%, 100% { transform: rotate(0); } 26%, 42%, 58%, 74% { transform: rotate(-30deg) translateY(-6px); } 34%, 50%, 66% { transform: rotate(0); } }
+@keyframes fg-stomp-r { 0%, 20%, 82%, 100% { transform: rotate(0); } 34%, 50%, 66% { transform: rotate(30deg) translateY(-6px); } 26%, 42%, 58%, 74% { transform: rotate(0); } }
+@keyframes fg-powerup-head { 0%, 20% { transform: none; } 26%, 58% { transform: rotate(8deg); } 42%, 74% { transform: rotate(-8deg); } 88%, 100% { transform: rotate(0) translateY(-3px); } }
+
+/* 36: skates unfold, a glide left and right with a lean, one spin, a pose. */
+.fg-game .fg-robot[data-perf="skate"] .fg-skate { opacity: 1; transform: none; animation: fg-skate-unfold 5.6s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-robot[data-perf="skate"] .fg-wheel { animation: fg-wheel 5.6s linear; }
+.fg-game .fg-robot[data-perf="skate"] .fg-robot-rig { animation: fg-glide 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-arm--left { animation: fg-glide-arm-l 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-arm--right { animation: fg-glide-arm-r 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-leg--right { animation: fg-glide-leg 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-head { animation: fg-glide-head 5.6s ease-in-out; }
+@keyframes fg-skate-unfold { 0% { opacity: 0; transform: scaleY(0); } 12% { opacity: 1; transform: scaleY(1.2); } 18%, 100% { opacity: 1; transform: none; } }
+@keyframes fg-wheel { 0%, 18% { transform: rotate(0); } 100% { transform: rotate(1440deg); } }
+@keyframes fg-glide { 0%, 16% { transform: none; } 20% { transform: translateY(-6px) scaleY(.95); } 34% { transform: translateX(-38px) rotate(-12deg); } 50% { transform: translateX(34px) rotate(12deg); } 62% { transform: translateX(0) rotate(0) scaleX(1); } 68% { transform: translateY(-12px) scaleX(-1); } 74% { transform: translateY(-12px) scaleX(1); } 80% { transform: translateY(0) translateX(-24px) rotate(-8deg); } 90%, 100% { transform: translateX(0) rotate(0) translateY(-2px); } }
+@keyframes fg-glide-arm-l { 0%, 16% { transform: rotate(0); } 34% { transform: rotate(60deg); } 50% { transform: rotate(-30deg); } 68%, 74% { transform: rotate(80deg); } 90%, 100% { transform: rotate(140deg); } }
+@keyframes fg-glide-arm-r { 0%, 16% { transform: rotate(0); } 34% { transform: rotate(30deg); } 50% { transform: rotate(-60deg); } 68%, 74% { transform: rotate(-80deg); } 90%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-glide-leg { 0%, 16%, 62%, 100% { transform: rotate(0); } 34% { transform: rotate(35deg) translateY(-4px); } 50% { transform: rotate(-25deg); } 80% { transform: rotate(40deg) translateY(-6px); } }
+@keyframes fg-glide-head { 34% { transform: rotate(-8deg); } 50% { transform: rotate(8deg); } 90%, 100% { transform: rotate(-4deg); } }
+
+/* 64: jetpack ignites, lifts off, one loop, a hover wave, a soft landing. */
+.fg-game .fg-robot[data-perf="jetpack"] .fg-jetpack { opacity: 1; transform: none; animation: fg-jet-pop 6s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-jet-flame { animation: fg-flame 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-robot-rig { animation: fg-fly 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-arm--left { animation: fg-fly-arm-l 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-arm--right { animation: fg-fly-arm-r 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-leg--left { animation: fg-fly-leg-l 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-leg--right { animation: fg-fly-leg-r 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-robot-shadow { animation: fg-shadow-shrink 6s ease-in-out; }
+@keyframes fg-jet-pop { 0% { opacity: 0; transform: scale(.4); } 10% { opacity: 1; transform: scale(1.15); } 15%, 100% { opacity: 1; transform: none; } }
+@keyframes fg-flame { 0%, 12% { opacity: 0; transform: scaleY(.2); } 16% { opacity: 1; transform: scaleY(1.4); } 20%, 84% { opacity: 1; transform: scaleY(1); } 22%, 50%, 70% { transform: scaleY(1.3) scaleX(.9); } 92%, 100% { opacity: 0; transform: scaleY(.2); } }
+@keyframes fg-fly { 0%, 14% { transform: none; } 17% { transform: scaleY(.9) scaleX(1.06); } 28% { transform: translateY(-46px) rotate(-6deg); } 40% { transform: translateY(-50px) translateX(14px) rotate(6deg); } 52% { transform: translateY(-64px) translateX(0) rotate(180deg); } 62% { transform: translateY(-50px) translateX(-14px) rotate(360deg); } 74% { transform: translateY(-44px) translateX(0) rotate(354deg); } 86% { transform: translateY(-10px) rotate(360deg); } 90% { transform: translateY(0) scaleY(.9) scaleX(1.08) rotate(360deg); } 100% { transform: rotate(360deg); } }
+@keyframes fg-fly-arm-l { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(120deg); } 86%, 100% { transform: rotate(20deg); } }
+@keyframes fg-fly-arm-r { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(-120deg); } 86%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-fly-leg-l { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(-18deg); } 86%, 100% { transform: rotate(0); } }
+@keyframes fg-fly-leg-r { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(18deg); } 86%, 100% { transform: rotate(0); } }
+@keyframes fg-shadow-shrink { 0%, 14%, 90%, 100% { transform: none; opacity: 1; } 28%, 74% { transform: scale(.5); opacity: .5; } }
+
+/* 100: the biggest dance, a crouch, a launch up out of the card, fireworks. */
+.fg-game .fg-robot[data-perf="finale"] .fg-jetpack { opacity: 1; transform: none; }
+.fg-game .fg-robot[data-perf="finale"] .fg-jet-flame { animation: fg-finale-flame 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-robot-rig { animation: fg-finale 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-arm--left { animation: fg-finale-arm-l 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-arm--right { animation: fg-finale-arm-r 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-leg--left { animation: fg-stomp-l 3.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="finale"] .fg-leg--right { animation: fg-stomp-r 3.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="finale"] .fg-head { animation: fg-powerup-head 3.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="finale"] .fg-bulb-glow { opacity: 1; animation: fg-bulb .5s ease-in-out infinite; }
+.fg-game .fg-robot[data-perf="finale"] .fg-robot-shadow { animation: fg-finale-shadow 8.2s ease-in-out forwards; }
+/* The launch goes around the solved equation, never through it. After the
+   crouch (56%) the whole robot box slides a fixed pixel distance to the
+   left, out from under the factor boxes, while the rig stays low and banks
+   into the move; only once it sits in that clear lane beside the equation
+   does the rig climb, shrinking a little as it goes, and leave through the
+   card's top edge. The lane is measured in pixels on the robot box because
+   the equation is laid out in pixels while the rig's own unit scale changes
+   with the stage height; the climb stays in viewBox units so it always
+   clears the card. On a desktop the lane sits in the cream to the left of
+   the ROW box (over the chart's edge on tall or narrow layouts); on a phone
+   it is the margin left of the ROW box, so the rig also shrinks first to
+   keep its head under the equation's labels during the slide, then drifts
+   back over the lit chart as it exits. */
+.fg-game .fg-robot { --fg-lane: -215px; }
+.fg-game .fg-robot[data-perf="finale"] { animation: fg-finale-lane 8.2s ease-in-out forwards; }
+@keyframes fg-finale-lane { 0%, 58% { transform: translateX(0); } 68%, 100% { transform: translateX(var(--fg-lane)); } }
+@keyframes fg-finale { 0% { transform: none; } 8%, 24% { transform: translateY(-14px) rotate(-6deg); } 16%, 32% { transform: translateY(0) rotate(6deg); } 36% { transform: translateY(-8px) scaleX(-1); } 40% { transform: translateY(-8px) scaleX(1); } 44% { transform: translateY(0); } 50% { transform: scaleY(.8) scaleX(1.12); } 54% { transform: scaleY(.78) scaleX(1.14) translateX(-2px); } 56% { transform: scaleY(.78) scaleX(1.14) translateX(2px); } 60% { transform: translate(0, -22px) rotate(0) scale(1, 1.08); } 68% { transform: translate(0, -28px) rotate(-10deg) scale(.92); } 78% { transform: translate(0, -230px) rotate(-3deg) scale(.82); } 90% { transform: translate(0, -440px) rotate(-2deg) scale(.72); } 100% { transform: translate(0, -560px) rotate(0) scale(.66); } }
+@keyframes fg-finale-phone { 0% { transform: none; } 8%, 24% { transform: translateY(-14px) rotate(-6deg); } 16%, 32% { transform: translateY(0) rotate(6deg); } 36% { transform: translateY(-8px) scaleX(-1); } 40% { transform: translateY(-8px) scaleX(1); } 44% { transform: translateY(0); } 50% { transform: scaleY(.8) scaleX(1.12); } 54% { transform: scaleY(.78) scaleX(1.14) translateX(-2px); } 56% { transform: scaleY(.78) scaleX(1.14) translateX(2px); } 60% { transform: translate(0, -10px) rotate(0) scale(.85); } 68% { transform: translate(0, -14px) rotate(-8deg) scale(.7); } 78% { transform: translate(0, -250px) rotate(-2deg) scale(.62); } 90% { transform: translate(0, -430px) rotate(6deg) scale(.55); } 100% { transform: translate(0, -560px) rotate(8deg) scale(.5); } }
+@keyframes fg-finale-lane-phone { 0%, 58% { transform: translateX(0); } 68%, 78% { transform: translateX(var(--fg-lane)); } 90% { transform: translateX(calc(var(--fg-lane) * .45)); } 100% { transform: translateX(calc(var(--fg-lane) * .25)); } }
+@keyframes fg-finale-arm-l { 0% { transform: rotate(0); } 8%, 24% { transform: rotate(160deg); } 16%, 32% { transform: rotate(40deg); } 50% { transform: rotate(-20deg); } 60%, 100% { transform: rotate(170deg); } }
+@keyframes fg-finale-arm-r { 0% { transform: rotate(0); } 8%, 24% { transform: rotate(-40deg); } 16%, 32% { transform: rotate(-160deg); } 50% { transform: rotate(20deg); } 60%, 100% { transform: rotate(-170deg); } }
+@keyframes fg-finale-flame { 0%, 44% { opacity: 0; transform: scaleY(.2); } 50% { opacity: 1; transform: scaleY(.8); } 58% { transform: scaleY(2.2) scaleX(1.2); } 100% { opacity: 1; transform: scaleY(2.6) scaleX(1.1); } }
+@keyframes fg-finale-shadow { 0%, 56% { transform: none; opacity: 1; } 70%, 100% { transform: scale(.2); opacity: 0; } }
+
+.fg-game .fg-fireworks { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.fg-game .fg-firework {
+  position: absolute; width: var(--fg-size); height: var(--fg-size);
+  margin: calc(var(--fg-size) / -2) 0 0 calc(var(--fg-size) / -2);
+  border-radius: 50%; border: 4px dotted var(--fg-color);
+  opacity: 0; transform: scale(.1);
+  animation: fg-burst 1.7s ease-out var(--fg-delay) infinite;
+}
+.fg-game .fg-firework::after { content: ''; position: absolute; inset: 30%; border-radius: 50%; background: radial-gradient(circle, #fff 0 20%, var(--fg-color) 21% 55%, transparent 60%); }
+.fg-game .fg-card[data-scene="finale"] .fg-firework { animation-delay: calc(var(--fg-delay) + 3s); }
+@keyframes fg-burst { 0% { opacity: 0; transform: scale(.1); } 15% { opacity: 1; } 70% { opacity: .9; transform: scale(1); } 100% { opacity: 0; transform: scale(1.15); } }
+
+/* End screen robot in its earned gear. */
+.fg-game .fg-end-robot { display: grid; place-items: center; height: 120px; }
+.fg-game .fg-robot--end { position: relative; height: 120px; width: 120px; }
+.fg-game .fg-robot--end .fg-robot-svg { height: 100%; }
+.fg-game .fg-robot[data-perf="end-pose"] .fg-arm--left { transform: rotate(150deg); }
+.fg-game .fg-robot[data-perf="end-pose"] .fg-arm--right { transform: rotate(-30deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--left { transform: rotate(160deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--right { transform: rotate(-160deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-jet-flame { opacity: 1; }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-robot-rig { animation: fg-idle 2s ease-in-out infinite; }
+.fg-game .fg-end-line { max-width: 34ch; margin-inline: auto; }
+
+/* ---------- start screen lesson ---------- */
+.fg-game .fg-start-icon { display: grid; place-items: center; }
+.fg-game .fg-start-icon svg { width: 64px; height: 64px; }
+.fg-game .fg-intro { display: grid; gap: 8px; color: var(--fg-ink); text-align: left; }
+.fg-game .fg-intro-steps { display: grid; gap: 6px; margin: 0; padding: 0 2px; list-style: none; font-size: 17px; font-weight: 700; line-height: 1.2; }
+.fg-game .fg-intro-steps li { display: flex; align-items: center; gap: 8px; }
+.fg-game .fg-step-num { flex: 0 0 26px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; border: 2px solid var(--fg-ink); font-size: 14px; background: var(--fg-mint); }
+.fg-game .fg-intro-steps li:nth-child(2) .fg-step-num { background: var(--fg-yellow); }
+.fg-game .fg-intro-steps li:nth-child(3) .fg-step-num { background: #cdb4ff; }
+.fg-game .fg-intro-chart { display: grid; width: min(230px, 100%); margin-inline: auto; padding: 6px; background: var(--fg-screen); border: 3px solid var(--fg-ink); border-radius: 10px; box-shadow: inset 0 0 0 3px #c4cacf; }
+.fg-game .fg-intro-row { display: grid; grid-template-columns: repeat(5, 1fr); }
+.fg-game .fg-intro-cell { position: relative; display: grid; place-items: center; height: 30px; margin: -0.5px; border: 1px solid var(--fg-screen-line); background: rgba(255, 255, 255, .28); font-size: 16px; font-weight: 800; }
+.fg-game .fg-intro-cell--corner, .fg-game .fg-intro-cell--head { background: var(--fg-head); }
+.fg-game .fg-intro-cell--row, .fg-game .fg-intro-cell--col { background: var(--fg-mint); }
+.fg-game .fg-intro-cell--in-row, .fg-game .fg-intro-cell--in-col { background: rgba(255, 217, 61, .45); }
+.fg-game .fg-intro-cell--target { background: var(--fg-yellow); box-shadow: 0 0 0 2px var(--fg-ink); z-index: 1; border-radius: 3px; }
+.fg-game .fg-intro-answer { position: absolute; inset: 0; display: grid; place-items: center; background: #fff; opacity: 0; border-radius: 3px; }
+.fg-game .fg-intro-equation { text-align: center; font-family: var(--mg-font-read); font-size: 30px; font-weight: 700; color: var(--fg-ink); line-height: 1.1; }
+.fg-game .fg-intro-eq-a, .fg-game .fg-intro-eq-b { display: inline-block; padding: 0 6px; border-radius: 8px; background: var(--fg-mint); }
+/* One product slot: the question mark and the answer share one cell and
+   only one is visible at a time. */
+.fg-game .fg-intro-eq-slot { display: inline-grid; vertical-align: baseline; }
+.fg-game .fg-intro-eq-slot > b { grid-area: 1 / 1; display: inline-block; padding: 0 6px; border-radius: 8px; background: var(--fg-yellow); }
+.fg-game .fg-intro-eq-q, .fg-game .fg-intro-eq-p, .fg-game .fg-intro-unknown, .fg-game .fg-intro-answer { opacity: 0; }
+.fg-game .fg-intro-unknown { opacity: 1; }
+/* The lesson plays once: row lights, column lights, the square asks, the
+   product fills. Settled state: the filled chart and the finished equation. */
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-cell--row,
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-cell--in-row { animation: fg-intro-light 6.5s ease-out both; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-cell--col,
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-cell--in-col { animation: fg-intro-light 6.5s ease-out both; animation-delay: .9s; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-cell--target { animation: fg-intro-target 6.5s ease-out both; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-eq-a { animation: fg-intro-pop 6.5s ease-out both; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-eq-b { animation: fg-intro-pop 6.5s ease-out both; animation-delay: .9s; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-eq-q,
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-unknown { animation: fg-intro-ask 6.5s ease-out both; }
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-eq-p,
+.fg-game .fg-intro:not(.fg-intro--settled) .fg-intro-answer { animation: fg-intro-fill 6.5s ease-out both; }
+.fg-game .fg-intro-cell--row, .fg-game .fg-intro-cell--col { --fg-lit: var(--fg-mint); }
+.fg-game .fg-intro-cell--in-row, .fg-game .fg-intro-cell--in-col { --fg-lit: rgba(255, 217, 61, .45); }
+@keyframes fg-intro-light { 0%, 8% { background: rgba(255, 255, 255, .28); } 20%, 100% { background: var(--fg-lit); } }
+@keyframes fg-intro-target { 0%, 26% { box-shadow: none; background: rgba(255, 217, 61, .45); } 36%, 100% { box-shadow: 0 0 0 2px var(--fg-ink); background: var(--fg-yellow); } }
+@keyframes fg-intro-pop { 0%, 6% { transform: scale(.6); opacity: 0; } 18%, 100% { transform: none; opacity: 1; } }
+@keyframes fg-intro-ask { 0%, 30% { opacity: 0; } 40%, 58% { opacity: 1; } 62%, 100% { opacity: 0; } }
+@keyframes fg-intro-fill { 0%, 60% { opacity: 0; transform: scale(.4); } 70%, 100% { opacity: 1; transform: none; } }
+.fg-game .fg-intro--settled .fg-intro-answer, .fg-game .fg-intro--settled .fg-intro-eq-p { animation: none; opacity: 1; transform: none; }
+.fg-game .fg-intro--settled .fg-intro-eq-q, .fg-game .fg-intro--settled .fg-intro-unknown { animation: none; opacity: 0; }
+.fg-game .fg-start-actions { display: grid; justify-items: center; gap: 8px; }
+.fg-game .fg-fresh-btn {
+  min-height: 44px; padding: 6px 18px; font-family: var(--mg-font-shout); font-size: 20px; letter-spacing: 1px;
+  color: var(--fg-ink); background: transparent; border: 3px solid var(--fg-ink); border-radius: 999px; cursor: pointer;
+}
+.fg-game .fg-fresh-btn:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 3px; }
+
+/* ---------- help content ---------- */
+.fg-game .fg-help-line { display: grid; gap: 10px; width: 100%; justify-items: center; }
+.fg-game .fg-help-equation { font-family: var(--mg-font-read); font-size: var(--mf-popup-focus-size); font-weight: 700; }
+.fg-game .fg-help-jumps { display: flex; flex-wrap: wrap; justify-content: center; align-items: flex-end; gap: 10px 14px; }
+.fg-game .fg-jump {
+  position: relative; display: grid; justify-items: center; gap: 2px;
+  min-width: 56px; padding: 6px 10px 4px; border: 3px solid var(--fg-ink); border-radius: 12px; background: var(--fg-cream);
+  opacity: 0; transform: translateY(8px);
+  animation: fg-jump-in 260ms ease-out var(--fg-delay, 0ms) forwards;
+}
+.fg-game .fg-jump b { font-family: var(--mg-font-read); font-size: var(--mf-popup-value-size); line-height: 1; }
+.fg-game .fg-jump i { font-style: normal; font-size: var(--mf-popup-label-size); font-weight: 800; color: #355080; }
+.fg-game .fg-jump--unknown { background: #ffe8b8; border-style: dashed; border-color: #9b6200; color: #9b6200; }
+.fg-game .fg-jump:not(:last-child)::after { content: '→'; position: absolute; right: -14px; top: 40%; transform: translateY(-50%); font-size: 18px; font-weight: 800; color: var(--fg-ink); }
+@keyframes fg-jump-in { to { opacity: 1; transform: none; } }
+
+/* ---------- continuation choices ---------- */
+.fg-game .fg-popup-actions { display: grid; gap: 10px; width: 100%; justify-items: center; }
+.fg-game .fg-choice-btn { display: grid; justify-items: center; gap: 2px; width: min(100%, 420px); min-height: 52px; padding: 8px 18px; line-height: 1; }
+.fg-game .fg-choice-btn b { font-family: var(--mg-font-shout); font-weight: 400; font-size: clamp(18px, 2.2vw, 25px); letter-spacing: 1px; }
+.fg-game .fg-choice-detail { font-family: var(--mg-font-read); font-size: 14px; font-weight: 700; letter-spacing: 0; }
+.fg-game .fg-choice-btn--secondary {
+  color: var(--fg-ink); background: var(--fg-cream); border: 3px solid var(--fg-ink); border-radius: 999px; box-shadow: 0 4px 0 var(--fg-ink); cursor: pointer;
+}
+.fg-game .fg-choice-btn--secondary:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--fg-ink); }
+.fg-game .fg-choice-btn--secondary:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 4px; }
+
+/* ---------- development controls ---------- */
+.fg-game .fg-dev { position: fixed; left: 6px; bottom: 6px; z-index: 50; display: flex; flex-wrap: wrap; gap: 4px; max-width: 46vw; padding: 6px; background: rgba(19, 33, 63, .85); border-radius: 10px; }
+.fg-game .fg-dev-btn { min-height: 28px; padding: 2px 8px; font-size: 12px; font-weight: 700; border-radius: 6px; border: 2px solid #fff; background: var(--fg-cream); color: var(--fg-ink); cursor: pointer; }
+
+/* ---------- responsive ---------- */
+@media (max-width: 560px) {
+  .fg-game .fg-card { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
+  .fg-game .fg-toy-shell { padding: 6px; border-radius: 14px; }
+  .fg-game .fg-cell { font-size: max(9px, 5.4cqh); }
+  .fg-game .fg-side { grid-template-columns: minmax(0, 1fr) 96px; grid-template-rows: auto minmax(0, 1fr); gap: 4px; }
+  .fg-game .fg-equation { grid-column: 1 / -1; padding: 2px 46px 0; }
+  .fg-game .fg-factor-value { font-size: clamp(24px, 8cqw, 34px); min-height: 1.2em; }
+  .fg-game .fg-robot-stage { grid-column: 2; grid-row: 2; min-height: 84px; }
+  .fg-game .fg-race { grid-column: 1; grid-row: 2; align-self: center; padding: 4px; }
+  .fg-game .fg-race-marker { width: 22px; height: 22px; }
+  .fg-game .fg-sound { top: 6px; right: 6px; }
+  /* Milestone on a phone: the completed chart yields some height, the robot
+     takes the whole lower row and the banner sits beneath its feet. */
+  .fg-game .fg-card[data-scene] { grid-template-rows: minmax(0, 1fr) minmax(0, 1.25fr); }
+  .fg-game .fg-card[data-scene] .fg-side { grid-template-columns: minmax(0, 1fr); }
+  .fg-game .fg-card[data-scene] .fg-robot-stage { grid-column: 1; }
+  .fg-game .fg-card[data-scene] .fg-race { display: none; }
+  .fg-game .fg-card[data-scene] .fg-robot { bottom: 48px; top: 6%; }
+  /* Phone launch: the lane is the margin left of the ROW box, the rig
+     shrinks before it slides so its head stays under the equation labels,
+     and the exit drifts back over the lit chart. */
+  .fg-game .fg-robot { --fg-lane: -138px; }
+  .fg-game .fg-robot[data-perf="finale"] { animation-name: fg-finale-lane-phone; }
+  .fg-game .fg-robot[data-perf="finale"] .fg-robot-rig { animation-name: fg-finale-phone; }
+  .fg-game .fg-scene-banner { min-height: 46px; right: 74px; }
+  .fg-game .fg-scene-title { font-size: 20px; }
+  .fg-game .fg-skip { right: 0; bottom: 4px; font-size: 16px; padding: 4px 10px; min-height: 44px; }
+  .fg-game .fg-jump { min-width: 48px; padding: 4px 8px 2px; }
+  .fg-game .fg-intro-cell { height: 26px; font-size: 14px; }
+  .fg-game .fg-intro-equation { font-size: 26px; }
+  .fg-game .fg-robot--end { height: 96px; width: 96px; }
+  .fg-game .fg-end-robot { height: 96px; }
+}
+@media (max-height: 700px) and (min-width: 561px) {
+  .fg-game .fg-race { padding: 2px 8px 0; }
+  .fg-game .fg-robot-stage { min-height: 70px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .fg-game .fg-card { gap: 6px; }
+  .fg-game .fg-side { grid-template-rows: auto minmax(0, 1fr); }
+  .fg-game .fg-race { display: none; }
+  .fg-game .fg-equation { padding: 0; }
+}
+
+/* ---------- reduced motion: settled states keep every meaning ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .fg-game .fg-robot, .fg-game .fg-robot-svg *, .fg-game .fg-robot-svg, .fg-game .fg-cell, .fg-game .fg-factor-value, .fg-game .fg-race-marker,
+  .fg-game .fg-jump, .fg-game .fg-intro *, .fg-game .fg-firework, .fg-game .fg-scene-banner, .fg-game .fg-skate, .fg-game .fg-jetpack,
+  .fg-game .fg-toast-static {
+    animation: none !important;
+    transition: none !important;
+  }
+  .fg-game .fg-scene-banner { opacity: 0; transform: none; }
+  .fg-game .fg-card[data-scene] .fg-scene-banner { opacity: 1; }
+  .fg-game .fg-jump { opacity: 1; transform: none; }
+  .fg-game .fg-intro-answer, .fg-game .fg-intro-eq-p { opacity: 1; transform: none; }
+  .fg-game .fg-intro-eq-q, .fg-game .fg-intro-unknown { opacity: 0; }
+  .fg-game .fg-intro-eq-a, .fg-game .fg-intro-eq-b { opacity: 1; transform: none; }
+  .fg-game .fg-intro-cell--target { box-shadow: 0 0 0 2px var(--fg-ink); }
+  .fg-game .fg-firework { opacity: .9; transform: scale(1); }
+  .fg-game .fg-robot--powered .fg-bulb-glow { opacity: .6; }
+  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--left, .fg-game .fg-robot[data-perf="skate"] .fg-arm--left,
+  .fg-game .fg-robot[data-perf="finale"] .fg-arm--left { transform: rotate(150deg); }
+  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--right, .fg-game .fg-robot[data-perf="skate"] .fg-arm--right,
+  .fg-game .fg-robot[data-perf="finale"] .fg-arm--right { transform: rotate(-150deg); }
+  .fg-game .fg-robot[data-perf="skate"] .fg-robot-rig { transform: rotate(-8deg); }
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-robot-rig { transform: translateY(-30px); }
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-jet-flame, .fg-game .fg-robot[data-perf="finale"] .fg-jet-flame { opacity: 1; transform: scaleY(1.4); }
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--left { transform: rotate(120deg); }
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--right { transform: rotate(-120deg); }
+  .fg-game .fg-robot[data-perf="finale"] .fg-robot-rig { transform: translateY(-40px); }
+  .fg-game .fg-toy--launchpad .fg-cell--done { background: var(--fg-yellow); }
+  .fg-game .fg-robot[data-perf="encourage"] .fg-arm--right { transform: rotate(-70deg); }
+  .fg-game .fg-robot[data-perf="fistpump"] .fg-arm--right { transform: rotate(-165deg); }
+  .fg-game .fg-robot[data-perf="star"] .fg-arm--left { transform: rotate(110deg); }
+  .fg-game .fg-robot[data-perf="star"] .fg-holo { opacity: 1; transform: scale(1); }
+  .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--left, .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--left { transform: rotate(150deg); }
+  .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--right, .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--right { transform: rotate(-150deg); }
+  .fg-game .fg-robot[data-perf="spin"] .fg-arm--left, .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--left { transform: rotate(60deg); }
+  .fg-game .fg-robot[data-perf="spin"] .fg-arm--right, .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--right { transform: rotate(-60deg); }
+}</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>
