@@ -359,6 +359,7 @@ const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty(
 }, Symbol.toStringTag, { value: "Module" }));
 const MILESTONES = Object.freeze([6, 32, 56, TOTAL_FACTS]);
 const SAVE_VERSION = 3;
+const SCHEDULE_VERSION = 2;
 const PHASES = Object.freeze(["question", "reward", "decision"]);
 const CHOICE_SEED_MAX = 2147483646;
 const cellKey = (row, col) => `${row}x${col}`;
@@ -384,7 +385,7 @@ function pushNew(list, seen, cell, stage, direction, family) {
   list.push({ row: cell.row, col: cell.col, key, stage, direction, family });
   return true;
 }
-function planSession(rng) {
+function planSession(rng, scheduleVersion = SCHEDULE_VERSION) {
   const numbers = rng.shuffle(Array.from({ length: FACTOR_COUNT }, (_, i) => i + MIN_FACTOR));
   const [f1, f2, g1, g2] = numbers;
   const families = { opening: [f1, f2], next: [g1, g2] };
@@ -422,6 +423,10 @@ function planSession(rng) {
   finishFamilies(families.next, 3);
   for (let row = MIN_FACTOR; row <= CHART_SIZE; row += 1) {
     for (let col = MIN_FACTOR; col <= CHART_SIZE; col += 1) pushNew(schedule, seen, { row, col }, 4, "row", row);
+  }
+  if (scheduleVersion >= 2) {
+    schedule.splice(6, 26, ...rng.shuffle(schedule.slice(6, 32)));
+    schedule.splice(32, 24, ...rng.shuffle(schedule.slice(32, 56)));
   }
   return { families, schedule };
 }
@@ -464,9 +469,9 @@ function continuationOptions(completed) {
   }
   return options;
 }
-function derivePlan(seed) {
+function derivePlan(seed, scheduleVersion = SCHEDULE_VERSION) {
   const rng = createRng(seed);
-  const plan = planSession(rng);
+  const plan = planSession(rng, scheduleVersion);
   return {
     families: plan.families,
     schedule: plan.schedule.map((c2) => c2.key),
@@ -474,8 +479,8 @@ function derivePlan(seed) {
   };
 }
 const nextChoiceSeed = (seed) => seed * 48271 % 2147483647 || 7;
-function choiceSeedAt(seed, completed) {
-  let value = derivePlan(seed).choiceSeed;
+function choiceSeedAt(seed, completed, scheduleVersion = SCHEDULE_VERSION) {
+  let value = derivePlan(seed, scheduleVersion).choiceSeed;
   for (let i = 0; i < completed; i += 1) value = nextChoiceSeed(value);
   return value;
 }
@@ -483,6 +488,7 @@ function newSession(seed = Date.now()) {
   const plan = derivePlan(seed);
   return {
     version: SAVE_VERSION,
+    scheduleVersion: SCHEDULE_VERSION,
     seed,
     families: plan.families,
     schedule: plan.schedule,
@@ -498,17 +504,21 @@ function newSession(seed = Date.now()) {
     wrongAttempts: 0,
     choiceSeed: plan.choiceSeed,
     performanceIndex: -1,
-    finished: false
+    finished: false,
+    activeQuestion: null,
+    lastAnsweredKey: null
   };
 }
 function jumpTo(session, completed) {
+  session.activeQuestion = null;
+  session.lastAnsweredKey = completed > 0 ? session.schedule[completed - 1] : null;
   session.completed = completed;
   session.questionsAnswered = completed;
   session.streak = 0;
   session.bestStreak = Math.min(session.bestStreak, completed);
   session.score = Math.max(Math.min(session.score, maxScore(completed)), minScore(completed));
   session.wrongAttempts = 0;
-  session.choiceSeed = choiceSeedAt(session.seed, completed);
+  session.choiceSeed = choiceSeedAt(session.seed, completed, session.scheduleVersion ?? 1);
   session.phase = "question";
   session.mode = "ask";
   return session;
@@ -520,7 +530,19 @@ function currentCell(session) {
   const { row, col } = parseKey(session.schedule[session.completed]);
   return { row, col, seed: session.choiceSeed };
 }
+function activateQuestion(session, replay = null) {
+  if (session.activeQuestion) return session.activeQuestion;
+  const scheduled = currentCell(session);
+  const replayKey = isReplayable(replay) ? cellKey(replay.row, replay.col) : null;
+  const useReplay = replayKey !== null && replayKey !== session.lastAnsweredKey && replayKey !== (scheduled ? cellKey(scheduled.row, scheduled.col) : null);
+  const params = useReplay ? { ...replay } : scheduled;
+  if (!params) return null;
+  session.activeQuestion = { params, replay: useReplay, choiceSeed: session.choiceSeed };
+  return session.activeQuestion;
+}
 function applyCorrect(session, basePoints = 10) {
+  session.lastAnsweredKey = session.schedule[session.completed];
+  session.activeQuestion = null;
   session.completed += 1;
   session.streak += 1;
   session.bestStreak = Math.max(session.bestStreak, session.streak);
@@ -533,14 +555,18 @@ function applyCorrect(session, basePoints = 10) {
   return milestone;
 }
 function applyReplayCorrect(session) {
+  const params = session.activeQuestion?.params;
+  if (params) session.lastAnsweredKey = cellKey(params.row, params.col);
+  session.activeQuestion = null;
   session.questionsAnswered += 1;
   session.wrongAttempts = 0;
 }
 function isReplayable(params) {
   if (!params || !Number.isInteger(params.row) || !Number.isInteger(params.col)) return false;
-  return isCanonicalKey(cellKey(params.row, params.col));
+  return (params.seed === void 0 || Number.isSafeInteger(params.seed)) && isCanonicalKey(cellKey(params.row, params.col));
 }
 function applyWrong(session) {
+  activateQuestion(session);
   session.streak = 0;
   session.wrongAttempts += 1;
 }
@@ -574,7 +600,9 @@ function parseSaved(raw) {
       if (typeof key !== "string" || !isCanonicalKey(key) || keys.has(key)) return null;
       keys.add(key);
     }
-    const expected = derivePlan(data.seed);
+    const scheduleVersion = data.scheduleVersion ?? 1;
+    if (![1, SCHEDULE_VERSION].includes(scheduleVersion)) return null;
+    const expected = derivePlan(data.seed, scheduleVersion);
     if (data.schedule.some((key, index) => key !== expected.schedule[index])) return null;
     const opening = data.families?.opening;
     const next = data.families?.next;
@@ -584,15 +612,28 @@ function parseSaved(raw) {
     if (data.streak > data.completed || data.bestStreak > data.completed || data.streak > data.bestStreak) return null;
     if (!isInt(data.score, 0, 1e7) || data.score < minScore(data.completed) || data.score > maxScore(data.completed)) return null;
     if (!isInt(data.wrongAttempts, 0, 1e3) || data.wrongAttempts > 0 && data.streak !== 0) return null;
-    if (!isInt(data.choiceSeed, 1, CHOICE_SEED_MAX) || data.choiceSeed !== choiceSeedAt(data.seed, data.completed)) return null;
+    if (!isInt(data.choiceSeed, 1, CHOICE_SEED_MAX) || data.choiceSeed !== choiceSeedAt(data.seed, data.completed, scheduleVersion)) return null;
     if (!["ask", "all"].includes(data.mode) || !PHASES.includes(data.phase)) return null;
     if (data.finished === true) return null;
     if (data.phase === "question" && data.completed >= TOTAL_FACTS) return null;
     if (data.phase !== "question" && !MILESTONES.includes(data.completed)) return null;
     if (data.phase === "decision" && (data.completed >= TOTAL_FACTS || data.mode === "all")) return null;
     if (data.phase !== "question" && data.wrongAttempts !== 0) return null;
+    const lastAnsweredKey = data.lastAnsweredKey === void 0 ? data.completed > 0 ? data.schedule[data.completed - 1] : null : data.lastAnsweredKey;
+    if (lastAnsweredKey !== null && !isCanonicalKey(lastAnsweredKey)) return null;
+    const legacyQuestion = data.activeQuestion === void 0;
+    const active = data.activeQuestion ?? null;
+    if (active !== null) {
+      if (data.phase !== "question" || typeof active.replay !== "boolean" || !isReplayable(active.params)) return null;
+      if (!isInt(active.choiceSeed, 1, CHOICE_SEED_MAX) || active.choiceSeed !== data.choiceSeed) return null;
+      if (!active.replay) {
+        const scheduled = parseKey(data.schedule[data.completed]);
+        if (active.params.row !== scheduled.row || active.params.col !== scheduled.col || active.params.seed !== data.choiceSeed) return null;
+      }
+    } else if (data.wrongAttempts > 0 && !legacyQuestion) return null;
     return {
       version: SAVE_VERSION,
+      scheduleVersion,
       seed: data.seed,
       families: { opening: [...opening], next: [...next] },
       schedule: [...data.schedule],
@@ -603,10 +644,12 @@ function parseSaved(raw) {
       streak: data.streak,
       bestStreak: data.bestStreak,
       questionsAnswered: data.questionsAnswered,
-      wrongAttempts: data.wrongAttempts,
+      wrongAttempts: legacyQuestion ? 0 : data.wrongAttempts,
       choiceSeed: data.choiceSeed,
       performanceIndex: isInt(data.performanceIndex, -1, 100) ? data.performanceIndex : -1,
-      finished: false
+      finished: false,
+      lastAnsweredKey,
+      activeQuestion: active ? { params: { ...active.params }, replay: active.replay, choiceSeed: active.choiceSeed } : null
     };
   } catch {
     return null;
@@ -670,12 +713,19 @@ function createChartView(container) {
   }
   function setTarget(row, col) {
     clearJust();
+    container.querySelectorAll(".fg-cell--sweep").forEach((cell) => cell.classList.remove("fg-cell--sweep"));
+    void container.offsetWidth;
     cells.forEach((cell) => {
       const r = Number(cell.dataset.row);
       const c2 = Number(cell.dataset.col);
-      cell.classList.toggle("fg-cell--active-line", row != null && (r === row || c2 === col));
+      const onLine = row != null && (r === row || c2 === col);
+      cell.classList.toggle("fg-cell--active-line", onLine);
       const isTarget = row != null && r === row && c2 === col;
       cell.classList.toggle("fg-cell--target", isTarget);
+      if (onLine) {
+        cell.style?.setProperty?.("--fg-i", String(isTarget ? Math.max(r, c2) : r === row ? c2 : r));
+        cell.classList.add("fg-cell--sweep");
+      }
       if (isTarget) {
         cell.querySelector("span").textContent = "?";
         cell.setAttribute("aria-label", `row ${row} column ${col}, this square, unknown`);
@@ -685,8 +735,14 @@ function createChartView(container) {
         if (!cell.classList.contains("fg-cell--done")) cell.querySelector("span").textContent = "";
       }
     });
-    heads.row.forEach((head, n) => head.classList.toggle("fg-cell--active-head", n === row));
-    heads.col.forEach((head, n) => head.classList.toggle("fg-cell--active-head", n === col));
+    heads.row.forEach((head, n) => {
+      head.classList.toggle("fg-cell--active-head", n === row);
+      head.classList.toggle("fg-cell--sweep", n === row);
+    });
+    heads.col.forEach((head, n) => {
+      head.classList.toggle("fg-cell--active-head", n === col);
+      head.classList.toggle("fg-cell--sweep", n === col);
+    });
   }
   function reset() {
     cells.forEach((cell) => {
@@ -702,8 +758,8 @@ function createChartView(container) {
       cell.setAttribute("aria-label", `row ${cell.dataset.row} column ${cell.dataset.col}, ${value}, given`);
       cell.removeAttribute("aria-current");
     });
-    heads.row.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head"));
-    heads.col.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head"));
+    heads.row.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head", "fg-cell--sweep"));
+    heads.col.forEach((head) => head.classList.remove("fg-cell--family", "fg-cell--active-head", "fg-cell--sweep"));
   }
   function cellElement(row, col) {
     return cells.get(cellKey(row, col)) ?? null;
@@ -730,7 +786,10 @@ const PERFORMANCES = Object.freeze([
   { id: "spin", label: "Spin", ms: 1150 },
   { id: "fistpump", label: "Fist pump", ms: 1e3 },
   { id: "cartwheel", label: "Cartwheel", ms: 1250 },
-  { id: "star", label: "Holo star", ms: 1200 }
+  { id: "armwave", label: "Arm wave", ms: 1300 },
+  { id: "runningman", label: "Running man", ms: 1200 },
+  { id: "twostep", label: "Two-step", ms: 1300 },
+  { id: "flying", label: "Flying pose", ms: 1400 }
 ]);
 const MILESTONE_SCENES = Object.freeze({
   6: { id: "powerup", label: "Power-up dance", ms: 5200, title: "POWER UP!", line: "The antenna lights up. Dance time!" },
@@ -740,7 +799,7 @@ const MILESTONE_SCENES = Object.freeze({
 });
 const c = ROBOT;
 function robotSvg({ idPrefix = "fg" } = {}) {
-  return `<svg class="fg-robot-svg" viewBox="0 0 140 170" preserveAspectRatio="xMidYMax meet" focusable="false" aria-hidden="true">
+  return `<svg class="fg-robot-svg" viewBox="-12 0 164 170" preserveAspectRatio="xMidYMax meet" focusable="false" aria-hidden="true">
   <defs>
     <radialGradient id="${idPrefix}-bulb" cx="40%" cy="35%" r="70%">
       <stop offset="0" stop-color="#fff7c2"/>
@@ -795,27 +854,36 @@ function robotSvg({ idPrefix = "fg" } = {}) {
       <rect x="40" y="82" width="60" height="50" rx="16" fill="url(#${idPrefix}-shell)" stroke="${c.ink}" stroke-width="3.5"/>
       <rect x="52" y="92" width="36" height="22" rx="6" fill="${c.ink}"/>
       <rect x="55" y="95" width="30" height="16" rx="4" fill="#5cd8ff" opacity=".9"/>
+      <circle class="fg-chest-glow" cx="70" cy="103" r="10" fill="${c.glow}" opacity="0"/>
       <path class="fg-chest-star" d="M70 97 l2.4 5 5.4 .6 -4 3.7 1.1 5.4 -4.9 -2.7 -4.9 2.7 1.1 -5.4 -4 -3.7 5.4 -.6z" fill="${c.glow}" stroke="${c.ink}" stroke-width="1.2"/>
+      <g class="fg-chest-cover">
+        <rect class="fg-chest-cover--left" x="52" y="92" width="18" height="22" rx="4" fill="${c.shell}" stroke="${c.ink}" stroke-width="2"/>
+        <rect class="fg-chest-cover--right" x="70" y="92" width="18" height="22" rx="4" fill="${c.shell}" stroke="${c.ink}" stroke-width="2"/>
+      </g>
       <rect x="44" y="118" width="52" height="8" rx="4" fill="${c.trim}" stroke="${c.ink}" stroke-width="2.5"/>
       <circle cx="70" cy="122" r="3" fill="${c.face}" stroke="${c.ink}" stroke-width="1.5"/>
     </g>
     <g class="fg-arm fg-arm--left">
-      <rect x="18" y="88" width="22" height="13" rx="6.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
-      <g class="fg-forearm fg-forearm--left">
-        <rect x="8" y="98" width="14" height="22" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
-        <circle class="fg-hand" cx="15" cy="124" r="8" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
-        <g class="fg-holo">
-          <path d="M15 84 l4.5 9.3 10.2 1.2 -7.5 7 2 10.1 -9.2 -5 -9.2 5 2 -10.1 -7.5 -7 10.2 -1.2z" fill="${c.glow}" stroke="${c.ink}" stroke-width="2.5" stroke-linejoin="round"/>
-          <path d="M15 92 l2.4 5 5.4 .6 -4 3.7 1.1 5.4 -4.9 -2.7 -4.9 2.7 1.1 -5.4 -4 -3.7 5.4 -.6z" fill="#fff9d6"/>
-        </g>
+      <g class="fg-upperarm fg-upperarm--left">
+        <path d="M38 94 L15 100" fill="none" stroke="${c.ink}" stroke-width="13" stroke-linecap="round"/>
+        <path d="M38 94 L15 100" fill="none" stroke="${c.shellDark}" stroke-width="7" stroke-linecap="round"/>
       </g>
+      <g class="fg-forearm fg-forearm--left">
+        <rect x="8" y="94" width="14" height="26" rx="7" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+        <circle class="fg-hand" cx="15" cy="124" r="8" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
+      </g>
+      <circle class="fg-elbow fg-elbow--left" cx="15" cy="100" r="7.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="2.5"/>
     </g>
     <g class="fg-arm fg-arm--right">
-      <rect x="100" y="88" width="22" height="13" rx="6.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+      <g class="fg-upperarm fg-upperarm--right">
+        <path d="M102 94 L125 100" fill="none" stroke="${c.ink}" stroke-width="13" stroke-linecap="round"/>
+        <path d="M102 94 L125 100" fill="none" stroke="${c.shellDark}" stroke-width="7" stroke-linecap="round"/>
+      </g>
       <g class="fg-forearm fg-forearm--right">
-        <rect x="118" y="98" width="14" height="22" rx="6" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
+        <rect x="118" y="94" width="14" height="26" rx="7" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="3"/>
         <circle class="fg-hand" cx="125" cy="124" r="8" fill="${c.trim}" stroke="${c.ink}" stroke-width="3"/>
       </g>
+      <circle class="fg-elbow fg-elbow--right" cx="125" cy="100" r="7.5" fill="${c.shellDark}" stroke="${c.ink}" stroke-width="2.5"/>
     </g>
     <g class="fg-head">
       <g class="fg-antenna">
@@ -1041,11 +1109,17 @@ const SUBTITLE = "Multiply the row and the column.";
 const REDUCED_SCENE_MS = 2600;
 const REDUCED_SKIP_MS = 300;
 const SKIP_MS = 1e3;
+const FLY_MS = 420;
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text != null) n.textContent = text;
   return n;
+};
+const replayClass = (node, cls) => {
+  node.classList.remove(cls);
+  void node.offsetWidth;
+  node.classList.add(cls);
 };
 function safeStorage(getStorage) {
   try {
@@ -1277,6 +1351,7 @@ function startSession(root, options = {}) {
   const equationCol = card.querySelector(".fg-factor--col .fg-factor-value");
   const equationProduct = card.querySelector(".fg-product-value");
   const equation = card.querySelector(".fg-equation");
+  const completion = card.querySelector(".fg-completion");
   const completionTrack = card.querySelector(".fg-completion-track");
   const completionFill = completionTrack.querySelector("i");
   const completionPercent = card.querySelector(".fg-completion-percent");
@@ -1330,13 +1405,18 @@ function startSession(root, options = {}) {
       later(() => showToast(tier.word, "tier"), 250);
     }
   }
+  let shownStreak = 0;
+  let shownCompleted = 0;
   const renderHud = () => {
     state.score = session?.score ?? 0;
     state.streak = session?.streak ?? 0;
     state.bestStreak = session?.bestStreak ?? 0;
     state.questionsAnswered = session?.questionsAnswered ?? 0;
+    const streakGrew = state.streak > shownStreak;
+    shownStreak = state.streak;
     streakChip.textContent = `${state.streak}🔥`;
     streakChip.classList.toggle("mg-hot", state.streak >= opt.hotStreak);
+    if (streakGrew) replayClass(streakChip, "fg-chip-bump");
     fitHudTitle();
     const completed = session?.completed ?? 0;
     const done = completed / TOTAL_FACTS;
@@ -1352,6 +1432,8 @@ function startSession(root, options = {}) {
     const percent = Math.round(completed / TOTAL_FACTS * 100);
     completionPercent.textContent = `${percent}%`;
     completionFill.style.width = `${completed / TOTAL_FACTS * 100}%`;
+    if (completed > shownCompleted) replayClass(completion, "fg-completion--bump");
+    shownCompleted = completed;
     completionTrack.setAttribute("aria-valuenow", String(percent));
     completionTrack.setAttribute("aria-valuetext", `${percent} percent. ${completed} of ${TOTAL_FACTS} squares filled.`);
   };
@@ -1375,6 +1457,8 @@ function startSession(root, options = {}) {
     equationCol.textContent = String(col);
     equationProduct.textContent = productValue == null ? "?" : String(productValue);
     equation.classList.toggle("fg-equation--filled", productValue != null);
+    if (productValue == null) replayClass(equation, "fg-equation--ask");
+    else equation.classList.remove("fg-equation--ask");
   }
   function showCompletedEquation() {
     if (!session?.completed) return;
@@ -1400,14 +1484,16 @@ function startSession(root, options = {}) {
     state.canAnswer = false;
   }
   function renderQuestion({ focus = true } = {}) {
-    const missed = tracker.getMissedProblem();
+    const missed = session.activeQuestion ? null : tracker.getMissedProblem();
     const replay = isReplayable(missed) ? missed : null;
-    const cell = replay ?? currentCell(session);
-    if (!cell) return;
-    problem = build(cell, rng);
+    const active = activateQuestion(session, replay);
+    if (!active) return;
+    const cell = active.params;
+    problem = build(cell, createRng(active.choiceSeed));
+    save();
     state.firstTry = session.wrongAttempts === 0;
     state.wrongAttempts = session.wrongAttempts;
-    state.isReplay = Boolean(replay);
+    state.isReplay = active.replay;
     chart.setFamilies(activeFamilies$1());
     chart.setTarget(cell.row, cell.col);
     showEquation(cell.row, cell.col, null);
@@ -1416,9 +1502,10 @@ function startSession(root, options = {}) {
     tiles.classList.remove("fg-tiles--parked");
     tiles.removeAttribute("aria-hidden");
     tiles.dataset.count = String(problem.choices.length);
-    for (const choice of problem.choices) {
+    problem.choices.forEach((choice, index) => {
       const b = el("button", "mg-tile mf-answer-button mp-number-choice");
       b.type = "button";
+      b.style.setProperty("--fg-tile-i", String(index));
       b.dataset.choiceId = choice.id;
       b.dataset.factoryKind = "number";
       const content = el("span", "mf-answer-content mf-answer-content--number", choice.label);
@@ -1426,7 +1513,7 @@ function startSession(root, options = {}) {
       b.setAttribute("aria-label", `Choose ${choice.label}`);
       b.addEventListener("click", () => answer(choice, b));
       tiles.append(b);
-    }
+    });
     announce.textContent = `Row ${cell.row}, column ${cell.col}. ${cell.row} times ${cell.col} equals what? Tap the product.`;
     setMood("idle");
     state.canAnswer = true;
@@ -1687,7 +1774,7 @@ function startSession(root, options = {}) {
         b.removeAttribute("aria-disabled");
       });
       tile.classList.remove("mg-wrong");
-      setMood("idle");
+      encourage();
       state.canAnswer = true;
       tile.focus?.({ preventScroll: true });
     };
@@ -1718,8 +1805,36 @@ function startSession(root, options = {}) {
     tracker.markMissed(problem.params);
     renderHud();
     save();
-    encourage();
+    cancelPerformance();
+    robot.dataset.perf = "";
+    setMood("kind");
     openHelp(tile);
+  }
+  function flyProduct(row, col, value) {
+    const cell = chart.cellElement(row, col);
+    if (reducedMotion() || !cell || typeof equationProduct.animate !== "function") return 0;
+    const base = fx.getBoundingClientRect();
+    const from = equationProduct.getBoundingClientRect();
+    const to = cell.getBoundingClientRect();
+    if (!from.width || !to.width) return 0;
+    const n = el("b", "fg-fly-number", String(value));
+    n.style.left = `${from.left - base.left + from.width / 2}px`;
+    n.style.top = `${from.top - base.top + from.height / 2}px`;
+    n.style.fontSize = `${Math.round(from.height * 0.62)}px`;
+    fx.append(n);
+    const dx = to.left + to.width / 2 - (from.left + from.width / 2);
+    const dy = to.top + to.height / 2 - (from.top + from.height / 2);
+    const scale = Math.max(0.3, Math.min(1, to.height / from.height));
+    const anim = n.animate([
+      { transform: "translate(-50%, -50%) scale(1)", opacity: 1, offset: 0 },
+      { transform: `translate(calc(-50% + ${dx * 0.5}px), calc(-50% + ${dy * 0.5 - 36}px)) scale(1.12)`, opacity: 1, offset: 0.5 },
+      { transform: `translate(calc(-50% + ${dx * 0.82}px), calc(-50% + ${dy * 0.82 - 14}px)) scale(1)`, opacity: 1, offset: 0.78 },
+      { transform: `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(${scale})`, opacity: 1, offset: 1 }
+    ], { duration: FLY_MS, easing: "cubic-bezier(.3, .7, .35, 1)", fill: "forwards" });
+    const remove = () => n.remove();
+    anim.onfinish = remove;
+    later(remove, FLY_MS + 80);
+    return FLY_MS;
   }
   function onCorrect(tile) {
     const { row, col } = problem.params;
@@ -1731,10 +1846,15 @@ function startSession(root, options = {}) {
     if (state.isReplay) tracker.markCorrected(problem.params);
     const milestone = state.isReplay ? applyReplayCorrect(session) : applyCorrect(session, opt.basePoints);
     problem = null;
-    chart.fill(row, col, row * col);
     showEquation(row, col, row * col);
+    const flight = flyProduct(row, col, row * col);
+    const land = () => {
+      chart.fill(row, col, row * col);
+      sound.play("fill");
+    };
+    if (flight) later(land, flight - 40);
+    else later(land, 180);
     announce.textContent = `${row} times ${col} equals ${row * col}. Square filled.`;
-    later(() => sound.play("fill"), 180);
     renderHud();
     renderCompletion();
     tracker.checkAutoSave();
@@ -2778,6 +2898,14 @@ body {
    Problem Card never grows into the established answer area. */
 .fg-game .mg-tiles.fg-tiles--parked { visibility: hidden; }
 .fg-game .mg-tiles.fg-tiles--parked .mg-tile { pointer-events: none; }
+/* Answers arrive one after another under the new question, the right one
+   pops, a wrong one gives a soft amber wobble. */
+.fg-game .mg-tiles:not(.fg-tiles--parked) .mg-tile { animation: fg-tile-in .32s cubic-bezier(.2, .9, .3, 1.3) both; animation-delay: calc(var(--fg-tile-i, 0) * 55ms + .12s); }
+.fg-game .mg-tiles .mg-tile.mg-right { animation: fg-tile-right .5s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .mg-tiles .mg-tile.mg-wrong { animation: fg-tile-wobble .5s ease-in-out; }
+@keyframes fg-tile-in { 0% { transform: translateY(14px) scale(.9); opacity: 0; } 100% { transform: none; opacity: 1; } }
+@keyframes fg-tile-right { 30% { transform: scale(1.06); } 60% { transform: scale(.98); } 100% { transform: none; } }
+@keyframes fg-tile-wobble { 20% { transform: translateX(-6px) rotate(-1.5deg); } 45% { transform: translateX(5px) rotate(1deg); } 70% { transform: translateX(-3px); } 100% { transform: none; } }
 
 /* Reduced motion: one static praise toast on a timer instead of the
    animated engine effects. */
@@ -2854,14 +2982,10 @@ body {
 /* Highlighted families use an even mint fill without marker bars. */
 .fg-game .fg-cell--head.fg-cell--family { background: var(--fg-mint); }
 .fg-game .fg-cell--product.fg-cell--family { background: rgba(127, 227, 210, .38); }
-/* Active row and column: brighter band plus a dotted trail. */
-.fg-game .fg-cell--product.fg-cell--active-line { background: rgba(255, 217, 61, .48); }
-.fg-game .fg-cell--product.fg-cell--active-line:not(.fg-cell--done)::before {
-  content: ''; position: absolute; inset: 30%; border-radius: 50%; background: rgba(19, 33, 63, .18);
-}
+/* Selected headers stay yellow; ordinary cells keep their family or progress fill. */
 .fg-game .fg-cell--head.fg-cell--active-head { background: var(--fg-yellow); box-shadow: inset 0 0 0 2px var(--fg-ink); z-index: 1; }
 /* The square being filled: yellow, outlined, with a question mark. */
-.fg-game .fg-cell--target {
+.fg-game .fg-cell--product.fg-cell--target {
   z-index: 2;
   background: var(--fg-yellow);
   box-shadow: 0 0 0 2px var(--fg-ink), 0 0 0 5px rgba(255, 217, 61, .9);
@@ -2871,6 +2995,15 @@ body {
 }
 .fg-game .fg-cell--target::before { display: none; }
 @keyframes fg-target-pulse { 50% { box-shadow: 0 0 0 2px var(--fg-ink), 0 0 0 7px rgba(255, 217, 61, .55); } }
+/* A new question sweeps in: the two headers pop, the row and the column
+   light up cell by cell from their headers (--fg-i is each cell's distance),
+   and the square itself lands last with a bounce, then keeps its pulse. */
+.fg-game .fg-cell--head.fg-cell--active-head.fg-cell--sweep { animation: fg-head-pop .45s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-cell--product.fg-cell--active-line.fg-cell--sweep:not(.fg-cell--target) { animation: fg-line-in .34s cubic-bezier(.2, .8, .3, 1.2) both; animation-delay: calc(var(--fg-i, 1) * 38ms); }
+.fg-game .fg-cell--target.fg-cell--sweep { animation: fg-target-in .5s cubic-bezier(.2, .9, .3, 1.4) calc(var(--fg-i, 1) * 38ms) both, fg-target-pulse 1.4s ease-in-out calc(var(--fg-i, 1) * 38ms + .5s) infinite; }
+@keyframes fg-head-pop { 40% { transform: scale(1.35); } }
+@keyframes fg-line-in { 0% { transform: scale(.45); opacity: .15; } 100% { transform: none; opacity: 1; } }
+@keyframes fg-target-in { 0% { transform: scale(.3) rotate(-12deg); opacity: 0; } 55% { transform: scale(1.35) rotate(4deg); opacity: 1; } 100% { transform: none; } }
 /* Completed squares: white with the product, so progress reads as numbers. */
 .fg-game .fg-cell--done { background: #fff; color: var(--fg-ink); }
 /* Given squares (row 1 and column 1): filled in from the start, quieter
@@ -2879,6 +3012,23 @@ body {
 .fg-game .fg-cell--done.fg-cell--family { background: #f4fffc; }
 .fg-game .fg-cell--just { animation: fg-cell-pop .5s cubic-bezier(.2, .9, .3, 1.3); }
 @keyframes fg-cell-pop { 0% { transform: scale(.4); background: var(--fg-yellow); } 60% { transform: scale(1.25); } 100% { transform: none; } }
+/* A ring ripples out of the square as the product lands in it. */
+.fg-game .fg-cell--just { z-index: 3; }
+.fg-game .fg-cell--just::after { content: ''; position: absolute; inset: -2px; border-radius: 4px; border: 2px solid var(--fg-orange); pointer-events: none; animation: fg-cell-ring .7s ease-out .1s both; }
+@keyframes fg-cell-ring { 0% { transform: scale(.6); opacity: 1; } 100% { transform: scale(2.6); opacity: 0; } }
+/* The product in flight, from the PRODUCT box to its square (positioned
+   and moved by script in the effects layer). */
+.fg-game .fg-fly-number {
+  position: absolute; z-index: 6; pointer-events: none;
+  padding: .05em .3em; font-family: var(--mg-font-read); font-weight: 700; line-height: 1.15; color: var(--fg-ink);
+  background: var(--fg-yellow); border: 3px solid var(--fg-ink); border-radius: .3em; box-shadow: 0 4px 0 rgba(19, 33, 63, .35);
+  transform: translate(-50%, -50%);
+}
+/* During a milestone the filled squares glow in a wave from the bottom row
+   up (finale keeps its own launchpad loop), so the reward celebrates the
+   work on the chart, not just the robot. */
+.fg-game .fg-card[data-scene]:not([data-scene="finale"]) .fg-cell--done { animation: fg-done-wave 1.2s ease-in-out 1; animation-delay: calc(var(--fg-r, 0) * 90ms + .4s); }
+@keyframes fg-done-wave { 40% { background: var(--fg-yellow); transform: scale(1.12); box-shadow: 0 0 5px 1px rgba(255, 217, 61, .7); } }
 
 /* Launchpad: the finished chart lights up row by row. */
 .fg-game .fg-toy--launchpad .fg-cell--done { animation: fg-launch-glow 1.2s ease-in-out infinite; animation-delay: calc(var(--fg-r, 0) * 110ms); }
@@ -2920,6 +3070,11 @@ body {
 .fg-game .fg-factor--row .fg-factor-value { border-color: var(--fg-mint-deep); background: #edfff9; }
 .fg-game .fg-factor--col .fg-factor-value { border-color: var(--fg-mint-deep); background: #edfff9; }
 .fg-game .fg-factor--product .fg-factor-value { border-style: dashed; background: var(--fg-yellow); }
+/* A fresh question: ROW pops, then COLUMN, then the question mark. */
+.fg-game .fg-equation--ask .fg-factor--row .fg-factor-value { animation: fg-factor-in .4s cubic-bezier(.2, .9, .3, 1.4) both; }
+.fg-game .fg-equation--ask .fg-factor--col .fg-factor-value { animation: fg-factor-in .4s cubic-bezier(.2, .9, .3, 1.4) .13s both; }
+.fg-game .fg-equation--ask .fg-factor--product .fg-factor-value { animation: fg-factor-in .4s cubic-bezier(.2, .9, .3, 1.4) .28s both; }
+@keyframes fg-factor-in { 0% { transform: scale(.5); opacity: 0; } 100% { transform: none; opacity: 1; } }
 .fg-game .fg-equation--filled .fg-factor--product .fg-factor-value { border-style: solid; background: #fff; animation: fg-cell-pop .5s cubic-bezier(.2, .9, .3, 1.3); }
 .fg-game .fg-op { font-size: clamp(26px, 8cqw, 40px); line-height: 1.3; padding-top: .1em; }
 
@@ -2952,6 +3107,15 @@ body {
 .fg-game .fg-completion-percent { font-size: 23px; line-height: 1; letter-spacing: 0; }
 .fg-game .fg-completion-track { height: 16.5px; overflow: hidden; border: 3px solid var(--fg-ink); border-radius: 999px; background: #fff; }
 .fg-game .fg-completion-track i { display: block; height: 100%; width: 0; background: var(--fg-mint-deep); border-radius: inherit; transition: width .5s ease-out; }
+/* Each filled square: the percent ticks up with a pop and the badge nods. */
+.fg-game .fg-completion--bump .fg-completion-percent { display: inline-block; animation: fg-percent-pop .5s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .fg-completion--bump .fg-player-badge { animation: fg-badge-nod .6s ease-in-out; }
+@keyframes fg-percent-pop { 40% { transform: scale(1.35); color: var(--fg-mint-deep); } }
+@keyframes fg-badge-nod { 30% { transform: rotate(-10deg) scale(1.1); } 60% { transform: rotate(8deg) scale(1.1); } }
+/* The streak flame bumps every time it grows. */
+.fg-game .mg-chip-streak.fg-chip-bump { animation: fg-chip-bump .45s cubic-bezier(.2, .9, .3, 1.4); }
+.fg-game .mg-chip-streak.mg-hot.fg-chip-bump { animation: fg-chip-bump .45s cubic-bezier(.2, .9, .3, 1.4), mg-pulse .8s .45s infinite alternate; }
+@keyframes fg-chip-bump { 40% { transform: scale(1.25) rotate(-6deg); } 70% { transform: scale(1.1) rotate(4deg); } }
 
 /* Sound toggle lives on the toy casing. */
 .fg-game .fg-sound {
@@ -2964,6 +3128,14 @@ body {
 .fg-game .fg-sound:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 2px; }
 
 /* ---------- robot rig ---------- */
+/* Arm angles below follow one convention (see robot.js). rotate() is
+   clockwise on screen. The left arm lifts with a positive shoulder angle,
+   the right with a negative one. At rest the upper arm points sideways and
+   the forearm hangs, so the hand direction is shoulder plus forearm: 0 is
+   down, plus or minus 180 is straight up. A raised arm is shoulder 60 and
+   forearm 100 (hand 160: up, a touch outward) on the left, and the same
+   numbers negated on the right. Past about 105 at the shoulder the upper
+   arm swings inward behind the head, so no pose goes there. */
 .fg-game .fg-robot-svg * { transform-box: view-box; }
 .fg-game .fg-robot-rig { transform-origin: 70px 160px; }
 .fg-game .fg-head { transform-origin: 70px 84px; }
@@ -2975,10 +3147,16 @@ body {
 .fg-game .fg-leg--left { transform-origin: 54px 128px; }
 .fg-game .fg-leg--right { transform-origin: 86px 128px; }
 .fg-game .fg-torso { transform-origin: 70px 128px; }
+.fg-game .fg-shades { transform-origin: 70px 48px; }
+.fg-game .fg-chest-glow { transform-origin: 70px 103px; opacity: 0; }
+.fg-game .fg-chest-cover { opacity: 0; }
+.fg-game .fg-chest-cover--left { transform-origin: 52px 103px; }
+.fg-game .fg-chest-cover--right { transform-origin: 88px 103px; }
 .fg-game .fg-skate { transform-origin: 70px 158px; opacity: 0; transform: scaleY(0); transition: opacity .3s, transform .4s cubic-bezier(.2, .9, .3, 1.4); }
 .fg-game .fg-jetpack { transform-origin: 70px 100px; opacity: 0; transform: scale(.4); transition: opacity .3s, transform .4s cubic-bezier(.2, .9, .3, 1.4); }
 .fg-game .fg-jet-flame { transform-origin: 70px 124px; opacity: 0; }
-.fg-game .fg-holo { transform-origin: 15px 100px; opacity: 0; transform: scale(0); }
+.fg-game .fg-upperarm--left { transform-origin: 29px 101px; }
+.fg-game .fg-upperarm--right { transform-origin: 111px 101px; }
 .fg-game .fg-bulb-glow { transition: opacity .4s; }
 .fg-game .fg-robot--powered .fg-bulb-glow { opacity: .55; animation: fg-bulb 2.4s ease-in-out infinite; }
 .fg-game .fg-robot--skates .fg-skate { opacity: 1; transform: none; }
@@ -3017,6 +3195,7 @@ body {
 .fg-game .fg-robot[data-perf="shuffle"] .fg-leg--right { animation: fg-step-r 1.1s ease-in-out; }
 .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--left { animation: fg-swing-l 1.1s ease-in-out; }
 .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--right { animation: fg-swing-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="shuffle"] .fg-forearm { animation: fg-swing-fore 1.1s ease-in-out; }
 .fg-game .fg-robot[data-perf="shuffle"] .fg-head { animation: fg-head-bob 1.1s ease-in-out; }
 /* The arms trail the slide (swing away from the direction of travel), so
    the leading hand never reaches past the stage edge on narrow stages. */
@@ -3025,6 +3204,8 @@ body {
 @keyframes fg-step-r { 0%, 50%, 100% { transform: rotate(0); } 25% { transform: rotate(-10deg); } 75% { transform: rotate(22deg) translateY(-4px); } }
 @keyframes fg-swing-l { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(-35deg); } 75% { transform: rotate(35deg); } }
 @keyframes fg-swing-r { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(-35deg); } 75% { transform: rotate(35deg); } }
+/* The forearms lag the shoulders by a beat, so the elbows visibly lead. */
+@keyframes fg-swing-fore { 0%, 100% { transform: rotate(0); } 32% { transform: rotate(-18deg); } 82% { transform: rotate(18deg); } }
 @keyframes fg-head-bob { 0%, 100% { transform: rotate(0); } 25% { transform: rotate(6deg) translateY(2px); } 75% { transform: rotate(-6deg) translateY(2px); } }
 
 /* 2 Heel-click hop: crouch, jump, kick both heels together, land with squash. */
@@ -3033,11 +3214,21 @@ body {
 .fg-game .fg-robot[data-perf="heelclick"] .fg-leg--right { animation: fg-kick-r 1.05s ease-in-out; }
 .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--left { animation: fg-arms-up-l 1.05s ease-in-out; }
 .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--right { animation: fg-arms-up-r 1.05s ease-in-out; }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-forearm--left { animation: fg-arms-up-fore-l 1.05s ease-in-out; }
+.fg-game .fg-robot[data-perf="heelclick"] .fg-forearm--right { animation: fg-arms-up-fore-r 1.05s ease-in-out; }
 @keyframes fg-hop { 0% { transform: none; } 18% { transform: scaleY(.86); } 45% { transform: translateY(-14px) scaleY(1.02); } 62% { transform: translateY(-11px); } 82% { transform: translateY(0) scaleY(.9); } 100% { transform: none; } }
 @keyframes fg-kick-l { 0%, 25%, 80%, 100% { transform: rotate(0); } 45%, 60% { transform: rotate(-40deg) translateX(6px); } }
 @keyframes fg-kick-r { 0%, 25%, 80%, 100% { transform: rotate(0); } 45%, 60% { transform: rotate(40deg) translateX(-6px); } }
-@keyframes fg-arms-up-l { 0%, 100% { transform: rotate(0); } 40%, 70% { transform: rotate(150deg); } }
-@keyframes fg-arms-up-r { 0%, 100% { transform: rotate(0); } 40%, 70% { transform: rotate(-150deg); } }
+/* Both arms up in a V: shoulders 60 out, forearms 100 more so the hands
+   point up beside the head rather than hanging from the lifted elbows. */
+/* Raising: the shoulder lifts first with the hand still hanging, then the
+   forearm flips up; lowering runs the other way (forearm drops, then the
+   shoulder). That keeps the hand inside the stage, since an arm swung up
+   with a level forearm would reach past the drawing's edge. */
+@keyframes fg-arms-up-l { 0% { transform: rotate(0); } 20%, 84% { transform: rotate(60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-arms-up-r { 0% { transform: rotate(0); } 20%, 84% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-arms-up-fore-l { 0%, 18% { transform: rotate(0); } 40%, 70% { transform: rotate(100deg); } 86%, 100% { transform: rotate(0); } }
+@keyframes fg-arms-up-fore-r { 0%, 18% { transform: rotate(0); } 40%, 70% { transform: rotate(-100deg); } 86%, 100% { transform: rotate(0); } }
 
 /* 3 Spin: a full turn on the spot, arms out, small hop. */
 .fg-game .fg-robot[data-perf="spin"] .fg-robot-rig { animation: fg-spin 1.1s cubic-bezier(.4, 0, .3, 1); }
@@ -3055,8 +3246,13 @@ body {
 .fg-game .fg-robot[data-perf="fistpump"] .fg-robot-rig { animation: fg-pump-body 1s ease-in-out; }
 .fg-game .fg-robot[data-perf="fistpump"] .fg-head { animation: fg-pump-head 1s ease-in-out; }
 .fg-game .fg-robot[data-perf="fistpump"] .fg-leg--left { animation: fg-pump-leg 1s ease-in-out; }
-@keyframes fg-pump { 0% { transform: rotate(0); } 20% { transform: rotate(30deg); } 40%, 75% { transform: rotate(-165deg); } 100% { transform: rotate(0); } }
-@keyframes fg-pump-fore { 0%, 20% { transform: rotate(0); } 40%, 75% { transform: rotate(40deg); } 100% { transform: rotate(0); } }
+/* The wind-up is a short arc with the elbow tucked in. The punch: the
+   shoulder snaps up to -60 first while the forearm still hangs, then the
+   forearm flips up (a direct bend, no full turn) so the fist points up
+   beside the head. Coming down the forearm drops first, then the shoulder,
+   so the fist never sweeps out past the stage edge. */
+@keyframes fg-pump { 0% { transform: rotate(0); } 20% { transform: rotate(15deg); } 32%, 86% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-pump-fore { 0% { transform: rotate(0); } 20%, 26% { transform: rotate(20deg); } 45%, 75% { transform: rotate(-100deg); } 88%, 100% { transform: rotate(0); } }
 @keyframes fg-pump-body { 0% { transform: none; } 20% { transform: scaleY(.94) rotate(4deg); } 40%, 75% { transform: translateY(-6px) rotate(-7deg); } 100% { transform: none; } }
 @keyframes fg-pump-head { 40%, 75% { transform: rotate(-10deg); } }
 @keyframes fg-pump-leg { 40%, 75% { transform: rotate(-20deg) translateY(-6px); } }
@@ -3068,29 +3264,215 @@ body {
 .fg-game .fg-robot[data-perf="cartwheel"] .fg-robot-rig { transform-origin: 70px 92px; animation: fg-cartwheel 1.25s cubic-bezier(.45, .05, .35, 1); }
 .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--left { animation: fg-spread-l 1.25s ease-in-out; }
 .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--right { animation: fg-spread-r 1.25s ease-in-out; }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-forearm--left { animation: fg-spread-fore-l 1.25s ease-in-out; }
+.fg-game .fg-robot[data-perf="cartwheel"] .fg-forearm--right { animation: fg-spread-fore-r 1.25s ease-in-out; }
 .fg-game .fg-robot[data-perf="cartwheel"] .fg-leg--left { animation: fg-spread-leg-l 1.25s ease-in-out; }
 .fg-game .fg-robot[data-perf="cartwheel"] .fg-leg--right { animation: fg-spread-leg-r 1.25s ease-in-out; }
-@keyframes fg-cartwheel { 0% { transform: none; } 12% { transform: translateX(6px) rotate(-8deg); } 30% { transform: translateX(-2px) translateY(-12px) rotate(90deg) scale(.9); } 55% { transform: translateX(-4px) translateY(-24px) rotate(200deg); } 78% { transform: translateY(-6px) rotate(330deg); } 88% { transform: translateY(4px) rotate(360deg) scaleY(.94); } 100% { transform: translateX(0) rotate(360deg); } }
-@keyframes fg-spread-l { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(150deg); } }
-@keyframes fg-spread-r { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(-150deg); } }
+@keyframes fg-cartwheel { 0% { transform: none; } 12% { transform: translateX(2px) rotate(-5deg); } 30% { transform: translateX(-2px) translateY(-12px) rotate(90deg) scale(.9); } 55% { transform: translateX(-4px) translateY(-24px) rotate(200deg); } 78% { transform: translateY(-6px) rotate(330deg); } 88% { transform: translateY(4px) rotate(360deg) scaleY(.94); } 100% { transform: translateX(0) rotate(360deg); } }
+/* Arms in the same V as the heel-click, so the body reads as an X. */
+@keyframes fg-spread-l { 0% { transform: rotate(0); } 15%, 90% { transform: rotate(60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-spread-r { 0% { transform: rotate(0); } 15%, 90% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-spread-fore-l { 0%, 12% { transform: rotate(0); } 25%, 80% { transform: rotate(100deg); } 92%, 100% { transform: rotate(0); } }
+@keyframes fg-spread-fore-r { 0%, 12% { transform: rotate(0); } 25%, 80% { transform: rotate(-100deg); } 92%, 100% { transform: rotate(0); } }
 @keyframes fg-spread-leg-l { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(-35deg); } }
 @keyframes fg-spread-leg-r { 0%, 100% { transform: rotate(0); } 25%, 80% { transform: rotate(35deg); } }
 
-/* 6 Holo star: raises a hand and projects a spinning star. */
-.fg-game .fg-robot[data-perf="star"] .fg-arm--left { animation: fg-present 1.2s cubic-bezier(.2, .9, .3, 1.2); }
-.fg-game .fg-robot[data-perf="star"] .fg-holo { animation: fg-holo 1.2s ease-out; }
-.fg-game .fg-robot[data-perf="star"] .fg-head { animation: fg-look-up 1.2s ease-in-out; }
-.fg-game .fg-robot[data-perf="star"] .fg-robot-rig { animation: fg-lean 1.2s ease-in-out; }
-@keyframes fg-present { 0% { transform: rotate(0); } 30%, 80% { transform: rotate(110deg); } 100% { transform: rotate(0); } }
-@keyframes fg-holo { 0%, 25% { opacity: 0; transform: scale(0) rotate(0); } 45% { opacity: 1; transform: scale(1.25) rotate(90deg); } 80% { opacity: 1; transform: scale(1) rotate(360deg); } 100% { opacity: 0; transform: scale(.4) rotate(420deg); } }
-@keyframes fg-look-up { 30%, 80% { transform: rotate(-8deg) translateY(-2px); } }
-@keyframes fg-lean { 30%, 80% { transform: rotate(5deg); } }
+/* 6 Arm wave: both arms out with elbows level and forearms up (a goal
+   post), then a ripple runs left hand, left elbow, left shoulder, across
+   the shoulders, right shoulder, right elbow, right hand. Each joint lifts
+   a beat after the one before it. The forearm stays near vertical while its
+   elbow rises, so the hand keeps pointing up through the ripple. */
+.fg-game .fg-robot[data-perf="armwave"] .fg-arm--left { animation: fg-wave-arm-l 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="armwave"] .fg-forearm--left { animation: fg-wave-fore-l 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="armwave"] .fg-torso { animation: fg-wave-torso 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="armwave"] .fg-head { animation: fg-wave-head 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="armwave"] .fg-arm--right { animation: fg-wave-arm-r 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="armwave"] .fg-forearm--right { animation: fg-wave-fore-r 1.3s ease-in-out; }
+/* Both arms rise through the V (shoulder first, forearm after) and settle
+   into the goal post; at the end they lift back to the V and lower the
+   same way, so no hand crosses the stage edge. */
+@keyframes fg-wave-arm-l { 0% { transform: rotate(0); } 7%, 12% { transform: rotate(60deg); } 18%, 30% { transform: rotate(30deg); } 40% { transform: rotate(55deg); } 50%, 84% { transform: rotate(30deg); } 88%, 94% { transform: rotate(60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-wave-fore-l { 0%, 6% { transform: rotate(0); } 12% { transform: rotate(100deg); } 18% { transform: rotate(150deg); } 24% { transform: rotate(118deg); } 32% { transform: rotate(165deg); } 40% { transform: rotate(130deg); } 50%, 84% { transform: rotate(150deg); } 88% { transform: rotate(100deg); } 95%, 100% { transform: rotate(0); } }
+@keyframes fg-wave-torso { 0%, 30% { transform: none; } 42% { transform: rotate(-5deg) translateY(-3px); } 56% { transform: rotate(5deg) translateY(-3px); } 68%, 100% { transform: none; } }
+@keyframes fg-wave-head { 0%, 30% { transform: none; } 42% { transform: translate(-4px, 2px) rotate(-6deg); } 56% { transform: translate(4px, 2px) rotate(6deg); } 68%, 100% { transform: none; } }
+@keyframes fg-wave-arm-r { 0% { transform: rotate(0); } 7%, 12% { transform: rotate(-60deg); } 18%, 52% { transform: rotate(-30deg); } 62% { transform: rotate(-55deg); } 72%, 84% { transform: rotate(-30deg); } 88%, 94% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-wave-fore-r { 0%, 6% { transform: rotate(0); } 12% { transform: rotate(-100deg); } 18%, 52% { transform: rotate(-150deg); } 62% { transform: rotate(-130deg); } 70% { transform: rotate(-165deg); } 78% { transform: rotate(-118deg); } 84% { transform: rotate(-150deg); } 88% { transform: rotate(-100deg); } 95%, 100% { transform: rotate(0); } }
 
-/* Encouragement after a miss: a soft head tilt and a thumbs-up. */
+/* 8 Sunglasses finish: two shoulder bounces, then the right hand comes up
+   to the shades, nudges them, and drops to a hip as the head tips. */
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-torso { animation: fg-shrug 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-head { animation: fg-shrug-head 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-arm--left { animation: fg-shrug-arm-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-arm--right { animation: fg-shades-arm 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-forearm--right { animation: fg-shades-fore 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-shades { animation: fg-shades-nudge 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="sunglasses"] .fg-leg--left { animation: fg-shades-leg 1.4s ease-in-out; }
+@keyframes fg-shrug { 0%, 40%, 100% { transform: none; } 10%, 30% { transform: translateY(-5px) scaleY(.96); } 20% { transform: translateY(0); } }
+@keyframes fg-shrug-head { 0%, 40% { transform: none; } 10%, 30% { transform: translateY(-4px); } 20% { transform: translateY(0); } 68% { transform: none; } 78%, 90% { transform: rotate(-9deg) translateY(-2px); } 100% { transform: none; } }
+@keyframes fg-shrug-arm-l { 0%, 40% { transform: rotate(0); } 10%, 30% { transform: rotate(-12deg) translateY(-4px); } 20% { transform: rotate(0); } 70%, 90% { transform: rotate(25deg); } 100% { transform: rotate(0); } }
+/* Return path: the elbow tucks inward first (68% to 71%) while the shoulder
+   holds at the temple, and only then does the arm lower, so the hand never
+   swings past the resting silhouette on the way down. */
+@keyframes fg-shades-arm { 0%, 40% { transform: rotate(0); } 10%, 30% { transform: rotate(12deg) translateY(-4px); } 20% { transform: rotate(0); } 55%, 68%, 71% { transform: rotate(-102deg); } 80%, 90% { transform: rotate(18deg); } 100% { transform: rotate(0); } }
+@keyframes fg-shades-fore { 0%, 40% { transform: rotate(0); } 55%, 68% { transform: rotate(-45.5deg); } 71% { transform: rotate(45deg); } 80%, 90% { transform: rotate(30deg); } 100% { transform: rotate(0); } }
+@keyframes fg-shades-nudge { 0%, 56% { transform: none; } 62% { transform: translateY(-3px) rotate(-3deg); } 68%, 100% { transform: none; } }
+@keyframes fg-shades-leg { 0%, 60% { transform: rotate(0); } 72%, 90% { transform: rotate(-14deg); } 100% { transform: rotate(0); } }
+
+/* 9 Running man: each knee lifts while the other foot slides back, with
+   the arms pumping against the legs. Four beats. */
+.fg-game .fg-robot[data-perf="runningman"] .fg-leg--left { animation: fg-run-leg-l 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-leg--right { animation: fg-run-leg-r 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-arm--left { animation: fg-run-arm-l 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-arm--right { animation: fg-run-arm-r 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-forearm--left { animation: fg-run-fore-l 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-forearm--right { animation: fg-run-fore-r 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-torso { animation: fg-run-torso 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="runningman"] .fg-head { animation: fg-run-head 1.2s ease-in-out; }
+@keyframes fg-run-leg-l { 0%, 100% { transform: none; } 12%, 62% { transform: translateY(-10px) rotate(-28deg) scaleY(.68); } 37%, 87% { transform: translateX(-6px) translateY(2px) rotate(-6deg); } }
+@keyframes fg-run-leg-r { 0%, 100% { transform: none; } 12%, 62% { transform: translateX(6px) translateY(2px) rotate(6deg); } 37%, 87% { transform: translateY(-10px) rotate(28deg) scaleY(.68); } }
+@keyframes fg-run-arm-l { 0%, 100% { transform: rotate(0); } 12%, 62% { transform: rotate(-50deg); } 37%, 87% { transform: rotate(45deg); } }
+@keyframes fg-run-arm-r { 0%, 100% { transform: rotate(0); } 12%, 62% { transform: rotate(-45deg); } 37%, 87% { transform: rotate(50deg); } }
+/* Elbows stay bent like a runner's: the forward arm carries its fist up at
+   the chest, the back arm (elbow lifted out) keeps its fist in by the hip
+   instead of letting the forearm dangle from the raised elbow. */
+@keyframes fg-run-fore-l { 0%, 100% { transform: rotate(0); } 12%, 62% { transform: rotate(-70deg); } 37%, 87% { transform: rotate(-95deg); } }
+@keyframes fg-run-fore-r { 0%, 100% { transform: rotate(0); } 12%, 62% { transform: rotate(95deg); } 37%, 87% { transform: rotate(70deg); } }
+@keyframes fg-run-torso { 0%, 100% { transform: none; } 12%, 37%, 62%, 87% { transform: translateY(-4px) scaleY(.97); } 25%, 50%, 75% { transform: translateY(1px); } }
+@keyframes fg-run-head { 0%, 100% { transform: none; } 12%, 62% { transform: translateY(-4px) rotate(4deg); } 37%, 87% { transform: translateY(-4px) rotate(-4deg); } }
+
+/* 10 Disco point: hip out, right arm points high to the right, then sweeps
+   across the body to point low left, with the head following the hand. */
+.fg-game .fg-robot[data-perf="discopoint"] .fg-arm--right { animation: fg-disco-arm 1.2s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="discopoint"] .fg-forearm--right { animation: fg-disco-fore 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="discopoint"] .fg-arm--left { animation: fg-disco-arm-l 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="discopoint"] .fg-torso { animation: fg-disco-torso 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="discopoint"] .fg-head { animation: fg-disco-head 1.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="discopoint"] .fg-leg--left { animation: fg-disco-leg 1.2s ease-in-out; }
+@keyframes fg-disco-arm { 0% { transform: rotate(0); } 25%, 50% { transform: rotate(-140deg); } 70%, 88% { transform: rotate(112deg); } 100% { transform: rotate(0); } }
+@keyframes fg-disco-fore { 0% { transform: rotate(0); } 25%, 50% { transform: rotate(-15deg); } 70%, 88% { transform: rotate(-52deg); } 100% { transform: rotate(0); } }
+@keyframes fg-disco-arm-l { 0%, 100% { transform: rotate(0); } 25%, 50% { transform: rotate(20deg); } 70%, 88% { transform: rotate(-10deg); } }
+@keyframes fg-disco-torso { 0%, 100% { transform: none; } 25%, 50% { transform: rotate(6deg) translateY(-2px); } 70%, 88% { transform: rotate(-5deg) translateY(1px); } }
+@keyframes fg-disco-head { 0%, 100% { transform: none; } 25%, 50% { transform: translate(5px, 1px) rotate(-10deg); } 70%, 88% { transform: translate(-4px, 2px) rotate(8deg); } }
+@keyframes fg-disco-leg { 0%, 100% { transform: rotate(0); } 25%, 50% { transform: rotate(-16deg) translateY(-2px); } 70%, 88% { transform: rotate(-6deg); } }
+
+/* 11 Lean back: feet planted, knees soft, the torso, head and arms all tip
+   back together about the hips, hold, then straighten. The head and arms
+   are siblings of the torso, so each carries the hip-turn offset itself. */
+.fg-game .fg-robot[data-perf="leanback"] .fg-torso { animation: fg-lean-torso 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-head { animation: fg-lean-head 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-arm--left { animation: fg-lean-arm-l 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-arm--right { animation: fg-lean-arm-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-forearm--left { animation: fg-lean-fore-l 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-forearm--right { animation: fg-lean-fore-r 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-leg--left { animation: fg-lean-leg 1.1s ease-in-out; }
+.fg-game .fg-robot[data-perf="leanback"] .fg-leg--right { animation: fg-lean-leg 1.1s ease-in-out; }
+@keyframes fg-lean-torso { 0%, 100% { transform: none; } 30%, 75% { transform: rotate(-12deg) scaleY(.96); } }
+@keyframes fg-lean-head { 0%, 100% { transform: none; } 30%, 75% { transform: translate(-9px, 2px) rotate(-16deg); } }
+@keyframes fg-lean-arm-l { 0%, 100% { transform: none; } 30%, 75% { transform: translate(-7px, 6px) rotate(-30deg); } }
+@keyframes fg-lean-arm-r { 0%, 100% { transform: none; } 30%, 75% { transform: translate(-7px, -6px) rotate(10deg); } }
+@keyframes fg-lean-fore-l { 0%, 100% { transform: rotate(0); } 30%, 75% { transform: rotate(-20deg); } }
+@keyframes fg-lean-fore-r { 0%, 100% { transform: rotate(0); } 30%, 75% { transform: rotate(-25deg); } }
+@keyframes fg-lean-leg { 0%, 100% { transform: none; } 30%, 75% { transform: scaleY(.93); } }
+
+/* 12 Two-step: step right, feet together, step left, feet together. The
+   leading foot reaches, the trailing foot closes the gap, arms swing
+   against the steps. */
+.fg-game .fg-robot[data-perf="twostep"] .fg-robot-rig { animation: fg-twostep 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-leg--right { animation: fg-twostep-leg-r 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-leg--left { animation: fg-twostep-leg-l 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-arm--left { animation: fg-twostep-arm-l 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-arm--right { animation: fg-twostep-arm-r 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-head { animation: fg-twostep-head 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-forearm--left { animation: fg-twostep-fore-l 1.3s ease-in-out; }
+.fg-game .fg-robot[data-perf="twostep"] .fg-forearm--right { animation: fg-twostep-fore-r 1.3s ease-in-out; }
+@keyframes fg-twostep { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(7px) translateY(-3px); } 50% { transform: translateX(7px); } 75% { transform: translateX(-7px) translateY(-3px); } 90% { transform: translateX(-7px); } }
+@keyframes fg-twostep-leg-r { 0%, 25%, 50%, 100% { transform: none; } 12% { transform: rotate(-22deg) translateY(-5px); } 62%, 87% { transform: translateX(-8px); } 75% { transform: translateX(-8px) translateY(-4px); } }
+@keyframes fg-twostep-leg-l { 0%, 50%, 75%, 100% { transform: none; } 12%, 37% { transform: translateX(8px); } 25% { transform: translateX(8px) translateY(-4px); } 62% { transform: rotate(22deg) translateY(-5px); } }
+@keyframes fg-twostep-arm-l { 0%, 100% { transform: rotate(0); } 12%, 37% { transform: rotate(-10deg); } 62%, 87% { transform: rotate(10deg); } }
+@keyframes fg-twostep-arm-r { 0%, 100% { transform: rotate(0); } 12%, 37% { transform: rotate(-10deg); } 62%, 87% { transform: rotate(10deg); } }
+@keyframes fg-twostep-head { 0%, 100% { transform: none; } 12%, 37% { transform: rotate(5deg) translateY(2px); } 62%, 87% { transform: rotate(-5deg) translateY(2px); } }
+/* Forearms curl inward by the sides (left negative, right positive), tighter
+   on the trailing side, so the hands stay inside the stage on both steps. */
+@keyframes fg-twostep-fore-l { 0%, 100% { transform: rotate(0); } 18%, 40% { transform: rotate(-20deg); } 68%, 90% { transform: rotate(-8deg); } }
+@keyframes fg-twostep-fore-r { 0%, 100% { transform: rotate(0); } 18%, 40% { transform: rotate(8deg); } 68%, 90% { transform: rotate(20deg); } }
+
+/* 15 Flying pose: a crouch, then the robot lifts and tilts into a hero
+   flight. The right arm reaches up and away with the elbow straightening,
+   the left elbow tucks a fist up beside the shoulder, the legs trail behind, the
+   chest star glows through a short hover, and it lands back to neutral. */
+.fg-game .fg-robot[data-perf="flying"] .fg-robot-rig { animation: fg-fly-pose-body 1.4s cubic-bezier(.3, .7, .3, 1); }
+.fg-game .fg-robot[data-perf="flying"] .fg-arm--right { animation: fg-fly-pose-arm-r 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="flying"] .fg-forearm--right { animation: fg-fly-pose-fore-r 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-arm--left { animation: fg-fly-pose-arm-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-forearm--left { animation: fg-fly-pose-fore-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-leg--left { animation: fg-fly-pose-leg-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-leg--right { animation: fg-fly-pose-leg-r 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-head { animation: fg-fly-pose-head 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="flying"] .fg-chest-glow { animation: fg-fly-pose-glow 1.4s ease-in-out; }
+@keyframes fg-fly-pose-body { 0% { transform: none; } 15% { transform: scaleY(.9); } 30%, 78% { transform: translate(-6px, -10px) rotate(6deg); } 55% { transform: translate(-6px, -13px) rotate(6deg); } 90% { transform: translateY(1px) scaleY(.95); } 100% { transform: none; } }
+/* The reaching arm: shoulder -65, forearm -95, so the hand points up and
+   away (world -160) with the elbow and fist clear of the head and ear. */
+@keyframes fg-fly-pose-arm-r { 0% { transform: rotate(0); } 15% { transform: rotate(20deg); } 24%, 88% { transform: rotate(-65deg); } 100% { transform: rotate(0); } }
+@keyframes fg-fly-pose-fore-r { 0%, 22% { transform: rotate(0); } 30%, 78% { transform: rotate(-95deg); } 90%, 100% { transform: rotate(0); } }
+@keyframes fg-fly-pose-arm-l { 0% { transform: rotate(0); } 15% { transform: rotate(-12deg); } 30%, 78% { transform: rotate(-25deg); } 100% { transform: rotate(0); } }
+@keyframes fg-fly-pose-fore-l { 0%, 15% { transform: rotate(0); } 30%, 78% { transform: rotate(-110deg); } 100% { transform: rotate(0); } }
+@keyframes fg-fly-pose-leg-l { 0%, 15%, 100% { transform: none; } 30%, 78% { transform: rotate(14deg) scaleY(.92); } }
+@keyframes fg-fly-pose-leg-r { 0%, 15%, 100% { transform: none; } 30%, 78% { transform: rotate(20deg) scaleY(.9); } }
+@keyframes fg-fly-pose-head { 0%, 15%, 100% { transform: none; } 30%, 78% { transform: rotate(-4deg) translateY(-1px); } }
+@keyframes fg-fly-pose-glow { 0%, 20%, 90%, 100% { opacity: 0; } 35%, 75% { opacity: .7; } }
+
+/* 14 Muscle pose: shoulders and upper arms stay put; only the forearms
+   curl inward from their hanging position until the fists sit beside the
+   head. The upper-arm outline itself swells upward from its lower edge,
+   pulsing twice while the curl is held, then everything settles neutral. */
+.fg-game .fg-robot[data-perf="muscleman"] .fg-forearm--left { animation: fg-muscle-fore-l 1.4s cubic-bezier(.3, .8, .3, 1.15); }
+.fg-game .fg-robot[data-perf="muscleman"] .fg-forearm--right { animation: fg-muscle-fore-r 1.4s cubic-bezier(.3, .8, .3, 1.15); }
+.fg-game .fg-robot[data-perf="muscleman"] .fg-upperarm { animation: fg-muscle-bulge 1.4s ease-in-out; }
+@keyframes fg-muscle-fore-l { 0%, 100% { transform: rotate(0); } 18%, 84% { transform: rotate(-160deg); } }
+@keyframes fg-muscle-fore-r { 0%, 100% { transform: rotate(0); } 18%, 84% { transform: rotate(160deg); } }
+@keyframes fg-muscle-bulge { 0%, 100% { transform: none; } 18%, 46%, 68%, 84% { transform: scale(1.04, 1.18); } 36%, 58% { transform: scale(1.1, 1.42); } }
+
+/* 13 Shirt-rip reveal: two shell panels close over the chest screen, the
+   hands meet at the chest and grab, then tear the panels outward as the
+   arms fling wide and the chest star flares behind them. */
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover { animation: fg-rip-cover 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover--left { animation: fg-rip-panel-l 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover--right { animation: fg-rip-panel-r 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-glow { animation: fg-rip-glow 1.4s ease-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-star { animation: fg-rip-star 1.4s ease-out; transform-origin: 70px 104px; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-arm--left { animation: fg-rip-arm-l 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-arm--right { animation: fg-rip-arm-r 1.4s cubic-bezier(.3, .8, .3, 1.1); }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-forearm--left { animation: fg-rip-fore-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-forearm--right { animation: fg-rip-fore-r 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-torso { animation: fg-rip-torso 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-head { animation: fg-rip-head 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-leg--left { animation: fg-rip-leg-l 1.4s ease-in-out; }
+.fg-game .fg-robot[data-perf="shirtrip"] .fg-leg--right { animation: fg-rip-leg-r 1.4s ease-in-out; }
+@keyframes fg-rip-cover { 0% { opacity: 0; } 8%, 66% { opacity: 1; } 78%, 100% { opacity: 0; } }
+@keyframes fg-rip-panel-l { 0%, 44% { transform: none; } 50% { transform: translateX(1px); } 62% { transform: translateX(-14px) scaleX(.5) rotate(-10deg); } 100% { transform: translateX(-16px) scaleX(.3) rotate(-14deg); } }
+@keyframes fg-rip-panel-r { 0%, 44% { transform: none; } 50% { transform: translateX(-1px); } 62% { transform: translateX(14px) scaleX(.5) rotate(10deg); } 100% { transform: translateX(16px) scaleX(.3) rotate(14deg); } }
+@keyframes fg-rip-glow { 0%, 48% { opacity: 0; transform: scale(.3); } 60% { opacity: .9; transform: scale(1.6); } 85% { opacity: .5; transform: scale(1.2); } 100% { opacity: 0; transform: scale(1); } }
+@keyframes fg-rip-star { 0%, 48% { transform: none; } 60% { transform: scale(1.7) rotate(20deg); } 78% { transform: scale(1.4) rotate(-6deg); } 100% { transform: none; } }
+@keyframes fg-rip-arm-l { 0% { transform: rotate(0); } 22%, 46% { transform: rotate(-90.5deg); } 62%, 84% { transform: rotate(60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-rip-arm-r { 0% { transform: rotate(0); } 22%, 46% { transform: rotate(90.5deg); } 62%, 84% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-rip-fore-l { 0% { transform: rotate(0); } 22%, 46% { transform: rotate(-29.25deg); } 62%, 84% { transform: rotate(-20deg); } 100% { transform: rotate(0); } }
+@keyframes fg-rip-fore-r { 0% { transform: rotate(0); } 22%, 46% { transform: rotate(29.25deg); } 62%, 84% { transform: rotate(20deg); } 100% { transform: rotate(0); } }
+@keyframes fg-rip-torso { 0%, 100% { transform: none; } 22%, 46% { transform: scaleY(.96) translateY(1px); } 62%, 84% { transform: scale(1.06, 1.03) translateY(-2px); } }
+@keyframes fg-rip-head { 0%, 100% { transform: none; } 22%, 46% { transform: translateY(3px) rotate(4deg); } 62%, 84% { transform: translateY(-3px) rotate(-5deg); } }
+@keyframes fg-rip-leg-l { 0%, 100% { transform: none; } 22%, 46% { transform: scaleY(.94); } 62%, 84% { transform: rotate(8deg); } }
+@keyframes fg-rip-leg-r { 0%, 100% { transform: none; } 22%, 46% { transform: scaleY(.94); } 62%, 84% { transform: rotate(-8deg); } }
+
+/* Encouragement after a miss: a soft head tilt and a thumbs-up. The
+   shoulder lifts to the V first, the forearm flips up, then the elbow
+   settles lower so the fist stands upright beside the head; it comes down
+   the same way in reverse, so the fist stays inside the stage and never
+   crosses the face. */
 .fg-game .fg-robot[data-perf="encourage"] .fg-head { animation: fg-tilt .9s ease-in-out; }
 .fg-game .fg-robot[data-perf="encourage"] .fg-arm--right { animation: fg-thumb .9s ease-in-out; }
+.fg-game .fg-robot[data-perf="encourage"] .fg-forearm--right { animation: fg-thumb-fore .9s ease-in-out; }
 @keyframes fg-tilt { 30%, 70% { transform: rotate(9deg); } }
-@keyframes fg-thumb { 30%, 70% { transform: rotate(-70deg); } }
+@keyframes fg-thumb { 0% { transform: rotate(0); } 18%, 36% { transform: rotate(-60deg); } 44%, 68% { transform: rotate(-35deg); } 76%, 90% { transform: rotate(-60deg); } 100% { transform: rotate(0); } }
+@keyframes fg-thumb-fore { 0%, 16% { transform: rotate(0); } 36% { transform: rotate(-100deg); } 44%, 68% { transform: rotate(-135deg); } 76% { transform: rotate(-110deg); } 92%, 100% { transform: rotate(0); } }
 
 /* ---------- milestone scenes ---------- */
 /* During a milestone the progress meter yields its space to the banner (the
@@ -3103,6 +3485,11 @@ body {
   text-align: center;
 }
 .fg-game .fg-card[data-scene] .fg-scene-banner { opacity: 1; transform: none; }
+/* The scene title stamps down, the line slides up after it. */
+.fg-game .fg-card[data-scene] .fg-scene-title { display: block; animation: fg-stamp .55s cubic-bezier(.2, .9, .3, 1.4) .15s both; }
+.fg-game .fg-card[data-scene] .fg-scene-line { display: block; animation: fg-line-up .4s ease-out .5s both; }
+@keyframes fg-stamp { 0% { transform: scale(2) rotate(-6deg); opacity: 0; } 60% { transform: scale(.95) rotate(1deg); opacity: 1; } 100% { transform: none; } }
+@keyframes fg-line-up { 0% { transform: translateY(8px); opacity: 0; } 100% { transform: none; opacity: 1; } }
 .fg-game .fg-card[data-scene] .fg-completion { visibility: hidden; }
 .fg-game .fg-scene-title { font-family: var(--mg-font-shout); font-size: clamp(20px, 7cqw, 32px); letter-spacing: 2px; line-height: 1.05; color: var(--fg-ink); text-shadow: 3px 3px 0 var(--fg-yellow); }
 .fg-game .fg-scene-line { font-size: clamp(12px, 3.4cqw, 15px); font-weight: 700; line-height: 1.15; color: #355080; }
@@ -3120,6 +3507,8 @@ body {
   color: var(--fg-ink); background: var(--fg-cream); border: 3px solid var(--fg-ink); border-radius: 999px; box-shadow: 0 3px 0 var(--fg-ink); cursor: pointer;
 }
 .fg-game .fg-skip:focus-visible { outline: 4px solid var(--fg-yellow); outline-offset: 2px; }
+.fg-game .fg-skip:not(.mg-hidden) { animation: fg-skip-in .35s cubic-bezier(.2, .9, .3, 1.4) both; }
+@keyframes fg-skip-in { 0% { transform: scale(.6); opacity: 0; } 100% { transform: none; opacity: 1; } }
 
 /* 6: power-up. Antenna flares, eyes flash, then a stomping wave dance. */
 .fg-game .fg-robot[data-perf="powerup"] .fg-bulb-glow { opacity: 1; animation: fg-flare 5.2s ease-in-out; }
@@ -3127,14 +3516,22 @@ body {
 .fg-game .fg-robot[data-perf="powerup"] .fg-robot-rig { animation: fg-powerup-body 5.2s ease-in-out; }
 .fg-game .fg-robot[data-perf="powerup"] .fg-arm--left { animation: fg-wave-l 5.2s ease-in-out; }
 .fg-game .fg-robot[data-perf="powerup"] .fg-arm--right { animation: fg-wave-r 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-forearm--left { animation: fg-wave-fore-up-l 5.2s ease-in-out; }
+.fg-game .fg-robot[data-perf="powerup"] .fg-forearm--right { animation: fg-wave-fore-up-r 5.2s ease-in-out; }
 .fg-game .fg-robot[data-perf="powerup"] .fg-leg--left { animation: fg-stomp-l 5.2s ease-in-out; }
 .fg-game .fg-robot[data-perf="powerup"] .fg-leg--right { animation: fg-stomp-r 5.2s ease-in-out; }
 .fg-game .fg-robot[data-perf="powerup"] .fg-head { animation: fg-powerup-head 5.2s ease-in-out; }
 @keyframes fg-flare { 0% { opacity: 0; transform: scale(.5); } 8%, 14% { opacity: 1; transform: scale(2.2); } 20% { opacity: .6; transform: scale(1); } 100% { opacity: .6; transform: scale(1); } }
 @keyframes fg-bulb-pop { 6%, 12% { transform: scale(1.5); } }
 @keyframes fg-powerup-body { 0%, 12% { transform: none; } 14% { transform: translateX(-3px); } 16% { transform: translateX(3px); } 18% { transform: translateX(-3px); } 20% { transform: none; } 26%, 42%, 58%, 74% { transform: translateY(-14px) rotate(-5deg); } 34%, 50%, 66% { transform: translateY(0) rotate(5deg); } 82% { transform: translateY(0); } 88% { transform: translateY(-22px) scaleY(1.06); } 94%, 100% { transform: translateY(0); } }
-@keyframes fg-wave-l { 0%, 20% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(160deg); } 36%, 52%, 68% { transform: rotate(40deg); } 88%, 100% { transform: rotate(150deg); } }
-@keyframes fg-wave-r { 0%, 20% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(-40deg); } 36%, 52%, 68% { transform: rotate(-160deg); } 88%, 100% { transform: rotate(-150deg); } }
+/* The wave alternates each arm between the raised V (shoulder 60, forearm
+   100) and a goal post (elbow at rest height, forearm straight up), so a
+   hand is always pointing up and never dangles from a lifted elbow. Both
+   arms end in the V. */
+@keyframes fg-wave-l { 0%, 20% { transform: rotate(0); } 26%, 28%, 44%, 60%, 76% { transform: rotate(60deg); } 36%, 52%, 68% { transform: rotate(5deg); } 88%, 100% { transform: rotate(60deg); } }
+@keyframes fg-wave-r { 0%, 20% { transform: rotate(0); } 26%, 28%, 44%, 60%, 76% { transform: rotate(-60deg); } 36%, 52%, 68% { transform: rotate(-5deg); } 88%, 100% { transform: rotate(-60deg); } }
+@keyframes fg-wave-fore-up-l { 0%, 25% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(100deg); } 36%, 52%, 68% { transform: rotate(160deg); } 88%, 100% { transform: rotate(100deg); } }
+@keyframes fg-wave-fore-up-r { 0%, 25% { transform: rotate(0); } 28%, 44%, 60%, 76% { transform: rotate(-100deg); } 36%, 52%, 68% { transform: rotate(-160deg); } 88%, 100% { transform: rotate(-100deg); } }
 @keyframes fg-stomp-l { 0%, 20%, 82%, 100% { transform: rotate(0); } 26%, 42%, 58%, 74% { transform: rotate(-30deg) translateY(-6px); } 34%, 50%, 66% { transform: rotate(0); } }
 @keyframes fg-stomp-r { 0%, 20%, 82%, 100% { transform: rotate(0); } 34%, 50%, 66% { transform: rotate(30deg) translateY(-6px); } 26%, 42%, 58%, 74% { transform: rotate(0); } }
 @keyframes fg-powerup-head { 0%, 20% { transform: none; } 26%, 58% { transform: rotate(8deg); } 42%, 74% { transform: rotate(-8deg); } 88%, 100% { transform: rotate(0) translateY(-3px); } }
@@ -3142,16 +3539,28 @@ body {
 /* 36: skates unfold, a glide left and right with a lean, one spin, a pose. */
 .fg-game .fg-robot[data-perf="skate"] .fg-skate { opacity: 1; transform: none; animation: fg-skate-unfold 5.6s cubic-bezier(.2, .9, .3, 1.4); }
 .fg-game .fg-robot[data-perf="skate"] .fg-wheel { animation: fg-wheel 5.6s linear; }
-.fg-game .fg-robot[data-perf="skate"] .fg-robot-rig { animation: fg-glide 5.6s ease-in-out; }
+/* The glide leans about the body's centre (70, 110), not the floor pivot,
+   so a lean moves the head and feet a little each way instead of sweeping
+   the head and the raised hand out past the stage edge. The slide and lean
+   are sized so the padded viewBox contains the lean-side hand. */
+.fg-game .fg-robot[data-perf="skate"] .fg-robot-rig { transform-origin: 70px 110px; animation: fg-glide 5.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="skate"] .fg-arm--left { animation: fg-glide-arm-l 5.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="skate"] .fg-arm--right { animation: fg-glide-arm-r 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-forearm--left { animation: fg-glide-fore-l 5.6s ease-in-out; }
+.fg-game .fg-robot[data-perf="skate"] .fg-forearm--right { animation: fg-glide-fore-r 5.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="skate"] .fg-leg--right { animation: fg-glide-leg 5.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="skate"] .fg-head { animation: fg-glide-head 5.6s ease-in-out; }
 @keyframes fg-skate-unfold { 0% { opacity: 0; transform: scaleY(0); } 12% { opacity: 1; transform: scaleY(1.2); } 18%, 100% { opacity: 1; transform: none; } }
 @keyframes fg-wheel { 0%, 18% { transform: rotate(0); } 100% { transform: rotate(1440deg); } }
-@keyframes fg-glide { 0%, 16% { transform: none; } 20% { transform: translateY(-6px) scaleY(.95); } 34% { transform: translateX(-38px) rotate(-12deg); } 50% { transform: translateX(34px) rotate(12deg); } 62% { transform: translateX(0) rotate(0) scaleX(1); } 68% { transform: translateY(-12px) scaleX(-1); } 74% { transform: translateY(-12px) scaleX(1); } 80% { transform: translateY(0) translateX(-24px) rotate(-8deg); } 90%, 100% { transform: translateX(0) rotate(0) translateY(-2px); } }
-@keyframes fg-glide-arm-l { 0%, 16% { transform: rotate(0); } 34% { transform: rotate(60deg); } 50% { transform: rotate(-30deg); } 68%, 74% { transform: rotate(80deg); } 90%, 100% { transform: rotate(140deg); } }
-@keyframes fg-glide-arm-r { 0%, 16% { transform: rotate(0); } 34% { transform: rotate(30deg); } 50% { transform: rotate(-60deg); } 68%, 74% { transform: rotate(-80deg); } 90%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-glide { 0%, 16% { transform: none; } 20% { transform: translateY(-6px) scaleY(.95); } 34% { transform: translateX(-6px) rotate(-8deg); } 50% { transform: translateX(6px) rotate(8deg); } 62% { transform: translateX(0) rotate(0) scaleX(1); } 68% { transform: translateY(-12px) scaleX(-1); } 74% { transform: translateY(-12px) scaleX(1); } 80% { transform: translateY(0) translateX(0) rotate(-6deg); } 90%, 100% { transform: translateX(0) rotate(0) translateY(-2px); } }
+/* Gliding: the leading arm reaches up and out nearly straight, the trailing
+   arm hangs with a slight inward curl. The spin (68 to 74) uses the same
+   arms-out shape as the Spin dance. The finish is one arm high (shoulder
+   65, forearm 100) and the other hand at the hip. */
+@keyframes fg-glide-arm-l { 0%, 16% { transform: rotate(0); } 28%, 34%, 41% { transform: rotate(60deg); } 50% { transform: rotate(-30deg); } 68%, 74% { transform: rotate(80deg); } 90%, 100% { transform: rotate(65deg); } }
+@keyframes fg-glide-arm-r { 0%, 16% { transform: rotate(0); } 34% { transform: rotate(30deg); } 43%, 50% { transform: rotate(-60deg); } 68%, 74% { transform: rotate(-80deg); } 90%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-glide-fore-l { 0%, 26% { transform: rotate(0); } 34% { transform: rotate(100deg); } 42% { transform: rotate(0); } 50% { transform: rotate(20deg); } 68%, 74% { transform: rotate(0); } 90%, 100% { transform: rotate(100deg); } }
+@keyframes fg-glide-fore-r { 0%, 16% { transform: rotate(0); } 34%, 44% { transform: rotate(0); } 50% { transform: rotate(-100deg); } 68%, 74% { transform: rotate(0); } 90%, 100% { transform: rotate(40deg); } }
 @keyframes fg-glide-leg { 0%, 16%, 62%, 100% { transform: rotate(0); } 34% { transform: rotate(35deg) translateY(-4px); } 50% { transform: rotate(-25deg); } 80% { transform: rotate(40deg) translateY(-6px); } }
 @keyframes fg-glide-head { 34% { transform: rotate(-8deg); } 50% { transform: rotate(8deg); } 90%, 100% { transform: rotate(-4deg); } }
 
@@ -3166,14 +3575,20 @@ body {
 .fg-game .fg-robot[data-perf="jetpack"] .fg-robot-rig { transform-origin: 70px 92px; animation: fg-fly 6s ease-in-out; }
 .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--left { animation: fg-fly-arm-l 6s ease-in-out; }
 .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--right { animation: fg-fly-arm-r 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-forearm--left { animation: fg-fly-fore-l 6s ease-in-out; }
+.fg-game .fg-robot[data-perf="jetpack"] .fg-forearm--right { animation: fg-fly-fore-r 6s ease-in-out; }
 .fg-game .fg-robot[data-perf="jetpack"] .fg-leg--left { animation: fg-fly-leg-l 6s ease-in-out; }
 .fg-game .fg-robot[data-perf="jetpack"] .fg-leg--right { animation: fg-fly-leg-r 6s ease-in-out; }
 .fg-game .fg-robot[data-perf="jetpack"] .fg-robot-shadow { animation: fg-shadow-shrink 6s ease-in-out; }
 @keyframes fg-jet-pop { 0% { opacity: 0; transform: scale(.4); } 10% { opacity: 1; transform: scale(1.15); } 15%, 100% { opacity: 1; transform: none; } }
 @keyframes fg-flame { 0%, 12% { opacity: 0; transform: scaleY(.2); } 16% { opacity: 1; transform: scaleY(1.4); } 20%, 84% { opacity: 1; transform: scaleY(1); } 22%, 50%, 70% { transform: scaleY(1.3) scaleX(.9); } 92%, 100% { opacity: 0; transform: scaleY(.2); } }
 @keyframes fg-fly { 0%, 14% { transform: none; } 17% { transform: translateY(8px) scaleY(.9) scaleX(1.06); } 28% { transform: translateY(-32px) rotate(-6deg); } 40% { transform: translateY(-36px) translateX(8px) rotate(6deg); } 52% { transform: translateY(-46px) translateX(0) rotate(180deg) scale(.8); } 62% { transform: translateY(-36px) translateX(-8px) rotate(360deg); } 74% { transform: translateY(-30px) translateX(0) rotate(354deg); } 86% { transform: translateY(-10px) rotate(360deg); } 90% { transform: translateY(8px) scaleY(.9) scaleX(1.06) rotate(360deg); } 100% { transform: rotate(360deg); } }
-@keyframes fg-fly-arm-l { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(120deg); } 86%, 100% { transform: rotate(20deg); } }
-@keyframes fg-fly-arm-r { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(-120deg); } 86%, 100% { transform: rotate(-20deg); } }
+/* Flight: both arms up in the V. Landing: elbows a little out with the
+   forearms kept vertical, so the hands hang straight for balance. */
+@keyframes fg-fly-arm-l { 0%, 14% { transform: rotate(0); } 22%, 80% { transform: rotate(60deg); } 86%, 100% { transform: rotate(20deg); } }
+@keyframes fg-fly-arm-r { 0%, 14% { transform: rotate(0); } 22%, 80% { transform: rotate(-60deg); } 86%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-fly-fore-l { 0%, 20% { transform: rotate(0); } 28%, 74% { transform: rotate(100deg); } 82%, 100% { transform: rotate(-20deg); } }
+@keyframes fg-fly-fore-r { 0%, 20% { transform: rotate(0); } 28%, 74% { transform: rotate(-100deg); } 82%, 100% { transform: rotate(20deg); } }
 @keyframes fg-fly-leg-l { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(-18deg); } 86%, 100% { transform: rotate(0); } }
 @keyframes fg-fly-leg-r { 0%, 14% { transform: rotate(0); } 28%, 74% { transform: rotate(18deg); } 86%, 100% { transform: rotate(0); } }
 @keyframes fg-shadow-shrink { 0%, 14%, 90%, 100% { transform: none; opacity: 1; } 28%, 74% { transform: scale(.5); opacity: .5; } }
@@ -3184,6 +3599,8 @@ body {
 .fg-game .fg-robot[data-perf="finale"] .fg-robot-rig { animation: fg-finale 8.2s ease-in-out forwards; }
 .fg-game .fg-robot[data-perf="finale"] .fg-arm--left { animation: fg-finale-arm-l 8.2s ease-in-out forwards; }
 .fg-game .fg-robot[data-perf="finale"] .fg-arm--right { animation: fg-finale-arm-r 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-forearm--left { animation: fg-finale-fore-l 8.2s ease-in-out forwards; }
+.fg-game .fg-robot[data-perf="finale"] .fg-forearm--right { animation: fg-finale-fore-r 8.2s ease-in-out forwards; }
 .fg-game .fg-robot[data-perf="finale"] .fg-leg--left { animation: fg-stomp-l 3.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="finale"] .fg-leg--right { animation: fg-stomp-r 3.6s ease-in-out; }
 .fg-game .fg-robot[data-perf="finale"] .fg-head { animation: fg-powerup-head 3.6s ease-in-out; }
@@ -3208,8 +3625,13 @@ body {
 @keyframes fg-finale { 0% { transform: none; } 8%, 24% { transform: translateY(-14px) rotate(-6deg); } 16%, 32% { transform: translateY(0) rotate(6deg); } 36% { transform: translateY(-8px) scaleX(-1); } 40% { transform: translateY(-8px) scaleX(1); } 44% { transform: translateY(0); } 50% { transform: scaleY(.8) scaleX(1.12); } 54% { transform: scaleY(.78) scaleX(1.14) translateX(-2px); } 56% { transform: scaleY(.78) scaleX(1.14) translateX(2px); } 60% { transform: translate(0, -22px) rotate(0) scale(1, 1.08); } 68% { transform: translate(0, -28px) rotate(-10deg) scale(.92); } 78% { transform: translate(0, -230px) rotate(-3deg) scale(.82); } 90% { transform: translate(0, -440px) rotate(-2deg) scale(.72); } 100% { transform: translate(0, -560px) rotate(0) scale(.66); } }
 @keyframes fg-finale-phone { 0% { transform: none; } 8%, 24% { transform: translateY(-14px) rotate(-6deg); } 16%, 32% { transform: translateY(0) rotate(6deg); } 36% { transform: translateY(-8px) scaleX(-1); } 40% { transform: translateY(-8px) scaleX(1); } 44% { transform: translateY(0); } 50% { transform: scaleY(.8) scaleX(1.12); } 54% { transform: scaleY(.78) scaleX(1.14) translateX(-2px); } 56% { transform: scaleY(.78) scaleX(1.14) translateX(2px); } 60% { transform: translate(0, -10px) rotate(0) scale(.85); } 68% { transform: translate(0, -14px) rotate(-8deg) scale(.7); } 78% { transform: translate(0, -250px) rotate(-2deg) scale(.62); } 90% { transform: translate(0, -430px) rotate(6deg) scale(.55); } 100% { transform: translate(0, -560px) rotate(8deg) scale(.5); } }
 @keyframes fg-finale-lane-phone { 0%, 58% { transform: translateX(0); } 68%, 78% { transform: translateX(var(--fg-lane)); } 90% { transform: translateX(calc(var(--fg-lane) * .45)); } 100% { transform: translateX(calc(var(--fg-lane) * .25)); } }
-@keyframes fg-finale-arm-l { 0% { transform: rotate(0); } 8%, 24% { transform: rotate(160deg); } 16%, 32% { transform: rotate(40deg); } 50% { transform: rotate(-20deg); } 60%, 100% { transform: rotate(170deg); } }
-@keyframes fg-finale-arm-r { 0% { transform: rotate(0); } 8%, 24% { transform: rotate(-40deg); } 16%, 32% { transform: rotate(-160deg); } 50% { transform: rotate(20deg); } 60%, 100% { transform: rotate(-170deg); } }
+/* The same alternating V and goal-post wave as the power-up, a crouch with
+   the forearms still up (ready to jump), then both arms thrust high
+   (shoulder 65, forearm 100) for the whole launch. */
+@keyframes fg-finale-arm-l { 0% { transform: rotate(0); } 6%, 8%, 24% { transform: rotate(60deg); } 16%, 32% { transform: rotate(5deg); } 50% { transform: rotate(-10deg); } 60%, 100% { transform: rotate(65deg); } }
+@keyframes fg-finale-arm-r { 0% { transform: rotate(0); } 6%, 8%, 24% { transform: rotate(-60deg); } 16%, 32% { transform: rotate(-5deg); } 50% { transform: rotate(10deg); } 60%, 100% { transform: rotate(-65deg); } }
+@keyframes fg-finale-fore-l { 0%, 5% { transform: rotate(0); } 8%, 24% { transform: rotate(100deg); } 16%, 32% { transform: rotate(160deg); } 50% { transform: rotate(170deg); } 60%, 100% { transform: rotate(100deg); } }
+@keyframes fg-finale-fore-r { 0%, 5% { transform: rotate(0); } 8%, 24% { transform: rotate(-100deg); } 16%, 32% { transform: rotate(-160deg); } 50% { transform: rotate(-170deg); } 60%, 100% { transform: rotate(-100deg); } }
 @keyframes fg-finale-flame { 0%, 44% { opacity: 0; transform: scaleY(.2); } 50% { opacity: 1; transform: scaleY(.8); } 58% { transform: scaleY(2.2) scaleX(1.2); } 100% { opacity: 1; transform: scaleY(2.6) scaleX(1.1); } }
 @keyframes fg-finale-shadow { 0%, 56% { transform: none; opacity: 1; } 70%, 100% { transform: scale(.2); opacity: 0; } }
 
@@ -3229,13 +3651,32 @@ body {
 .fg-game .fg-end-robot { display: grid; place-items: center; height: 120px; }
 .fg-game .fg-robot--end { position: relative; height: 120px; width: 120px; }
 .fg-game .fg-robot--end .fg-robot-svg { height: 100%; }
-.fg-game .fg-robot[data-perf="end-pose"] .fg-arm--left { transform: rotate(150deg); }
+/* One arm high with the other hand at the hip; the full chart gets both
+   arms thrust up as in the launch. */
+.fg-game .fg-robot[data-perf="end-pose"] .fg-arm--left { transform: rotate(65deg); }
+.fg-game .fg-robot[data-perf="end-pose"] .fg-forearm--left { transform: rotate(100deg); }
 .fg-game .fg-robot[data-perf="end-pose"] .fg-arm--right { transform: rotate(-30deg); }
-.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--left { transform: rotate(160deg); }
-.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--right { transform: rotate(-160deg); }
+.fg-game .fg-robot[data-perf="end-pose"] .fg-forearm--right { transform: rotate(40deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--left { transform: rotate(65deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-forearm--left { transform: rotate(100deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-arm--right { transform: rotate(-65deg); }
+.fg-game .fg-robot[data-perf="finale-pose"] .fg-forearm--right { transform: rotate(-100deg); }
 .fg-game .fg-robot[data-perf="finale-pose"] .fg-jet-flame { opacity: 1; }
 .fg-game .fg-robot[data-perf="finale-pose"] .fg-robot-rig { animation: fg-idle 2s ease-in-out infinite; }
+.fg-game .fg-robot[data-perf="end-pose"] .fg-robot-rig { animation: fg-idle 2.6s ease-in-out infinite; }
 .fg-game .fg-end-line { max-width: 34ch; margin-inline: auto; }
+/* Start and end cards rise in; the end robot hops in first, then the
+   stats land one at a time, then PLAY AGAIN. */
+.fg-game .mg-screen > .mg-card { animation: fg-card-in .5s cubic-bezier(.2, .9, .3, 1.2) both; }
+.fg-game .fg-end-robot { animation: fg-end-robot-in .6s cubic-bezier(.2, .9, .3, 1.4) .1s both; }
+.fg-game .fg-end-card .mg-stat { animation: fg-stat-in .45s cubic-bezier(.2, .9, .3, 1.4) both; }
+.fg-game .fg-end-card .mg-stat:nth-child(1) { animation-delay: .35s; }
+.fg-game .fg-end-card .mg-stat:nth-child(2) { animation-delay: .5s; }
+.fg-game .fg-end-card .mg-stat:nth-child(3) { animation-delay: .65s; }
+.fg-game .fg-end-card .mg-big-btn { animation: fg-stat-in .45s cubic-bezier(.2, .9, .3, 1.4) .85s both; }
+@keyframes fg-card-in { 0% { transform: translateY(24px) scale(.96); opacity: 0; } 100% { transform: none; opacity: 1; } }
+@keyframes fg-end-robot-in { 0% { transform: translateY(-40px) scale(.6); opacity: 0; } 60% { transform: translateY(6px) scale(1.05); opacity: 1; } 100% { transform: none; } }
+@keyframes fg-stat-in { 0% { transform: translateY(12px) scale(.85); opacity: 0; } 100% { transform: none; opacity: 1; } }
 
 /* ---------- start screen lesson ---------- */
 .fg-game .fg-start-icon { display: grid; place-items: center; }
@@ -3309,9 +3750,15 @@ body {
 .fg-game .fg-jump--unknown { background: #ffe8b8; border-style: dashed; border-color: #9b6200; color: #9b6200; }
 .fg-game .fg-jump:not(:last-child)::after { content: '→'; position: absolute; right: -14px; top: 40%; transform: translateY(-50%); font-size: 18px; font-weight: 800; color: var(--fg-ink); }
 @keyframes fg-jump-in { to { opacity: 1; transform: none; } }
+/* After it lands, the unknown chip asks twice: a small breathing pulse. */
+.fg-game .fg-jump--unknown { animation: fg-jump-in 260ms ease-out var(--fg-delay, 0ms) forwards, fg-unknown-pulse 1.1s ease-in-out calc(var(--fg-delay, 0ms) + 320ms) 2; }
+@keyframes fg-unknown-pulse { 50% { transform: scale(1.1); background: #ffd98a; } }
 
 /* ---------- continuation choices ---------- */
 .fg-game .fg-popup-actions { display: grid; gap: 10px; width: 100%; justify-items: center; }
+.fg-game .fg-popup-actions .fg-choice-btn { animation: fg-stat-in .4s cubic-bezier(.2, .9, .3, 1.4) both; }
+.fg-game .fg-popup-actions .fg-choice-btn:nth-child(2) { animation-delay: .12s; }
+.fg-game .fg-popup-actions .fg-choice-btn:nth-child(3) { animation-delay: .24s; }
 .fg-game .fg-choice-btn { display: grid; justify-items: center; gap: 2px; width: min(100%, 420px); min-height: 52px; padding: 8px 18px; line-height: 1; }
 .fg-game .fg-choice-btn b { font-family: var(--mg-font-shout); font-weight: 400; font-size: clamp(18px, 2.2vw, 25px); letter-spacing: 1px; }
 .fg-game .fg-choice-detail { font-family: var(--mg-font-read); font-size: 14px; font-weight: 700; letter-spacing: 0; }
@@ -3379,10 +3826,15 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .fg-game .fg-robot, .fg-game .fg-robot-svg *, .fg-game .fg-robot-svg, .fg-game .fg-cell, .fg-game .fg-factor-value, .fg-game .fg-completion-track i,
   .fg-game .fg-jump, .fg-game .fg-intro *, .fg-game .fg-firework, .fg-game .fg-scene-banner, .fg-game .fg-skate, .fg-game .fg-jetpack,
-  .fg-game .fg-toast-static {
+  .fg-game .fg-toast-static, .fg-game .fg-cell::after, .fg-game .fg-fly-number, .fg-game .fg-completion *, .fg-game .mg-chip-streak,
+  .fg-game .mg-tile, .fg-game .fg-scene-title, .fg-game .fg-scene-line, .fg-game .fg-skip, .fg-game .fg-choice-btn,
+  .fg-game .mg-screen > .mg-card, .fg-game .fg-end-robot, .fg-game .mg-stat, .fg-game .mg-big-btn {
     animation: none !important;
     transition: none !important;
   }
+  .fg-game .fg-cell--just::after { display: none; }
+  .fg-game .mg-tile, .fg-game .fg-choice-btn, .fg-game .mg-stat, .fg-game .mg-screen > .mg-card, .fg-game .fg-end-robot, .fg-game .mg-big-btn,
+  .fg-game .fg-scene-title, .fg-game .fg-scene-line, .fg-game .fg-skip, .fg-game .fg-factor-value, .fg-game .fg-cell { opacity: 1; transform: none; }
   .fg-game .fg-scene-banner { opacity: 0; transform: none; }
   .fg-game .fg-card[data-scene] .fg-scene-banner { opacity: 1; }
   .fg-game .fg-jump { opacity: 1; transform: none; }
@@ -3392,25 +3844,81 @@ body {
   .fg-game .fg-intro-cell--target { box-shadow: 0 0 0 2px var(--fg-ink); }
   .fg-game .fg-firework { opacity: .9; transform: scale(1); }
   .fg-game .fg-robot--powered .fg-bulb-glow { opacity: .6; }
-  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--left, .fg-game .fg-robot[data-perf="skate"] .fg-arm--left,
-  .fg-game .fg-robot[data-perf="finale"] .fg-arm--left { transform: rotate(150deg); }
-  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--right, .fg-game .fg-robot[data-perf="skate"] .fg-arm--right,
-  .fg-game .fg-robot[data-perf="finale"] .fg-arm--right { transform: rotate(-150deg); }
+  /* Each scene and dance frozen at its signature moment, using the same
+     shoulder plus forearm poses as the animated keyframes above. */
+  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--left, .fg-game .fg-robot[data-perf="finale"] .fg-arm--left,
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--left, .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--left,
+  .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--left { transform: rotate(60deg); }
+  .fg-game .fg-robot[data-perf="powerup"] .fg-arm--right, .fg-game .fg-robot[data-perf="finale"] .fg-arm--right,
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--right, .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--right,
+  .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--right, .fg-game .fg-robot[data-perf="fistpump"] .fg-arm--right { transform: rotate(-60deg); }
+  .fg-game .fg-robot[data-perf="powerup"] .fg-forearm--left, .fg-game .fg-robot[data-perf="finale"] .fg-forearm--left,
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-forearm--left, .fg-game .fg-robot[data-perf="heelclick"] .fg-forearm--left,
+  .fg-game .fg-robot[data-perf="cartwheel"] .fg-forearm--left, .fg-game .fg-robot[data-perf="skate"] .fg-forearm--left { transform: rotate(100deg); }
+  .fg-game .fg-robot[data-perf="powerup"] .fg-forearm--right, .fg-game .fg-robot[data-perf="finale"] .fg-forearm--right,
+  .fg-game .fg-robot[data-perf="jetpack"] .fg-forearm--right, .fg-game .fg-robot[data-perf="heelclick"] .fg-forearm--right,
+  .fg-game .fg-robot[data-perf="cartwheel"] .fg-forearm--right, .fg-game .fg-robot[data-perf="fistpump"] .fg-forearm--right { transform: rotate(-100deg); }
+  .fg-game .fg-robot[data-perf="skate"] .fg-arm--left { transform: rotate(65deg); }
+  .fg-game .fg-robot[data-perf="skate"] .fg-arm--right { transform: rotate(-20deg); }
+  .fg-game .fg-robot[data-perf="skate"] .fg-forearm--right { transform: rotate(40deg); }
   .fg-game .fg-robot[data-perf="skate"] .fg-robot-rig { transform: rotate(-8deg); }
   .fg-game .fg-robot[data-perf="jetpack"] .fg-robot-rig { transform: translateY(-30px); }
   .fg-game .fg-robot[data-perf="jetpack"] .fg-jet-flame, .fg-game .fg-robot[data-perf="finale"] .fg-jet-flame { opacity: 1; transform: scaleY(1.4); }
-  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--left { transform: rotate(120deg); }
-  .fg-game .fg-robot[data-perf="jetpack"] .fg-arm--right { transform: rotate(-120deg); }
   .fg-game .fg-robot[data-perf="finale"] .fg-robot-rig { transform: translateY(-40px); }
   .fg-game .fg-toy--launchpad .fg-cell--done { background: var(--fg-yellow); }
-  .fg-game .fg-robot[data-perf="encourage"] .fg-arm--right { transform: rotate(-70deg); }
-  .fg-game .fg-robot[data-perf="fistpump"] .fg-arm--right { transform: rotate(-165deg); }
-  .fg-game .fg-robot[data-perf="star"] .fg-arm--left { transform: rotate(110deg); }
-  .fg-game .fg-robot[data-perf="star"] .fg-holo { opacity: 1; transform: scale(1); }
-  .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--left, .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--left { transform: rotate(150deg); }
-  .fg-game .fg-robot[data-perf="heelclick"] .fg-arm--right, .fg-game .fg-robot[data-perf="cartwheel"] .fg-arm--right { transform: rotate(-150deg); }
-  .fg-game .fg-robot[data-perf="spin"] .fg-arm--left, .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--left { transform: rotate(60deg); }
-  .fg-game .fg-robot[data-perf="spin"] .fg-arm--right, .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--right { transform: rotate(-60deg); }
+  .fg-game .fg-robot[data-perf="encourage"] .fg-arm--right { transform: rotate(-35deg); }
+  .fg-game .fg-robot[data-perf="encourage"] .fg-forearm--right { transform: rotate(-135deg); }
+  .fg-game .fg-robot[data-perf="spin"] .fg-arm--left { transform: rotate(80deg); }
+  .fg-game .fg-robot[data-perf="spin"] .fg-arm--right { transform: rotate(-80deg); }
+  /* Shuffle: elbows lifted a little, forearms kept vertical. */
+  .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--left { transform: rotate(35deg); }
+  .fg-game .fg-robot[data-perf="shuffle"] .fg-arm--right { transform: rotate(-35deg); }
+  .fg-game .fg-robot[data-perf="shuffle"] .fg-forearm--left { transform: rotate(-35deg); }
+  .fg-game .fg-robot[data-perf="shuffle"] .fg-forearm--right { transform: rotate(35deg); }
+  /* Arm wave: the ripple has reached the right elbow. */
+  .fg-game .fg-robot[data-perf="armwave"] .fg-arm--left { transform: rotate(30deg); }
+  .fg-game .fg-robot[data-perf="armwave"] .fg-forearm--left { transform: rotate(150deg); }
+  .fg-game .fg-robot[data-perf="armwave"] .fg-arm--right { transform: rotate(-55deg); }
+  .fg-game .fg-robot[data-perf="armwave"] .fg-forearm--right { transform: rotate(-130deg); }
+  .fg-game .fg-robot[data-perf="sunglasses"] .fg-arm--right { transform: rotate(-102deg); }
+  .fg-game .fg-robot[data-perf="sunglasses"] .fg-forearm--right { transform: rotate(-45.5deg); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-leg--left { transform: translateY(-10px) rotate(-28deg) scaleY(.68); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-leg--right { transform: translateX(6px) translateY(2px) rotate(6deg); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-arm--left { transform: rotate(-50deg); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-arm--right { transform: rotate(-45deg); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-forearm--left { transform: rotate(-70deg); }
+  .fg-game .fg-robot[data-perf="runningman"] .fg-forearm--right { transform: rotate(95deg); }
+  .fg-game .fg-robot[data-perf="twostep"] .fg-forearm--left { transform: rotate(-20deg); }
+  .fg-game .fg-robot[data-perf="twostep"] .fg-forearm--right { transform: rotate(8deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-robot-rig { transform: translate(-6px, -10px) rotate(6deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-arm--right { transform: rotate(-65deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-forearm--right { transform: rotate(-95deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-arm--left { transform: rotate(-25deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-forearm--left { transform: rotate(-110deg); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-leg--left { transform: rotate(14deg) scaleY(.92); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-leg--right { transform: rotate(20deg) scaleY(.9); }
+  .fg-game .fg-robot[data-perf="flying"] .fg-chest-glow { opacity: .7; }
+  .fg-game .fg-robot[data-perf="discopoint"] .fg-arm--right { transform: rotate(-140deg); }
+  .fg-game .fg-robot[data-perf="discopoint"] .fg-forearm--right { transform: rotate(-15deg); }
+  .fg-game .fg-robot[data-perf="discopoint"] .fg-torso { transform: rotate(6deg); }
+  .fg-game .fg-robot[data-perf="discopoint"] .fg-head { transform: translate(5px, 1px) rotate(-10deg); }
+  .fg-game .fg-robot[data-perf="leanback"] .fg-torso { transform: rotate(-12deg) scaleY(.96); }
+  .fg-game .fg-robot[data-perf="leanback"] .fg-head { transform: translate(-9px, 2px) rotate(-16deg); }
+  .fg-game .fg-robot[data-perf="leanback"] .fg-arm--left { transform: translate(-7px, 6px) rotate(-30deg); }
+  .fg-game .fg-robot[data-perf="leanback"] .fg-arm--right { transform: translate(-7px, -6px) rotate(10deg); }
+  .fg-game .fg-robot[data-perf="twostep"] .fg-leg--right { transform: rotate(-22deg) translateY(-5px); }
+  .fg-game .fg-robot[data-perf="twostep"] .fg-leg--left { transform: translateX(8px); }
+  .fg-game .fg-robot[data-perf="twostep"] .fg-arm--left, .fg-game .fg-robot[data-perf="twostep"] .fg-arm--right { transform: rotate(-10deg); }
+  .fg-game .fg-robot[data-perf="muscleman"] .fg-forearm--left { transform: rotate(-160deg); }
+  .fg-game .fg-robot[data-perf="muscleman"] .fg-forearm--right { transform: rotate(160deg); }
+  .fg-game .fg-robot[data-perf="muscleman"] .fg-upperarm { transform: scale(1.1, 1.42); }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-arm--left { transform: rotate(60deg); }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-arm--right { transform: rotate(-60deg); }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-glow { opacity: .8; transform: scale(1.4); }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-star { transform: scale(1.5); transform-origin: 70px 104px; }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover { opacity: 1; }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover--left { transform: translateX(-16px) scaleX(.3) rotate(-14deg); }
+  .fg-game .fg-robot[data-perf="shirtrip"] .fg-chest-cover--right { transform: translateX(16px) scaleX(.3) rotate(14deg); }
 }</style>
 </head>
 <body>
