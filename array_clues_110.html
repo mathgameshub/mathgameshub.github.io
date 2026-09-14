@@ -1,0 +1,3790 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+(function installGameFrame(global) {
+  const DEFAULT_THEME = Object.freeze({
+    bgA: "#3156D8",
+    bgB: "#13213F",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#37C8C5",
+    picture: "#E5F8F5",
+    pictureAlt: "#fffdf4"
+  });
+  const DEFAULT_PROBLEMS = Object.freeze([
+    { id: "sample-1", title: "Sample lesson card", detail: "Replace this panel with the first lesson problem.", prompt: "Choose the answer that fits.", answer: "c", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-2", title: "The next sample card", detail: "The frame keeps the same question and choices after a miss.", prompt: "Choose the answer that fits.", answer: "a", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-3", title: "One more sample card", detail: "Your adapter can render a picture, chart, or other lesson view here.", prompt: "Choose the answer that fits.", answer: "d", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] }
+  ]);
+  const DEFAULTS = Object.freeze({
+    title: "LESSON GAME",
+    subtitle: "A reusable frame for a new lesson.",
+    tag: "LESSON · STARTER",
+    startButton: "START",
+    playAgain: "PLAY AGAIN",
+    totalQuestions: DEFAULT_PROBLEMS.length,
+    basePoints: 10,
+    // Game 107 awards base points plus the new streak length. Set false when
+    // a lesson wants the frame without a streak bonus.
+    streakBonus: true,
+    advanceMs: 900,
+    hotStreak: 5
+  });
+  const isNode = (value) => Boolean(value && typeof value === "object" && value.nodeType);
+  function node(documentRef, tag, className, text) {
+    const element = documentRef.createElement(tag);
+    if (className) element.className = className;
+    if (text !== void 0 && text !== null) element.textContent = String(text);
+    return element;
+  }
+  function append(parent, ...children) {
+    children.flat(Infinity).forEach((child) => {
+      if (child !== null && child !== void 0) parent.append(child);
+    });
+    return parent;
+  }
+  function putContent(host, content) {
+    host.replaceChildren();
+    if (isNode(content)) host.append(content);
+    else if (content !== void 0 && content !== null) host.textContent = String(content);
+    return host;
+  }
+  function safeText(value, fallback = "") {
+    return value === void 0 || value === null ? fallback : String(value);
+  }
+  function normalizeChoice(choice, index) {
+    if (choice && typeof choice === "object") {
+      const id = safeText(choice.id, String(index));
+      return { ...choice, id, label: safeText(choice.label, id) };
+    }
+    const label = safeText(choice, String(index));
+    return { id: label, label };
+  }
+  function normalizeProblem(problem, index) {
+    const value = problem && typeof problem === "object" ? problem : {};
+    const choices = Array.isArray(value.choices) ? value.choices.map(normalizeChoice) : [];
+    if (!choices.length) throw new Error("Game frame problem needs at least one choice");
+    const answer = safeText(value.answer, "");
+    if (!answer || !choices.some((choice) => choice.id === answer)) {
+      throw new Error(`Game frame problem answer must match a choice id (problem ${index + 1})`);
+    }
+    const answers = Array.isArray(value.answers) && value.answers.length ? value.answers.map((id) => safeText(id, "")) : [answer];
+    if (answers.some((id) => !choices.some((choice) => choice.id === id))) {
+      throw new Error(`Game frame problem answers must match choice ids (problem ${index + 1})`);
+    }
+    const parts = Array.isArray(value.parts) && value.parts.length ? value.parts.map((part) => {
+      const copy = { ...part && typeof part === "object" ? part : {} };
+      if (Array.isArray(copy.choices) && copy.choices.length) copy.choices = copy.choices.map(normalizeChoice);
+      else delete copy.choices;
+      return copy;
+    }) : null;
+    return {
+      ...value,
+      id: safeText(value.id, `problem-${index + 1}`),
+      prompt: safeText(value.prompt, ""),
+      answer,
+      answers,
+      multi: Boolean(value.multi) || Boolean(parts),
+      parts,
+      choices
+    };
+  }
+  function makeTheme(theme) {
+    return { ...DEFAULT_THEME, ...theme && typeof theme === "object" ? theme : {} };
+  }
+  function mount2(root, supplied = {}) {
+    if (!root || !root.ownerDocument) throw new Error("GameFrameStarter.mount needs a DOM element");
+    const documentRef = root.ownerDocument;
+    const view = documentRef.defaultView || global;
+    const config = { ...DEFAULTS, ...supplied };
+    const theme = makeTheme(config.theme);
+    const problems = Array.isArray(config.problems) && config.problems.length ? config.problems : DEFAULT_PROBLEMS;
+    const totalQuestions = Math.max(1, Number(config.totalQuestions) || problems.length);
+    const getProblem = typeof config.getProblem === "function" ? config.getProblem : (index) => problems[index % problems.length];
+    const renderProblem = typeof config.renderProblem === "function" ? config.renderProblem : (problem2, host) => renderDefaultProblem(problem2, host, documentRef);
+    const renderStartExample = typeof config.renderStartExample === "function" ? config.renderStartExample : (host) => renderDefaultStartExample(host, documentRef);
+    const renderAnswer = typeof config.renderAnswer === "function" ? config.renderAnswer : (choice, host) => host.textContent = safeText(choice.label, choice.id);
+    let destroyed = false;
+    let problem = null;
+    let problemIndex = 0;
+    let popup = null;
+    let partIndex = 0;
+    let picks = [];
+    let advanceTimer = null;
+    let toastTimer = null;
+    let previousFocus = null;
+    const listeners = [];
+    const timers = /* @__PURE__ */ new Set();
+    const state = {
+      phase: "start",
+      score: 0,
+      streak: 0,
+      bestStreak: 0,
+      questionsAnswered: 0,
+      completed: 0,
+      canAnswer: false,
+      firstTry: true,
+      wrongAttempts: 0,
+      muted: false
+    };
+    root.replaceChildren();
+    root.classList.add("game-frame", "game-frame--standard");
+    root.setAttribute("role", "main");
+    root.setAttribute("aria-label", safeText(config.ariaLabel, `${config.title} game`));
+    Object.entries(theme).forEach(([key, value]) => root.style.setProperty(`--gf-${toKebab(key)}`, value));
+    if (documentRef.title === "Math Game" || !documentRef.title) documentRef.title = `${config.title} | Math Games`;
+    if (config.hidePrompt) root.classList.add("game-frame--card-prompt");
+    const startScreen = node(documentRef, "section", "gf-screen gf-screen--start");
+    const startCard = node(documentRef, "div", "gf-card gf-start-card");
+    const startIcon = node(documentRef, "div", "gf-emoji", config.startIcon || "✦");
+    startIcon.setAttribute("aria-hidden", "true");
+    const startTitle = node(documentRef, "h1", "gf-title", config.title);
+    const startSubtitle = node(documentRef, "p", "gf-subtitle", config.subtitle);
+    const startTag = node(documentRef, "p", "gf-tag", config.tag);
+    const startExample = node(documentRef, "div", "gf-example");
+    const startButton = node(documentRef, "button", "gf-big-btn", config.startButton);
+    startButton.type = "button";
+    append(startCard, startIcon, startTitle, startSubtitle, startTag, startExample, startButton);
+    startScreen.append(startCard);
+    const shell = node(documentRef, "div", "gf-shell");
+    const hud = node(documentRef, "header", "gf-hud");
+    const hudTitle = node(documentRef, "h2", "gf-hud-title", config.title);
+    const chips = node(documentRef, "div", "gf-chips");
+    const scoreChip = node(documentRef, "span", "gf-chip gf-chip--score", "Score 0");
+    const streakChip = node(documentRef, "span", "gf-chip gf-chip--streak", "0🔥");
+    append(chips, scoreChip, streakChip);
+    append(hud, hudTitle, chips);
+    const progress = node(documentRef, "div", "gf-progress");
+    const progressBar = node(documentRef, "i");
+    progress.append(progressBar);
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", "Question progress");
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(totalQuestions));
+    const stage = node(documentRef, "main", "gf-stage");
+    const prompt = node(documentRef, "h3", "gf-prompt");
+    prompt.tabIndex = -1;
+    prompt.setAttribute("aria-live", "polite");
+    const visual = node(documentRef, "div", "gf-visual");
+    const problemCard = node(documentRef, "section", "gf-problem-card");
+    problemCard.setAttribute("aria-label", "Lesson problem");
+    const problemSlot = node(documentRef, "div", "gf-problem-slot");
+    const soundButton = node(documentRef, "button", "gf-sound", "🔊");
+    soundButton.type = "button";
+    soundButton.setAttribute("aria-pressed", "false");
+    soundButton.setAttribute("aria-label", "Sound on. Turn sound off");
+    append(problemCard, problemSlot, soundButton);
+    visual.append(problemCard);
+    const tiles = node(documentRef, "div", "gf-tiles");
+    tiles.setAttribute("role", "group");
+    tiles.setAttribute("aria-label", "Answer choices");
+    append(stage, prompt, visual, tiles);
+    const fx = node(documentRef, "div", "gf-fx");
+    const endScreen = node(documentRef, "section", "gf-screen gf-screen--end gf-hidden");
+    const endCard = node(documentRef, "div", "gf-card gf-end-card");
+    const endIcon = node(documentRef, "div", "gf-emoji", config.endIcon || "✦");
+    endIcon.setAttribute("aria-hidden", "true");
+    const endTitle = node(documentRef, "h1", "gf-title", config.endTitle || "NICE WORK!");
+    const endLine = node(documentRef, "p", "gf-subtitle");
+    const stats = node(documentRef, "div", "gf-stats");
+    const againButton = node(documentRef, "button", "gf-big-btn", config.playAgain);
+    againButton.type = "button";
+    const endExtra = node(documentRef, "div", "gf-end-extra");
+    append(endCard, endIcon, endTitle, endLine, stats, endExtra, againButton);
+    endScreen.append(endCard);
+    append(root, startScreen, shell, endScreen, fx);
+    append(shell, hud, progress, stage);
+    renderStartExample(startExample, { state, config, document: documentRef });
+    function listen(target, eventName, handler, options) {
+      target.addEventListener(eventName, handler, options);
+      listeners.push(() => target.removeEventListener(eventName, handler, options));
+    }
+    function later(callback, ms) {
+      const id = view.setTimeout(() => {
+        timers.delete(id);
+        if (!destroyed) callback();
+      }, ms);
+      timers.add(id);
+      return id;
+    }
+    function cancelTimer(id) {
+      if (id == null) return;
+      view.clearTimeout(id);
+      timers.delete(id);
+    }
+    function cancelAllTimers() {
+      timers.forEach((id) => view.clearTimeout(id));
+      timers.clear();
+      advanceTimer = null;
+      toastTimer = null;
+    }
+    function setInert(element, inert) {
+      if (inert) {
+        element.setAttribute("inert", "");
+        element.setAttribute("aria-hidden", "true");
+      } else {
+        element.removeAttribute("inert");
+        element.removeAttribute("aria-hidden");
+      }
+    }
+    function bump(chip) {
+      chip.classList.remove("gf-chip--bump");
+      void chip.offsetWidth;
+      chip.classList.add("gf-chip--bump");
+    }
+    let shownScore = 0;
+    let shownStreak = 0;
+    function updateHud() {
+      if (state.score > shownScore) bump(scoreChip);
+      if (state.streak > shownStreak) bump(streakChip);
+      shownScore = state.score;
+      shownStreak = state.streak;
+      scoreChip.textContent = `Score ${state.score}`;
+      streakChip.textContent = `${state.streak}🔥`;
+      streakChip.classList.toggle("gf-chip--hot", state.streak >= config.hotStreak);
+      const current = Math.min(totalQuestions, state.completed);
+      progressBar.style.width = `${current / totalQuestions * 100}%`;
+      progress.setAttribute("aria-valuenow", String(current));
+      progress.setAttribute("aria-valuetext", `${current} of ${totalQuestions} questions`);
+      if (typeof config.onStateChange === "function") config.onStateChange({ ...state }, api);
+    }
+    function showToast(text, kind = "good") {
+      if (!text) return;
+      const toast = node(documentRef, "div", `gf-toast gf-toast--${kind}`, text);
+      fx.append(toast);
+      if (toastTimer) cancelTimer(toastTimer);
+      toastTimer = later(() => toast.remove(), 900);
+    }
+    function focusableIn(panel) {
+      return Array.from(panel.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
+    }
+    function closePopup(restore = true) {
+      if (!popup) return;
+      const current = popup;
+      popup = null;
+      current.panel.removeEventListener("keydown", current.onKeyDown);
+      current.retry.removeEventListener("click", current.onRetry);
+      current.panel.remove();
+      setInert(shell, false);
+      tiles.querySelectorAll("button").forEach((button) => {
+        if (button.dataset.used === "true" || button.dataset.found === "true" || button.dataset.muted === "true") return;
+        button.disabled = false;
+        button.removeAttribute("aria-disabled");
+        button.classList.remove("gf-wrong");
+      });
+      if (restore && previousFocus && previousFocus.isConnected !== false) {
+        try {
+          previousFocus.focus({ preventScroll: true });
+        } catch {
+          previousFocus.focus();
+        }
+      }
+      previousFocus = null;
+    }
+    function openPopup({ kind, title, content, returnFocus }) {
+      closePopup(false);
+      const panel = node(documentRef, "section", `gf-popup gf-popup--${kind}`);
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+      const titleNode = node(documentRef, "p", "gf-popup-title", title);
+      titleNode.id = `gf-popup-title-${Date.now()}-${Math.floor(Math.random() * 1e3)}`;
+      panel.setAttribute("aria-labelledby", titleNode.id);
+      const contentHost = node(documentRef, "div", "gf-popup-content");
+      if (content !== void 0 && content !== null) putContent(contentHost, content);
+      const retry = node(documentRef, "button", "gf-retry", "TRY AGAIN");
+      retry.type = "button";
+      append(panel, titleNode, contentHost, retry);
+      fx.append(panel);
+      setInert(shell, true);
+      tiles.querySelectorAll("button").forEach((button) => {
+        button.disabled = true;
+        button.setAttribute("aria-disabled", "true");
+      });
+      previousFocus = returnFocus || documentRef.activeElement;
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          retry.click();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = focusableIn(panel);
+        if (!focusable.length) {
+          event.preventDefault();
+          return;
+        }
+        const currentIndex = focusable.indexOf(documentRef.activeElement);
+        const nextIndex = event.shiftKey ? (currentIndex <= 0 ? focusable.length : currentIndex) - 1 : (currentIndex + 1) % focusable.length;
+        event.preventDefault();
+        focusable[nextIndex].focus();
+      };
+      panel.addEventListener("keydown", onKeyDown);
+      const onRetry = () => {
+        const canRetry = state.phase === "question" && Boolean(problem);
+        if (typeof config.onRetry === "function") config.onRetry({ problem, state: { ...state }, api });
+        closePopup();
+        if (canRetry) {
+          state.canAnswer = true;
+          updateHud();
+        }
+      };
+      retry.addEventListener("click", onRetry);
+      popup = { panel, retry, onKeyDown, onRetry };
+      retry.focus();
+      return popup;
+    }
+    function renderQuestion({ focus = true } = {}) {
+      if (state.completed >= totalQuestions) return finish();
+      const rawProblem = getProblem(problemIndex, { ...state });
+      problem = normalizeProblem(rawProblem, problemIndex);
+      prompt.textContent = problem.prompt || config.prompt || "Choose an answer.";
+      putContent(problemSlot, null);
+      renderProblem(problem, problemSlot, { state: { ...state }, config, document: documentRef, api });
+      renderTiles(problem.choices);
+      state.phase = "question";
+      state.canAnswer = true;
+      state.firstTry = state.wrongAttempts === 0;
+      partIndex = 0;
+      picks = [];
+      if (focus) prompt.focus({ preventScroll: true });
+      if (typeof config.onQuestion === "function") config.onQuestion(problem, api);
+      if (problem.parts) notifyPart({ choice: null, button: null, complete: false });
+    }
+    let tilesEnterTimer = null;
+    function renderTiles(choices, swap = false) {
+      tiles.replaceChildren();
+      tiles.dataset.count = String(choices.length);
+      tiles.classList.toggle("gf-tiles--multi", problem.multi);
+      tiles.classList.toggle("gf-tiles--swap", swap);
+      tiles.classList.add("gf-tiles--enter");
+      if (tilesEnterTimer) cancelTimer(tilesEnterTimer);
+      tilesEnterTimer = later(() => {
+        tilesEnterTimer = null;
+        tiles.classList.remove("gf-tiles--enter", "gf-tiles--swap");
+      }, 700);
+      choices.forEach((choice, index) => {
+        const button = node(documentRef, "button", "gf-tile");
+        button.type = "button";
+        button.style.setProperty("--gf-tile-i", String(index));
+        button.dataset.choiceId = choice.id;
+        button.setAttribute("aria-label", safeText(choice.ariaLabel, `Choose ${choice.label}`));
+        const content = node(documentRef, "span", "gf-answer-content");
+        button.append(content);
+        renderAnswer(choice, content, { problem, state: { ...state }, document: documentRef, api });
+        listen(button, "click", () => problem.multi ? tapMulti(choice, button) : answer(choice, button));
+        tiles.append(button);
+      });
+    }
+    function activeChoices() {
+      const part = problem && problem.parts ? problem.parts[partIndex] : null;
+      return part && part.choices ? part.choices : problem.choices;
+    }
+    function notifyPart(extra) {
+      const part = problem.parts[partIndex];
+      if (part && part.prompt) prompt.textContent = safeText(part.prompt, problem.prompt);
+      const fromRect = extra && extra.button && extra.button.getBoundingClientRect ? extra.button.getBoundingClientRect() : null;
+      if (part && part.choices && extra && extra.choice) renderTiles(part.choices, true);
+      if (typeof config.onPart === "function") {
+        config.onPart({ problem, partIndex, part: problem.parts[partIndex] || null, picks: picks.slice(), state: { ...state }, api, fromRect, ...extra });
+      }
+    }
+    function acceptPick(choice) {
+      if (typeof config.acceptPick === "function") return Boolean(config.acceptPick({ problem, partIndex, part: problem.parts[partIndex], choice, picks: picks.slice() }));
+      const part = problem.parts[partIndex];
+      const answers = Array.isArray(part.answers) ? part.answers : problem.answers;
+      return answers.includes(choice.id) && !picks.includes(choice.id);
+    }
+    function tapPart(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      if (button.dataset.found === "true" || button.dataset.muted === "true") return;
+      if (!acceptPick(choice)) {
+        settle(false, { choice, choices: [choice], button, buttons: [button] });
+        return;
+      }
+      button.dataset.found = "true";
+      button.classList.add("gf-right");
+      button.disabled = true;
+      button.setAttribute("aria-disabled", "true");
+      picks.push(choice.id);
+      partIndex += 1;
+      const complete = partIndex >= problem.parts.length;
+      if (typeof config.onFound === "function") config.onFound({ choice, button, complete, problem, state: { ...state }, api });
+      notifyPart({ choice, button, complete });
+      if (!complete) return;
+      const found = foundButtons();
+      const choices = picks.map((id) => findChoice(id));
+      settle(true, { choice, choices, button, buttons: found });
+    }
+    function findChoice(id) {
+      const pools = [problem.choices, ...(problem.parts || []).map((part) => part.choices || [])];
+      for (const pool of pools) {
+        const hit = pool.find((entry) => entry.id === id);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    function foundButtons() {
+      return Array.from(tiles.querySelectorAll("button.gf-tile")).filter((button) => button.dataset.found === "true");
+    }
+    function tapMulti(choice, button) {
+      if (problem && problem.parts) return tapPart(choice, button);
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      if (button.dataset.found === "true") return;
+      if (!problem.answers.includes(choice.id)) {
+        settle(false, { choice, choices: [choice], button, buttons: [button] });
+        return;
+      }
+      button.dataset.found = "true";
+      button.classList.add("gf-right");
+      button.disabled = true;
+      button.setAttribute("aria-disabled", "true");
+      const found = foundButtons();
+      const complete = found.length >= problem.answers.length;
+      if (typeof config.onFound === "function") config.onFound({ choice, button, complete, problem, state: { ...state }, api });
+      if (!complete) return;
+      const choices = found.map((candidate) => problem.choices.find((entry) => entry.id === candidate.dataset.choiceId));
+      settle(true, { choice, choices, button, buttons: found });
+    }
+    function answer(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      settle(choice.id === problem.answer, { choice, choices: [choice], button, buttons: [button] });
+    }
+    function settle(correct, { choice, choices, button, buttons }) {
+      state.canAnswer = false;
+      if (correct) {
+        buttons.forEach((candidate) => candidate.classList.add("gf-right"));
+        tiles.querySelectorAll("button").forEach((candidate) => {
+          candidate.disabled = true;
+        });
+        state.completed += 1;
+        state.questionsAnswered += 1;
+        state.streak += 1;
+        state.bestStreak = Math.max(state.bestStreak, state.streak);
+        state.score += Number(config.basePoints) + (config.streakBonus === false ? 0 : state.streak);
+        state.wrongAttempts = 0;
+        updateHud();
+        showToast(typeof config.praise === "function" ? config.praise({ choice, problem, state: { ...state } }) : "NICE WORK!");
+        if (typeof config.onCorrect === "function") config.onCorrect({ choice, choices, problem, button, buttons, state: { ...state }, api });
+        const currentIndex = problemIndex;
+        problemIndex += 1;
+        const delay = typeof config.advanceMs === "function" ? config.advanceMs({ state: { ...state }, problem }) : config.advanceMs;
+        advanceTimer = later(() => {
+          advanceTimer = null;
+          if (currentIndex !== problemIndex - 1 || destroyed) return;
+          if (state.completed >= totalQuestions) finish();
+          else renderQuestion();
+          if (typeof config.onAdvance === "function") config.onAdvance({ state: { ...state }, api });
+        }, Math.max(0, Number(delay) || 0));
+      } else {
+        const firstTry = state.firstTry;
+        buttons.forEach((candidate) => candidate.classList.add("gf-wrong"));
+        state.wrongAttempts += 1;
+        state.streak = 0;
+        state.firstTry = false;
+        updateHud();
+        if (typeof config.onWrong === "function") config.onWrong({ choice, choices, problem, button, buttons, state: { ...state, firstTry }, api });
+        const teaching = state.wrongAttempts >= 2;
+        const title = teaching ? typeof config.teachingTitle === "function" ? config.teachingTitle({ problem, state: { ...state } }) : "LET’S WORK IT OUT TOGETHER" : typeof config.firstMissTitle === "function" ? config.firstMissTitle({ problem, state: { ...state } }) : "TAKE ANOTHER LOOK";
+        const content = teaching ? typeof config.renderTeaching === "function" ? config.renderTeaching(problem, { choices, state: { ...state }, document: documentRef, api }) : "Your teaching explanation goes here." : typeof config.renderFirstMiss === "function" ? config.renderFirstMiss(problem, { choices, state: { ...state }, document: documentRef, api }) : null;
+        openPopup({ kind: teaching ? "teaching" : "cue", title, content, returnFocus: button });
+      }
+    }
+    function startFresh() {
+      closePopup(false);
+      cancelAllTimers();
+      state.phase = "question";
+      state.score = 0;
+      state.streak = 0;
+      state.bestStreak = 0;
+      state.questionsAnswered = 0;
+      state.completed = 0;
+      state.canAnswer = false;
+      state.firstTry = true;
+      state.wrongAttempts = 0;
+      problemIndex = 0;
+      problem = null;
+      shell.classList.remove("gf-hidden");
+      startScreen.classList.add("gf-hidden");
+      endScreen.classList.add("gf-hidden");
+      setInert(startScreen, true);
+      setInert(endScreen, true);
+      setInert(shell, false);
+      updateHud();
+      renderQuestion();
+      if (typeof config.onStart === "function") config.onStart({ state: { ...state }, api });
+    }
+    function finish() {
+      if (destroyed) return;
+      cancelTimer(advanceTimer);
+      advanceTimer = null;
+      closePopup(false);
+      state.phase = "end";
+      state.canAnswer = false;
+      shell.classList.add("gf-hidden");
+      setInert(shell, true);
+      endLine.textContent = typeof config.endMessage === "function" ? config.endMessage({ state: { ...state } }) : `You completed ${state.completed} question${state.completed === 1 ? "" : "s"}.`;
+      stats.replaceChildren();
+      [["Score", state.score], ["Best streak", state.bestStreak], ["Questions", state.completed]].forEach(([label, value]) => {
+        const stat = node(documentRef, "div", "gf-stat", label);
+        stat.prepend(node(documentRef, "b", null, value));
+        stats.append(stat);
+      });
+      endExtra.replaceChildren();
+      if (typeof config.renderEnd === "function") config.renderEnd(endExtra, { state: { ...state }, document: documentRef, api });
+      endScreen.classList.remove("gf-hidden");
+      setInert(endScreen, false);
+      againButton.focus({ preventScroll: true });
+      updateHud();
+      if (typeof config.onEnd === "function") config.onEnd({ state: { ...state }, api });
+    }
+    function toggleSound() {
+      state.muted = !state.muted;
+      soundButton.textContent = state.muted ? "🔇" : "🔊";
+      soundButton.setAttribute("aria-pressed", state.muted ? "true" : "false");
+      soundButton.setAttribute("aria-label", state.muted ? "Sound off. Turn sound on" : "Sound on. Turn sound off");
+      if (typeof config.onSoundToggle === "function") config.onSoundToggle(state.muted, { state: { ...state }, api });
+    }
+    const api = {
+      root,
+      state,
+      get problem() {
+        return problem;
+      },
+      get problemIndex() {
+        return problemIndex;
+      },
+      get partIndex() {
+        return partIndex;
+      },
+      get picks() {
+        return picks.slice();
+      },
+      get choices() {
+        return activeChoices();
+      },
+      start: startFresh,
+      answer(choiceId) {
+        const button = Array.from(tiles.querySelectorAll("button")).find((candidate) => candidate.dataset.choiceId === String(choiceId));
+        button?.click();
+      },
+      finish,
+      closePopup,
+      renderQuestion,
+      updateHud,
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        cancelAllTimers();
+        closePopup(false);
+        listeners.splice(0).forEach((remove) => remove());
+        root.replaceChildren();
+        root.classList.remove("game-frame", "game-frame--standard");
+        root.removeAttribute("role");
+        root.removeAttribute("aria-label");
+        if (typeof config.onDestroy === "function") config.onDestroy({ state: { ...state } });
+      }
+    };
+    listen(startButton, "click", startFresh);
+    listen(againButton, "click", startFresh);
+    listen(soundButton, "click", toggleSound);
+    setInert(startScreen, false);
+    setInert(shell, true);
+    setInert(endScreen, true);
+    return api;
+  }
+  function renderDefaultStartExample(host, documentRef) {
+    const label = node(documentRef, "p", "gf-example-label", "STARTER EXAMPLE");
+    const body = node(documentRef, "p", "gf-example-body", "Replace this example with the lesson introduction.");
+    append(host, label, body);
+  }
+  function renderDefaultProblem(problem, host, documentRef) {
+    const label = node(documentRef, "p", "gf-sample-kicker", "ADAPTER SLOT");
+    const title = node(documentRef, "h4", "gf-sample-title", problem.title || "Lesson content goes here");
+    const detail = node(documentRef, "p", "gf-sample-detail", problem.detail || "Render the lesson-specific problem in this card.");
+    append(host, label, title, detail);
+  }
+  function toKebab(value) {
+    return String(value).replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+  }
+  global.GameFrameStarter = Object.freeze({ mount: mount2, DEFAULT_PROBLEMS });
+})(globalThis);
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+function checkGenerator(game2, { count = 500, seed = 1, choiceCounts = [3, 4] } = {}) {
+  const rng = createRng(seed);
+  const errors = [];
+  const seenParams = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i += 1) {
+    let params;
+    let problem;
+    try {
+      params = game2.generate(rng);
+      problem = game2.build(params, rng);
+    } catch (e) {
+      errors.push(`#${i}: threw ${e.message}`);
+      continue;
+    }
+    const tag = `#${i} ${JSON.stringify(params)}`;
+    if (JSON.stringify(JSON.parse(JSON.stringify(params))) !== JSON.stringify(params)) errors.push(`${tag}: params must be JSON-safe`);
+    if (!problem || typeof problem !== "object") {
+      errors.push(`${tag}: build returned nothing`);
+      continue;
+    }
+    if (JSON.stringify(problem.params) !== JSON.stringify(params)) errors.push(`${tag}: problem.params must equal the input params`);
+    const validateStep = (step, label, requireValue = false) => {
+      if (typeof step?.prompt !== "string" || !step.prompt.trim()) errors.push(`${tag}: ${label} prompt must be non-empty text`);
+      const choices = step?.choices;
+      if (!Array.isArray(choices) || !choiceCounts.includes(choices.length)) errors.push(`${tag}: ${label} expected ${choiceCounts.join(" or ")} choices, got ${choices && choices.length}`);
+      else {
+        const ids = choices.map((c) => c && c.id);
+        const labels = choices.map((c) => c && String(c.label));
+        if (new Set(ids).size !== ids.length) errors.push(`${tag}: ${label} choice ids must be unique`);
+        if (new Set(labels).size !== labels.length) errors.push(`${tag}: ${label} choice labels must be unique (${labels.join(" | ")})`);
+        if (!ids.includes(step.answer)) errors.push(`${tag}: ${label} answer ${step.answer} is not a choice id`);
+        if (choices.some((c) => !c || c.label == null)) errors.push(`${tag}: ${label} every choice needs a label`);
+        if (requireValue && choices.some((c) => typeof c?.value !== "number" || !Number.isFinite(c.value))) errors.push(`${tag}: ${label} every choice needs a finite numeric value`);
+      }
+    };
+    if (problem.steps) {
+      if (!Array.isArray(problem.steps) || problem.steps.length === 0) errors.push(`${tag}: steps must be a non-empty array`);
+      else {
+        const keys = problem.steps.map((step) => step && step.key);
+        if (keys.some((key) => typeof key !== "string" || !key)) errors.push(`${tag}: every step needs a key`);
+        if (new Set(keys).size !== keys.length) errors.push(`${tag}: step keys must be unique`);
+        problem.steps.forEach((step, index) => validateStep(step, `step ${index + 1}`, true));
+      }
+    } else {
+      validateStep(problem, "problem");
+    }
+    if (game2.ranges) {
+      for (const [k, [min, max]] of Object.entries(game2.ranges)) {
+        const v = params[k];
+        if (typeof v !== "number" || v < min || v > max) errors.push(`${tag}: ${k}=${v} outside [${min}, ${max}]`);
+      }
+    }
+    if (typeof game2.check === "function") {
+      for (const msg of game2.check(problem) || []) errors.push(`${tag}: ${msg}`);
+    }
+    const again = game2.build(JSON.parse(JSON.stringify(params)), createRng(seed + i));
+    const answerLabels = (p) => (p.steps || [p]).map((step) => step.choices.find((c) => c.id === step.answer)?.label);
+    if (JSON.stringify(answerLabels(again)) !== JSON.stringify(answerLabels(problem))) errors.push(`${tag}: rebuilding from params changed the correct answer`);
+    seenParams.add(JSON.stringify(params));
+  }
+  return { count, distinct: seenParams.size, errors };
+}
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+const ROWS = Object.freeze([2, 5]);
+const EACH = Object.freeze([2, 10]);
+const MAX_TOTAL = 40;
+const CHECK_ROWS = Object.freeze([2, 8]);
+const CHECK_TOTAL = 42;
+const FORMS = Object.freeze(["match", "model", "fill"]);
+const ROLES = Object.freeze(["each", "total", "rows"]);
+const TIMES = "×";
+const UNKNOWN = "?";
+const PROMPTS = Object.freeze({
+  // Tap adaptation of "Circle the equation that matches the situation."
+  match: "Choose the equation that matches the situation.",
+  // SE p. 67, verbatim (Show What You Know p. 10 has the same ask).
+  model: "Write a multiplication equation to represent the problem. Use a ? for the unknown value.",
+  // Minilessons p. 18, verbatim.
+  fill: "Write an equation that represents each situation, using a ? symbol for the unknown number.",
+  // SE p. 65, second sentence of the equation-then-answer stem.
+  unknown: "Then determine the unknown value."
+});
+const ROW_LABELS = Object.freeze({ equation: "equation:", unknown: "unknown:" });
+const UNIT = "stickers";
+const CONTAINER = "sticker book";
+const NAMES = Object.freeze(["Han", "Clare", "Jada", "Mai", "Noah", "Priya", "Diego", "Elena", "Kiran", "Tyler"]);
+const STORIES = Object.freeze({
+  // Bank story patterns (Minilessons p. 17, SE pp. 63 and 67).
+  collection: { role: "each", text: "{w} has a collection of {n} {w} set up in an array. There are {n} rows. How many {w} are in each row?", args: (p) => [p.name, p.total, UNIT, p.rows, UNIT] },
+  equalRows: { role: "each", text: "There are {n} {w} set up in {n} equal rows. How many {w} are in each row?", args: (p) => [p.total, UNIT, p.rows, UNIT] },
+  rowsIn: { role: "each", text: "There are {n} rows of {w} in a {w}. The {w} has {n} {w} in it. If each row has the same number of {w}, how many {w} are in each row?", args: (p) => [p.rows, UNIT, CONTAINER, CONTAINER, p.total, UNIT, UNIT, UNIT] },
+  bookRows: { role: "total", text: "A {w} has {n} rows of {w} with {n} {w} in each row. How many {w} are in the {w}?", args: (p) => [CONTAINER, p.rows, UNIT, p.each, UNIT, UNIT, CONTAINER] },
+  arrayPlace: { role: "rows", text: "There are {n} {w} set up in an array in a {w}. There are {n} {w} in each row. How many rows of {w} are there?", args: (p) => [p.total, UNIT, CONTAINER, p.each, UNIT, UNIT] },
+  // Theme adaptations of Minilessons p. 18 items 3-6 and Show What You Know
+  // p. 10 (allowlisted in test/copy-check.allow.json).
+  columns: { role: "total", text: "A page of {w} is arranged into {n} rows and {n} columns. How many {w} are there on the page?", args: (p) => [UNIT, p.rows, p.each, UNIT] },
+  arrayEach: { role: "rows", text: "There are {n} {w} arranged in an array. There are {n} {w} in each row. How many rows are there?", args: (p) => [p.total, UNIT, p.each, UNIT] },
+  rowsBook: { role: "total", text: "There are {n} rows of {w} in a {w} with {n} {w} in each row. How many {w} are in the {w}?", args: (p) => [p.rows, UNIT, CONTAINER, p.each, UNIT, UNIT, CONTAINER] },
+  arrangedRows: { role: "each", text: "There are {n} {w} arranged in an array. There are {n} rows of {w}. How many {w} are in each row?", args: (p) => [p.total, UNIT, p.rows, UNIT, UNIT] },
+  stored: { role: "each", text: "{w} has {n} {w} stored in a {w}. The {w} has {n} equal rows of slots for {w}. How many slots are in each row?", args: (p) => [p.name, p.total, UNIT, CONTAINER, CONTAINER, p.rows, UNIT], unit: "slots" }
+});
+const RANDOM_STORIES = Object.freeze({
+  each: ["collection", "equalRows", "rowsIn"],
+  total: ["bookRows"],
+  rows: ["arrayPlace"]
+});
+function fillTemplate(text, args) {
+  let i = 0;
+  return text.replace(/\{[nw]\}/g, () => String(args[i++]));
+}
+const eqId = (label) => `e:${label}`;
+const numId = (n) => `n:${n}`;
+const tokId = (t) => `t:${t}`;
+const equation = (a, b, c) => `${a} ${TIMES} ${b} = ${c}`;
+const plusEquation = (a, b, c) => `${a} + ${b} = ${c}`;
+function shuffleWith(rng, list) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = rng.int(0, i);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+function permutation(rng, n) {
+  return shuffleWith(rng, Array.from({ length: n }, (_, i) => i));
+}
+function applyOrder(list, order) {
+  return order.map((i) => list[i]);
+}
+function values(params) {
+  const { rows, each, role } = params;
+  const total = rows * each;
+  const unknown = role === "each" ? each : role === "rows" ? rows : total;
+  return { rows, each, total, unknown };
+}
+function targetEquation(params) {
+  const { rows, each, total } = values(params);
+  if (params.role === "each") return equation(rows, UNKNOWN, total);
+  if (params.role === "rows") return equation(UNKNOWN, each, total);
+  return equation(rows, each, UNKNOWN);
+}
+function trueEquation(params) {
+  const { rows, each, total } = values(params);
+  return equation(rows, each, total);
+}
+function matchDistractors(params) {
+  const { rows, each, total } = values(params);
+  if (params.role === "total") return [equation(rows, UNKNOWN, total), equation(UNKNOWN, each, total), equation(rows, UNKNOWN, each)];
+  if (params.role === "each") return [equation(each, total, UNKNOWN), equation(rows, UNKNOWN, each), equation(total, rows, UNKNOWN)];
+  return [equation(rows, total, UNKNOWN), equation(UNKNOWN, each, rows), equation(total, each, UNKNOWN)];
+}
+function modelDistractors(params) {
+  const { rows, each, total } = values(params);
+  if (params.role === "each") return [equation(rows, total, UNKNOWN), plusEquation(rows, UNKNOWN, total), equation(UNKNOWN, total, rows)];
+  if (params.role === "rows") return [equation(each, total, UNKNOWN), plusEquation(UNKNOWN, each, total), equation(UNKNOWN, total, each)];
+  return [equation(rows, UNKNOWN, total), plusEquation(rows, each, UNKNOWN), equation(UNKNOWN, each, total)];
+}
+function unknownDistractors(params) {
+  const { rows, each, total, unknown } = values(params);
+  const candidates = params.role === "each" ? [rows, total, each + 1, each - 1, each + 2] : params.role === "rows" ? [each, total, rows + 1, rows - 1, rows + 2] : [rows + each, total + each, total - each, total + rows, total - rows, total + 1, total - 1, total * 2];
+  const out = [];
+  for (const n of candidates) {
+    if (n >= 1 && n !== unknown && !out.includes(n)) out.push(n);
+    if (out.length === 3) break;
+  }
+  return out;
+}
+function fillTokens(params) {
+  const { rows, each, total } = values(params);
+  const out = [];
+  const push = (t) => {
+    if (!out.includes(t) && (t === UNKNOWN || t >= 1)) out.push(t);
+  };
+  [rows, each, total, UNKNOWN, rows + each, total + each, total - each, total + rows, each + 1, rows + 1, total + 1, total * 2].forEach((t) => {
+    if (out.length < 6) push(t);
+  });
+  return out;
+}
+function generate(rng) {
+  return generateForm(rng, FORMS[rng.int(0, FORMS.length - 1)]);
+}
+function pickSituation(rng, role) {
+  for (; ; ) {
+    const rows = rng.int(ROWS[0], ROWS[1]);
+    const each = rng.int(EACH[0], EACH[1]);
+    if (rows * each > MAX_TOTAL) continue;
+    if (role !== "total" && rows === each) continue;
+    return { rows, each };
+  }
+}
+function generateForm(rng, form, role) {
+  const chosenRole = role || ROLES[rng.int(0, ROLES.length - 1)];
+  const { rows, each } = pickSituation(rng, chosenRole);
+  const stories = RANDOM_STORIES[chosenRole];
+  const story = stories[rng.int(0, stories.length - 1)];
+  const name = rng.int(0, NAMES.length - 1);
+  const base = { form, role: chosenRole, rows, each, story, name };
+  if (form === "match") return { ...base, order: permutation(rng, 4) };
+  if (form === "model") return { ...base, layout: "split", order: permutation(rng, 4), order2: permutation(rng, 4) };
+  if (form === "fill") {
+    const given = chosenRole === "total" ? rng.chance(0.5) ? ["f1"] : [] : ["prod"];
+    return { ...base, given, unknown: false, order: permutation(rng, 6) };
+  }
+  throw new Error(`unknown form ${form}`);
+}
+const eqChoice = (label, correct) => ({ id: eqId(label), label, kind: "eq", correct });
+const numChoice = (n, correct) => ({ id: numId(n), label: String(n), kind: "num", correct, value: n });
+const tokChoice = (t, correct) => ({ id: tokId(t), label: String(t), kind: "tok", correct, value: t === UNKNOWN ? -1 : t });
+function storyText(params) {
+  const spec = STORIES[params.story];
+  if (!spec) throw new Error(`unknown story ${params.story}`);
+  const v = values(params);
+  return fillTemplate(spec.text, spec.args({ ...v, name: NAMES[params.name ?? 0] }));
+}
+function unitFor(params) {
+  if (params.role === "rows") return "rows";
+  return STORIES[params.story]?.unit || UNIT;
+}
+function common(params) {
+  const v = values(params);
+  return {
+    params,
+    form: params.form,
+    role: params.role,
+    rows: v.rows,
+    each: v.each,
+    total: v.total,
+    unknown: v.unknown,
+    unit: unitFor(params),
+    story: storyText(params),
+    target: targetEquation(params),
+    solved: trueEquation(params)
+  };
+}
+function matchProblem(params) {
+  const target = targetEquation(params);
+  const base = [eqChoice(target, true), ...matchDistractors(params).map((d) => eqChoice(d, false))];
+  const choices = applyOrder(base, params.order);
+  return { ...common(params), prompt: PROMPTS.match, choices, answer: eqId(target) };
+}
+function modelProblem(params) {
+  const target = targetEquation(params);
+  const v = values(params);
+  const eqs = applyOrder([eqChoice(target, true), ...modelDistractors(params).map((d) => eqChoice(d, false))], params.order);
+  const nums = applyOrder([numChoice(v.unknown, true), ...unknownDistractors(params).map((n) => numChoice(n, false))], params.order2);
+  return {
+    ...common(params),
+    layout: params.layout || "split",
+    modeled: Boolean(params.modeled),
+    prompt: PROMPTS.model,
+    choices: eqs,
+    answer: eqId(target),
+    parts: [
+      { kind: "eq", prompt: PROMPTS.model },
+      { kind: "num", prompt: PROMPTS.unknown, choices: nums }
+    ],
+    multi: true
+  };
+}
+function scaffold(params) {
+  const v = values(params);
+  const spec = params.role === "each" ? { f1: v.rows, f2: UNKNOWN, prod: v.total } : params.role === "rows" ? { f1: UNKNOWN, f2: v.each, prod: v.total } : { f1: v.rows, f2: v.each, prod: UNKNOWN };
+  const given = params.given || [];
+  let part = 0;
+  const slot = (key) => given.includes(key) ? { type: "fixed", key, text: String(spec[key]) } : { type: "blank", key, part: part++, value: spec[key] };
+  const slots = [slot("f1"), { type: "times" }, slot("f2"), { type: "equals" }, slot("prod")];
+  return { slots, blanks: part, spec };
+}
+function fillProblem(params) {
+  const v = values(params);
+  if (["rows", "each", "total"].includes(params.role)) {
+    const choices2 = [numChoice(v.unknown, true), ...unknownDistractors(params).map((n) => numChoice(n, false))];
+    const ordered = applyOrder(choices2, params.order2 || [1, 0, 3, 2]);
+    const unknownKey = params.role === "rows" ? "f1" : params.role === "each" ? "f2" : "prod";
+    const { slots: slots2 } = scaffold({ ...params, given: ["f1", "f2", "prod"].filter((key) => key !== unknownKey) });
+    return {
+      ...common(params),
+      solveUnknown: true,
+      picture: "array",
+      prompt: params.role === "rows" ? "How many rows are there?" : params.role === "each" ? "How many stickers are in each row?" : "How many stickers are there in all?",
+      choices: ordered,
+      answer: numId(v.unknown),
+      parts: [{ kind: "num" }],
+      multi: true,
+      slots: slots2
+    };
+  }
+  const { slots, blanks } = scaffold(params);
+  const tokens = fillTokens(params);
+  const order = params.order.length === tokens.length ? params.order : tokens.map((_, i) => i);
+  const choices = applyOrder(tokens.map((t) => tokChoice(t, false)), order);
+  const parts = Array.from({ length: blanks }, () => ({ kind: "tok", prompt: PROMPTS.fill }));
+  if (params.unknown) {
+    const nums = applyOrder([numChoice(v.unknown, true), ...unknownDistractors(params).map((n) => numChoice(n, false))], params.order2 || [0, 1, 2, 3]);
+    parts.push({ kind: "num", prompt: PROMPTS.unknown, choices: nums, unknownRow: true });
+  }
+  const problem = {
+    ...common(params),
+    picture: params.unknown ? "array" : "cover",
+    prompt: PROMPTS.fill,
+    choices,
+    parts,
+    slots,
+    multi: true
+  };
+  const accepted = /* @__PURE__ */ new Set();
+  const walk = (index, picks) => {
+    if (index >= blanks) return;
+    acceptable(problem, index, picks).forEach((id) => {
+      accepted.add(id);
+      walk(index + 1, [...picks, id]);
+    });
+  };
+  walk(0, []);
+  problem.choices.forEach((c) => {
+    c.correct = accepted.has(c.id);
+  });
+  problem.answer = acceptable(problem, 0, [])[0];
+  return problem;
+}
+function partPrompt(problem, partIndex, picks = []) {
+  if (problem.solveUnknown) return problem.prompt;
+  if (problem.form !== "fill") return problem.parts?.[partIndex]?.prompt || problem.prompt;
+  const blanks = problem.slots.filter((slot) => slot.type === "blank");
+  if (partIndex >= blanks.length) return PROMPTS.unknown;
+  const role = problem.role === "rows" ? "number of rows" : problem.role === "each" ? "number in each row" : "total number of stickers";
+  const ids = acceptable(problem, partIndex, picks);
+  if (ids.length === 1 && ids[0] === tokId(UNKNOWN)) {
+    return `Choose ? for the ${role}. You are writing the equation.`;
+  }
+  return `Complete the equation. Use ? for the ${role}, and use the known numbers from the story.`;
+}
+function acceptable(problem, partIndex, picks = []) {
+  if (problem.solveUnknown) return [numId(problem.unknown)];
+  if (problem.form === "model") {
+    return partIndex === 0 ? [eqId(problem.target)] : [numId(problem.unknown)];
+  }
+  if (problem.form !== "fill") return [problem.answer];
+  const blankSlots = problem.slots.filter((s) => s.type === "blank");
+  if (partIndex >= blankSlots.length) return [numId(problem.unknown)];
+  const slot = blankSlots[partIndex];
+  if (slot.key === "prod") return [tokId(slot.value)];
+  const other = blankSlots.find((s) => s.key !== slot.key && s.key !== "prod");
+  if (!other) return [tokId(slot.value)];
+  const first = blankSlots.indexOf(other) < blankSlots.indexOf(slot) ? other : slot;
+  if (slot === first) {
+    const both = [tokId(slot.value), tokId(other.value)];
+    return both.filter((id, i) => both.indexOf(id) === i);
+  }
+  const used = picks[blankSlots.indexOf(first)];
+  const remaining = used === tokId(slot.value) ? other.value : slot.value;
+  return [tokId(remaining)];
+}
+function build(params) {
+  if (["match", "model", "fill"].includes(params.form)) return fillProblem(params);
+  if (params.form === "match") return matchProblem(params);
+  if (params.form === "model") return modelProblem(params);
+  if (params.form === "fill") return fillProblem(params);
+  throw new Error(`unknown form ${params?.form}`);
+}
+function walkParts(problem, partIndex, picks, errors) {
+  if (!problem.parts || partIndex >= problem.parts.length) return;
+  const ids = acceptable(problem, partIndex, picks);
+  const part = problem.parts[partIndex];
+  const pool = part.choices || problem.choices;
+  if (!ids.length) errors.push(`${problem.form} part ${partIndex} has no accepted answer`);
+  ids.forEach((id) => {
+    const choice = pool.find((c) => c.id === id);
+    if (!choice) errors.push(`${problem.form} part ${partIndex} accepts ${id} which is not a choice`);
+    else if (choice.kind !== part.kind) errors.push(`${problem.form} part ${partIndex} accepts the wrong kind`);
+    else if (!choice.correct) errors.push(`${problem.form} part ${partIndex} accepts a distractor`);
+    walkParts(problem, partIndex + 1, [...picks, id], errors);
+  });
+}
+function checkGrid(choices, errors, label) {
+  if (new Set(choices.map((c) => c.id)).size !== choices.length) errors.push(`${label} choices must be distinct`);
+  if (new Set(choices.map((c) => c.label)).size !== choices.length) errors.push(`${label} labels must be distinct`);
+}
+function check(problem) {
+  const errors = [];
+  const { rows, each, total } = problem;
+  if (rows < CHECK_ROWS[0] || rows > CHECK_ROWS[1]) errors.push(`rows ${rows} outside range`);
+  if (each < EACH[0] || each > EACH[1]) errors.push(`each ${each} outside range`);
+  if (total > CHECK_TOTAL) errors.push(`total ${total} above ${CHECK_TOTAL}`);
+  if (!ROLES.includes(problem.role)) errors.push(`unknown role ${problem.role}`);
+  if (STORIES[problem.params.story]?.role !== problem.role) errors.push("story must match the unknown role");
+  if (!problem.story || /\{[nw]\}|undefined/.test(problem.story)) errors.push("story must be filled in");
+  const otherOrder = problem.role === "each" ? equation(UNKNOWN, rows, total) : problem.role === "rows" ? equation(each, UNKNOWN, total) : equation(each, rows, UNKNOWN);
+  if (problem.solveUnknown) {
+    if (problem.parts.length !== 1 || problem.answer !== numId(problem.unknown)) errors.push("direct unknown answer must match the story");
+    checkGrid(problem.choices, errors, "unknown solving");
+    walkParts(problem, 0, [], errors);
+  } else if (problem.form === "match") {
+    if (problem.choices.length !== 4) errors.push("match needs four equations");
+    if (problem.choices.filter((c) => c.correct).length !== 1) errors.push("match needs one correct equation");
+    if (problem.choices.some((c) => !c.correct && (c.label === problem.target || c.label === otherOrder))) errors.push("match distractor represents the situation");
+    checkGrid(problem.choices, errors, "match");
+  } else if (problem.form === "model") {
+    if (problem.choices.length !== 4) errors.push("model needs four equations");
+    if (problem.parts.length !== 2) errors.push("model needs two parts");
+    const nums = problem.parts[1].choices;
+    if (nums.length !== 4) errors.push("model needs four numbers");
+    if (nums.filter((c) => c.correct).length !== 1 || !nums.some((c) => c.correct && c.value === problem.unknown)) errors.push("model unknown must be the one correct number");
+    if (problem.choices.some((c) => !c.correct && (c.label === problem.target || c.label === otherOrder))) errors.push("model distractor represents the situation");
+    checkGrid(problem.choices, errors, "model equations");
+    checkGrid(nums, errors, "model numbers");
+    walkParts(problem, 0, [], errors);
+  } else if (problem.form === "fill") {
+    if (problem.choices.length !== 6) errors.push("fill needs six tokens");
+    const blanks = problem.slots.filter((s) => s.type === "blank").length;
+    const expected = blanks + (problem.params.unknown ? 1 : 0);
+    if (problem.parts.length !== expected) errors.push(`fill needs ${expected} parts`);
+    if (!problem.choices.some((c) => c.label === UNKNOWN)) errors.push("fill grid needs the ? token");
+    if (!problem.slots.some((s) => s.type === "blank" && s.value === UNKNOWN)) errors.push("fill scaffold must leave the ? blank");
+    checkGrid(problem.choices, errors, "fill");
+    if (problem.params.unknown) checkGrid(problem.parts[problem.parts.length - 1].choices, errors, "fill numbers");
+    walkParts(problem, 0, [], errors);
+  } else {
+    errors.push(`unknown form ${problem.form}`);
+  }
+  if (problem.solved !== equation(rows, each, total)) errors.push("solved equation must be rows × each = total");
+  return errors;
+}
+function identity(params) {
+  return `${params.role}:${params.rows}x${params.each}`;
+}
+const BETA_PLAN = Object.freeze([
+  { form: "model", role: "each", rows: 4, each: 10, story: "collection", name: 0, layout: "split", modeled: true, order: [1, 0, 3, 2], order2: [2, 0, 1, 3] },
+  { form: "match", role: "total", rows: 8, each: 5, story: "bookRows", name: 0, order: [1, 2, 3, 0] },
+  { form: "match", role: "each", rows: 5, each: 4, story: "equalRows", name: 0, order: [1, 2, 0, 3] },
+  { form: "fill", role: "total", rows: 4, each: 5, story: "columns", name: 0, given: ["f1"], unknown: false, order: [4, 0, 3, 1, 5, 2] },
+  { form: "fill", role: "rows", rows: 2, each: 8, story: "arrayEach", name: 0, given: ["prod"], unknown: false, order: [2, 5, 0, 4, 1, 3] },
+  { form: "fill", role: "total", rows: 2, each: 7, story: "rowsBook", name: 0, given: [], unknown: true, order: [3, 1, 4, 0, 2, 5], order2: [1, 3, 0, 2] },
+  { form: "model", role: "each", rows: 3, each: 5, story: "arrangedRows", name: 0, layout: "stacked", order: [2, 0, 1, 3], order2: [0, 2, 3, 1] },
+  { form: "model", role: "each", rows: 3, each: 10, story: "stored", name: 1, layout: "split", order: [3, 1, 0, 2], order2: [1, 0, 3, 2] }
+]);
+function sessionQuestions(rng, { fixed = BETA_PLAN, randomCount = 2 } = {}) {
+  const seen = /* @__PURE__ */ new Set();
+  const questions = [];
+  const add = (params) => {
+    const id = identity(params);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    questions.push(build(params));
+    return true;
+  };
+  fixed.forEach((params) => add(params));
+  let guard = 0;
+  let added = 0;
+  while (added < randomCount && guard < 500) {
+    guard += 1;
+    if (add(generate(rng))) added += 1;
+  }
+  return questions;
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  BETA_PLAN,
+  CHECK_ROWS,
+  CHECK_TOTAL,
+  CONTAINER,
+  EACH,
+  FORMS,
+  MAX_TOTAL,
+  NAMES,
+  PROMPTS,
+  RANDOM_STORIES,
+  ROLES,
+  ROWS,
+  ROW_LABELS,
+  STORIES,
+  TIMES,
+  UNIT,
+  UNKNOWN,
+  acceptable,
+  build,
+  check,
+  eqId,
+  equation,
+  fillTemplate,
+  fillTokens,
+  generate,
+  generateForm,
+  identity,
+  matchDistractors,
+  modelDistractors,
+  numId,
+  partPrompt,
+  pickSituation,
+  plusEquation,
+  scaffold,
+  sessionQuestions,
+  targetEquation,
+  tokId,
+  trueEquation,
+  unknownDistractors,
+  values
+}, Symbol.toStringTag, { value: "Module" }));
+const THEME = Object.freeze({
+  key: "sticker_album",
+  title: "ARRAY CLUES",
+  worldName: "Sticker Album",
+  subtitle: "Read the clues, count the array, find the mystery number.",
+  tag: "ML 1.10 · ARRAY SITUATIONS AND EQUATIONS",
+  startIcon: "?",
+  endIcon: "★",
+  endTitle: "EVERY CLUE SOLVED!",
+  // Countable unit noun, used in accessible descriptions and help copy.
+  unit: "sticker",
+  units: "stickers",
+  // Shell palette. The dark blue ink keeps the shared frame's outline rule.
+  palette: Object.freeze({
+    bgA: "#6B3FA0",
+    bgB: "#2A1E5C",
+    bgMid: "#4D5FD0",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#4D9DE0",
+    picture: "#F3F6FF",
+    pictureAlt: "#fffdf4",
+    page: "#FFFFFF",
+    pageLine: "#DCE3F7",
+    sticker: "#FFD45A",
+    stickerAlt: "#6BCBFF",
+    stickerThird: "#FF8FAB",
+    stickerInk: "#13213F"
+  }),
+  // Three sticker shapes cycle across an array so a row still reads as one
+  // row: every unit is the same size on the same page grid.
+  shapes: Object.freeze(["star", "circle", "diamond"]),
+  // Celebration pieces that fall on a streak tier.
+  confettiColors: Object.freeze(["#FFD45A", "#6BCBFF", "#FF8FAB", "#B28DFF", "#37C8C5", "#F29B38"]),
+  praise: Object.freeze(["NICE!", "YES!", "GOT IT!", "GREAT JOB!", "WELL DONE!", "YOU DID IT!"])
+});
+function cssVariables(theme = THEME) {
+  const out = {};
+  for (const [key, value] of Object.entries(theme.palette)) {
+    out[`--af-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`] = value;
+  }
+  return out;
+}
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+  return node;
+}
+function starPoints(cx, cy, outer, inner) {
+  const points = [];
+  for (let i = 0; i < 10; i += 1) {
+    const radius = i % 2 === 0 ? outer : inner;
+    const angle = Math.PI / 5 * i - Math.PI / 2;
+    points.push(`${(cx + radius * Math.cos(angle)).toFixed(2)},${(cy + radius * Math.sin(angle)).toFixed(2)}`);
+  }
+  return points.join(" ");
+}
+function stickerSvg(shape = "star", { size = 40, color } = {}) {
+  const { palette } = THEME;
+  const fill = color || { star: palette.sticker, circle: palette.stickerAlt, diamond: palette.stickerThird }[shape] || palette.sticker;
+  const root = svg("svg", { viewBox: "0 0 40 40", width: size, height: size, "aria-hidden": "true", focusable: "false", class: `af-sticker af-sticker--${shape}` });
+  root.append(svg("rect", { x: 2, y: 2, width: 36, height: 36, rx: 8, fill: "#fff", stroke: palette.stickerInk, "stroke-width": 2.5 }));
+  if (shape === "star") {
+    root.append(svg("polygon", { points: starPoints(20, 21, 13, 5.6), fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+  } else if (shape === "circle") {
+    root.append(svg("circle", { cx: 20, cy: 20, r: 11.5, fill, stroke: palette.stickerInk, "stroke-width": 2 }));
+    root.append(svg("circle", { cx: 16, cy: 16, r: 3, fill: "#fff", opacity: 0.85 }));
+  } else {
+    root.append(svg("polygon", { points: "20,7 33,20 20,33 7,20", fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+    root.append(svg("polygon", { points: "20,12 27,20 20,22 13,20", fill: "#fff", opacity: 0.55 }));
+  }
+  return root;
+}
+function shapeFor(rowIndex, colIndex) {
+  return THEME.shapes[rowIndex % THEME.shapes.length];
+}
+function arrayLabel(rows, cols) {
+  return `${rows} rows of ${cols} ${THEME.units}, ${rows * cols} in all`;
+}
+function fillGrid(grid, rows, cols, shapeAt = shapeFor) {
+  grid.replaceChildren();
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const cell = document.createElement("span");
+      cell.className = "af-cell";
+      cell.style.setProperty("--af-r", r);
+      cell.style.setProperty("--af-c", c);
+      cell.style.setProperty("--af-i", r * cols + c);
+      const shape = shapeAt(r, c);
+      cell.dataset.shape = shape;
+      cell.append(stickerSvg(shape));
+      grid.append(cell);
+    }
+  }
+}
+function arrayDisplay(rows, cols, { size = "card", braces = false, peel = false, label, shapeAt = shapeFor } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = `af-array af-array--${size}${braces ? " af-array--braced" : ""}${peel ? " af-array--peel" : ""}`;
+  wrap.setAttribute("role", "img");
+  wrap.setAttribute("aria-label", label || arrayLabel(rows, cols));
+  wrap.style.setProperty("--af-rows", rows);
+  wrap.style.setProperty("--af-cols", cols);
+  wrap.dataset.rows = String(rows);
+  wrap.dataset.cols = String(cols);
+  const page = document.createElement("div");
+  page.className = "af-page";
+  const grid = document.createElement("div");
+  grid.className = "af-grid";
+  fillGrid(grid, rows, cols, shapeAt);
+  page.append(grid);
+  if (braces) {
+    const rowBrace = document.createElement("span");
+    rowBrace.className = "af-brace af-brace--rows";
+    rowBrace.textContent = `${rows} rows`;
+    const colBrace = document.createElement("span");
+    colBrace.className = "af-brace af-brace--cols";
+    colBrace.textContent = `${cols} in each row`;
+    wrap.append(rowBrace, page, colBrace);
+  } else {
+    wrap.append(page);
+  }
+  return wrap;
+}
+function shineRows(arrayNode, { rowMs = 140 } = {}) {
+  const cells = arrayNode.querySelectorAll(".af-cell");
+  const rows = Number(arrayNode.style.getPropertyValue("--af-rows")) || 1;
+  cells.forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--af-r")) || 0;
+    cell.style.setProperty("--af-shine-delay", `${r * rowMs}ms`);
+    cell.classList.remove("af-cell--shine");
+    void cell.offsetWidth;
+    cell.classList.add("af-cell--shine");
+  });
+  return rows * rowMs + 500;
+}
+function highlightRow(arrayNode, rowIndex) {
+  arrayNode.querySelectorAll(".af-cell").forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--af-r")) || 0;
+    cell.classList.toggle("af-cell--lit", rowIndex === null ? false : r <= rowIndex);
+    cell.classList.toggle("af-cell--current", r === rowIndex);
+  });
+}
+function albumPage(rows, cols, expressionText) {
+  const item = document.createElement("div");
+  item.className = "af-album-item";
+  item.style.setProperty("--af-rows", rows);
+  item.style.setProperty("--af-cols", cols);
+  const mini = document.createElement("div");
+  mini.className = "af-album-mini";
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const dot = document.createElement("i");
+      dot.className = `af-album-dot af-album-dot--${shapeFor(r)}`;
+      mini.append(dot);
+    }
+  }
+  const text = document.createElement("span");
+  text.className = "af-album-text";
+  text.textContent = expressionText;
+  item.append(mini, text);
+  return item;
+}
+function mysterySticker({ size = 40 } = {}) {
+  const { palette } = THEME;
+  const root = svg("svg", { viewBox: "0 0 40 40", width: size, height: size, "aria-hidden": "true", focusable: "false", class: "ac-mystery" });
+  root.append(svg("rect", { x: 2, y: 2, width: 36, height: 36, rx: 8, fill: "#fff", stroke: palette.stickerInk, "stroke-width": 2.5 }));
+  root.append(svg("rect", { x: 7, y: 7, width: 26, height: 26, rx: 6, fill: palette.sticker, stroke: palette.stickerInk, "stroke-width": 2 }));
+  const q = svg("text", { x: 20, y: 28, "text-anchor": "middle", "font-family": "Bangers, Impact, cursive", "font-size": 22, fill: palette.stickerInk });
+  q.textContent = "?";
+  root.append(q);
+  return root;
+}
+const PEEL_MS = 520;
+const LAND_MS = 360;
+function peelReveal(slot, value, { reduced = false, onPeel, onLand, schedule = setTimeout } = {}) {
+  const finish = () => {
+    slot.textContent = String(value);
+    slot.classList.remove("ac-slot--peeling");
+    slot.classList.add("ac-slot--revealed");
+    onLand?.();
+  };
+  if (reduced) {
+    finish();
+    return 0;
+  }
+  const sticker = document.createElement("span");
+  sticker.className = "ac-peel";
+  sticker.append(mysterySticker({ size: 44 }));
+  slot.classList.add("ac-slot--peeling");
+  slot.append(sticker);
+  onPeel?.();
+  schedule(() => {
+    sticker.remove();
+    slot.textContent = String(value);
+    slot.classList.remove("ac-slot--peeling");
+    slot.classList.add("ac-slot--revealed");
+    void slot.offsetWidth;
+    slot.classList.add("ac-slot--land");
+    schedule(() => {
+      slot.classList.remove("ac-slot--land");
+      onLand?.();
+    }, LAND_MS);
+  }, PEEL_MS);
+  return PEEL_MS + LAND_MS;
+}
+function stickerPack(rows, cols, { label } = {}) {
+  const pack = document.createElement("div");
+  pack.className = "ac-pack";
+  pack.setAttribute("role", "img");
+  pack.setAttribute("aria-label", label || "A sealed pack of stickers");
+  const face = document.createElement("div");
+  face.className = "ac-pack-face";
+  face.append(mysterySticker({ size: 64 }));
+  const text = document.createElement("p");
+  text.className = "ac-pack-copy";
+  text.textContent = "Write the equation to open the pack.";
+  face.append(text);
+  pack.append(face);
+  return pack;
+}
+const OPEN_MS = 520;
+function openPack(pack, rows, cols, { reduced = false, onOpen } = {}) {
+  const array = arrayDisplay(rows, cols, { size: "card", peel: !reduced });
+  const swap = () => {
+    pack.replaceWith(array);
+    onOpen?.(array);
+  };
+  if (reduced) {
+    swap();
+    return array;
+  }
+  pack.classList.add("ac-pack--open");
+  setTimeout(swap, OPEN_MS);
+  return array;
+}
+const MUTE_KEY = "array_clues_110.muted";
+function readMuted(storage) {
+  try {
+    return storage?.getItem?.(MUTE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function createSound({ storage = null } = {}) {
+  let muted = readMuted(storage);
+  let ctx2 = null;
+  let gate = null;
+  let hidden = false;
+  const nodes = /* @__PURE__ */ new Set();
+  const ready = () => Boolean(ctx2 && gate);
+  const tone = ({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.14 }) => {
+    if (!ready() || muted) return;
+    const t0 = ctx2.currentTime + at;
+    const osc = ctx2.createOscillator();
+    const g = ctx2.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+    osc.connect(g).connect(gate);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    const entry = { osc, g };
+    nodes.add(entry);
+    osc.onended = () => {
+      nodes.delete(entry);
+      try {
+        osc.disconnect();
+        g.disconnect();
+      } catch {
+      }
+    };
+  };
+  const SOUNDS = {
+    // The engine's canonical set, same frequencies and shapes.
+    correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09, gain: 0.18 })),
+    wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+    complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16, gain: 0.18 })),
+    tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle", gain: 0.18 })),
+    tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+    // Sticker sounds shared with Game 108's album.
+    // A sticker peeling onto the page, one per row while the array appears.
+    peel: (row = 0) => tone({ freq: 392 * 2 ** (row * 2 / 12), to: 392 * 2 ** ((row * 2 + 3) / 12), type: "triangle", dur: 0.11, gain: 0.07 }),
+    // Toggling an expression on or off.
+    pick: () => [660, 880].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.07 })),
+    unpick: () => [880, 660].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.06 })),
+    // The shine sweep after a correct answer, one note per row.
+    shine: (row = 0) => tone({ freq: 1047 * 2 ** (row * 2 / 12), type: "triangle", dur: 0.12, gain: 0.06 }),
+    // Counting a row in the teaching help.
+    count: (index = 0) => tone({ freq: 330 * 2 ** (index / 12), type: "triangle", dur: 0.14, gain: 0.08 }),
+    // A page turn in the matching set.
+    page: () => {
+      tone({ freq: 300, to: 620, type: "sawtooth", dur: 0.14, gain: 0.05 });
+      tone({ freq: 1200, dur: 0.05, at: 0.12, gain: 0.05, type: "triangle" });
+    },
+    // Game 110's signature: the mystery sticker peeling off its equation
+    // slot, then the number underneath landing in place.
+    peelOff: () => {
+      tone({ freq: 620, to: 1240, type: "sawtooth", dur: 0.22, gain: 0.05 });
+      tone({ freq: 1500, dur: 0.05, at: 0.2, gain: 0.05, type: "triangle" });
+    },
+    reveal: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.05, dur: 0.12, type: "triangle", gain: 0.1 })),
+    // A sealed sticker pack tearing open (fill form celebration).
+    open: () => {
+      tone({ freq: 220, to: 880, type: "sawtooth", dur: 0.2, gain: 0.06 });
+      tone({ freq: 988, dur: 0.08, at: 0.18, gain: 0.07, type: "square" });
+    },
+    // A number or expression dropping into its writing line.
+    slot: () => {
+      tone({ freq: 740, to: 988, type: "triangle", dur: 0.09, gain: 0.08 });
+      tone({ freq: 1320, dur: 0.05, at: 0.08, gain: 0.05, type: "square" });
+    },
+    fanfare: () => [523, 659, 784, 1047, 1319].forEach((f, i) => tone({ freq: f, at: i * 0.1, dur: 0.18, type: "triangle", gain: 0.1 }))
+  };
+  function stopAll() {
+    if (!ctx2) return;
+    const now = ctx2.currentTime;
+    nodes.forEach(({ osc, g }) => {
+      try {
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(0, now);
+      } catch {
+      }
+      try {
+        osc.stop(now);
+      } catch {
+      }
+    });
+    nodes.clear();
+  }
+  function applyGate() {
+    if (!ready()) return;
+    const now = ctx2.currentTime;
+    gate.gain.cancelScheduledValues(now);
+    gate.gain.setValueAtTime(muted ? 0 : 1, now);
+    if (muted || hidden) ctx2.suspend?.()?.catch?.(() => {
+    });
+    else ctx2.resume?.()?.catch?.(() => {
+    });
+  }
+  return {
+    get muted() {
+      return muted;
+    },
+    unlock() {
+      ctx2 = initAudio();
+      if (ctx2 && !gate) {
+        gate = ctx2.createGain();
+        gate.gain.value = muted ? 0 : 1;
+        gate.connect(ctx2.destination);
+      }
+      applyGate();
+      return ctx2;
+    },
+    setMuted(value) {
+      muted = Boolean(value);
+      try {
+        storage?.setItem?.(MUTE_KEY, muted ? "1" : "0");
+      } catch {
+      }
+      if (muted) stopAll();
+      applyGate();
+    },
+    toggle() {
+      this.setMuted(!muted);
+      return muted;
+    },
+    setHidden(value) {
+      hidden = Boolean(value);
+      if (hidden) stopAll();
+      applyGate();
+    },
+    play(name, ...args) {
+      if (muted || hidden) return;
+      SOUNDS[name]?.(...args);
+    },
+    stopAll,
+    destroy() {
+      stopAll();
+      try {
+        gate?.disconnect();
+      } catch {
+      }
+      gate = null;
+    }
+  };
+}
+const SHAPES = ["star", "circle", "diamond"];
+function reducedMotion() {
+  return Boolean(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+function stickerConfetti(root, count = 24) {
+  if (reducedMotion()) return;
+  for (let i = 0; i < count; i += 1) {
+    const piece = document.createElement("i");
+    piece.className = `af-confetti af-confetti--${SHAPES[i % SHAPES.length]}`;
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.setProperty("--af-piece", THEME.confettiColors[i % THEME.confettiColors.length]);
+    piece.style.animationDelay = `${Math.random() * 0.4}s`;
+    piece.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    piece.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.append(piece);
+    piece.addEventListener("animationend", () => piece.remove());
+  }
+}
+const FLY_MS = 380;
+function flyToken(root, from, to, content, { onLand } = {}) {
+  const land = () => onLand?.();
+  if (reducedMotion() || !from || !to?.getBoundingClientRect || typeof Element === "undefined" || !Element.prototype.animate) {
+    land();
+    return;
+  }
+  const a = typeof from.getBoundingClientRect === "function" ? from.getBoundingClientRect() : from;
+  const b = to.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  if (!a.width || !b.width) {
+    land();
+    return;
+  }
+  const token = document.createElement("span");
+  token.className = "ac-fly-token";
+  token.append(content);
+  token.style.left = `${a.left - base.left + a.width / 2}px`;
+  token.style.top = `${a.top - base.top + a.height / 2}px`;
+  root.append(token);
+  const dx = b.left + b.width / 2 - (a.left + a.width / 2);
+  const dy = b.top + b.height / 2 - (a.top + a.height / 2);
+  const anim = token.animate([
+    { transform: "translate(-50%, -50%) scale(1)", opacity: 1 },
+    { transform: `translate(calc(-50% + ${dx * 0.5}px), calc(-50% + ${dy * 0.5 - 28}px)) scale(1.15)`, opacity: 1, offset: 0.55 },
+    { transform: `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(.9)`, opacity: 1 }
+  ], { duration: FLY_MS, easing: "cubic-bezier(.3,.7,.3,1)", fill: "forwards" });
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    token.remove();
+    land();
+  };
+  anim.onfinish = finish;
+  anim.oncancel = finish;
+  setTimeout(finish, FLY_MS + 120);
+}
+function flyStars(root, from, count = 4) {
+  if (reducedMotion() || !from?.getBoundingClientRect) return;
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const star = document.createElement("span");
+    star.className = "af-fly";
+    star.textContent = "★";
+    star.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    star.style.top = `${r.top - base.top + r.height / 2}px`;
+    star.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    star.style.animationDelay = `${i * 0.05}s`;
+    root.append(star);
+    star.addEventListener("animationend", () => star.remove());
+  }
+}
+const game = defineGame({
+  meta: {
+    name: "array_clues",
+    lesson: "110",
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    emoji: THEME.startIcon,
+    tag: THEME.tag,
+    questions: 0
+  },
+  ...gen
+});
+const GROWTH = [
+  "Almost! Try again!",
+  "Great effort! Keep going!",
+  "Mistakes help your brain grow!",
+  "Look again. You got this!",
+  "So close! One more try!"
+];
+const ROLE_WORDS = Object.freeze({
+  each: "how many are in each row",
+  rows: "how many rows there are",
+  total: "how many there are in all"
+});
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== void 0 && text !== null) node.textContent = String(text);
+  return node;
+}
+function renderEquation(label, host) {
+  const wrap = host || el("span");
+  wrap.classList.add("ac-eq");
+  wrap.replaceChildren();
+  label.split(" ").forEach((token, i) => {
+    if (i) wrap.append(" ");
+    wrap.append(el("span", `ac-eq-token${token === UNKNOWN ? " ac-q" : ""}`, token));
+  });
+  return wrap;
+}
+function mount(element, options = {}) {
+  if (!element) throw new Error("array_clues.mount needs a DOM element");
+  const gameFile = options.gameFile ?? "array_clues_110.html";
+  const tracker = connectTracker({ gameFile, interval: options.autoSaveInterval ?? 3 });
+  const storage = options.storage ?? (() => {
+    try {
+      return globalThis.localStorage;
+    } catch {
+      return null;
+    }
+  })();
+  const sound = createSound({ storage });
+  const seedBase = options.seed ?? Date.now();
+  let session = 0;
+  let questions = [];
+  let album = [];
+  const timers = /* @__PURE__ */ new Set();
+  const later = (fn, ms) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const clearTimers = () => {
+    timers.forEach((id) => clearTimeout(id));
+    timers.clear();
+  };
+  const teachingTimers = /* @__PURE__ */ new Set();
+  const teachingLater = (fn, ms) => {
+    const id = setTimeout(() => {
+      teachingTimers.delete(id);
+      fn();
+    }, ms);
+    teachingTimers.add(id);
+    return id;
+  };
+  const clearTeachingTimers = () => {
+    teachingTimers.forEach((id) => clearTimeout(id));
+    teachingTimers.clear();
+  };
+  function planSession() {
+    session += 1;
+    const rng = createRng(Number(seedBase) + session * 7919);
+    questions = sessionQuestions(rng, { fixed: options.fixed ?? BETA_PLAN, randomCount: options.randomCount ?? 2 });
+    album = [];
+  }
+  planSession();
+  function frameProblem(index) {
+    const problem = questions[index];
+    if (!problem) throw new Error(`no question at ${index}`);
+    return { ...problem, id: `${session}-${index}` };
+  }
+  let currentArray = null;
+  let currentCard = null;
+  let currentPack = null;
+  let slots = [];
+  let unknownSlot = null;
+  let equationSlot = null;
+  let directSequenceMs = 0;
+  function peelIn(rows) {
+    if (reducedMotion()) return;
+    for (let r = 0; r < rows; r += 1) later(() => sound.play("peel", r), 120 + r * 170);
+  }
+  function statement(problem) {
+    const p = el("p", "ac-story", problem.story);
+    p.setAttribute("aria-label", `Story: ${problem.story}`);
+    return p;
+  }
+  function picture(problem, size = "card") {
+    const array = arrayDisplay(problem.rows, problem.each, { size, peel: !reducedMotion(), label: `${problem.rows} rows of ${problem.each} ${THEME.units}` });
+    currentArray = array;
+    peelIn(problem.rows);
+    return array;
+  }
+  function blank(part, { wide = false, unit } = {}) {
+    const node = el("span", `ac-slot ac-slot--blank${wide ? " ac-slot--wide" : ""}`, wide ? "0 × 0 = 0" : "0");
+    node.dataset.part = String(part);
+    node.setAttribute("aria-label", `blank ${part + 1}`);
+    slots[part] = node;
+    if (unit) {
+      const line = el("span", "ac-unit-line");
+      line.append(node, el("span", "ac-unit", unit));
+      return line;
+    }
+    return node;
+  }
+  function responseRows(problem, { equationBlank, unknownPart }) {
+    const rows = el("div", "ac-rows");
+    rows.setAttribute("role", "group");
+    rows.setAttribute("aria-label", "Equation and unknown");
+    const eqRow = el("div", "ac-row ac-row--equation");
+    eqRow.append(el("span", "ac-row-label", ROW_LABELS.equation));
+    const eqLine = el("span", "ac-row-line");
+    eqLine.append(equationBlank);
+    eqRow.append(eqLine);
+    rows.append(eqRow);
+    if (unknownPart !== null && unknownPart !== void 0) {
+      const unRow = el("div", "ac-row ac-row--unknown");
+      unRow.append(el("span", "ac-row-label", ROW_LABELS.unknown));
+      const unLine = el("span", "ac-row-line");
+      unLine.append(blank(unknownPart, { unit: problem.unit }));
+      unknownSlot = slots[unknownPart];
+      unRow.append(unLine);
+      rows.append(unRow);
+    }
+    return rows;
+  }
+  function scaffoldRow(problem) {
+    const line = el("span", "ac-row-line ac-scaffold");
+    problem.slots.forEach((slot) => {
+      if (slot.type === "fixed") line.append(el("span", "ac-slot ac-slot--fixed", slot.text));
+      else if (slot.type === "times") line.append(el("span", "ac-slot ac-slot--sign", TIMES));
+      else if (slot.type === "equals") line.append(el("span", "ac-slot ac-slot--sign", "="));
+      else line.append(blank(slot.part));
+    });
+    return line;
+  }
+  function renderMatchCard(problem, host) {
+    const card = el("div", "ac-card ac-card--match");
+    card.append(statement(problem), picture(problem));
+    host.append(card);
+    currentCard = card;
+  }
+  function renderModelCard(problem, host) {
+    const stacked = problem.layout === "stacked";
+    const card = el("div", `ac-card ac-card--model ${stacked ? "ac-card--stack" : "ac-card--split"}`);
+    card.append(statement(problem));
+    const body = el("div", "ac-body");
+    body.append(picture(problem));
+    equationSlot = blank(0, { wide: true });
+    body.append(responseRows(problem, { equationBlank: equationSlot, unknownPart: 1 }));
+    card.append(body);
+    host.append(card);
+    currentCard = card;
+  }
+  function renderFillCard(problem, host) {
+    const card = el("div", `ac-card ac-card--fill ac-card--stack${problem.picture === "cover" ? " ac-card--sealed" : ""}`);
+    card.append(statement(problem));
+    const body = el("div", "ac-body");
+    if (problem.picture === "cover") {
+      currentPack = stickerPack(problem.rows, problem.each);
+      body.append(currentPack);
+    } else {
+      body.append(picture(problem));
+    }
+    if (problem.solveUnknown) {
+      body.append(el("p", "ac-known-values", problem.role === "rows" ? `${problem.total} stickers total · ${problem.each} in each row` : problem.role === "each" ? `${problem.rows} rows · ${problem.total} stickers total` : `${problem.rows} rows · ${problem.each} in each row`));
+    }
+    const blanks = problem.slots.filter((s) => s.type === "blank").length;
+    body.append(responseRows(problem, { equationBlank: scaffoldRow(problem), unknownPart: !problem.solveUnknown && problem.params.unknown ? blanks : null }));
+    if (problem.solveUnknown) {
+      const rowSlot = slots[0];
+      rowSlot.textContent = UNKNOWN;
+      rowSlot.classList.remove("ac-slot--blank", "ac-slot--active");
+      rowSlot.classList.add("ac-slot--rows", "ac-q");
+      rowSlot.setAttribute("aria-label", problem.role === "rows" ? "Number of rows" : problem.role === "each" ? "Stickers in each row" : "Total stickers");
+      const labelledSlot = el("span", "ac-labelled-slot");
+      rowSlot.replaceWith(labelledSlot);
+      labelledSlot.append(rowSlot, el("span", "ac-unit", problem.role === "rows" ? "rows" : problem.role === "each" ? "in each row" : "stickers"));
+      unknownSlot = rowSlot;
+    }
+    card.append(body);
+    host.append(card);
+    currentCard = card;
+  }
+  function onPart({ problem, partIndex, picks, choice, button, fromRect, api: api2 }) {
+    if (!problem.parts) return;
+    if (problem.solveUnknown && partIndex < problem.parts.length) {
+      const prompt = api2?.root?.querySelector(".gf-prompt");
+      if (prompt) prompt.textContent = partPrompt(problem, partIndex, picks);
+    }
+    slots.forEach((slot) => slot?.classList.remove("ac-slot--active"));
+    if (!problem.solveUnknown && choice && slots[partIndex - 1]) {
+      const filled = slots[partIndex - 1];
+      const fill = () => {
+        if (choice.kind === "eq") renderEquation(choice.label, filled);
+        else {
+          filled.textContent = choice.label;
+          if (choice.label === UNKNOWN) filled.classList.add("ac-q");
+        }
+      };
+      const bounds = filled.getBoundingClientRect();
+      filled.style.width = `${bounds.width}px`;
+      filled.style.height = `${bounds.height}px`;
+      fill();
+      filled.classList.add("ac-slot--incoming");
+      const ghost = el("span", "ac-fly-content");
+      if (choice.kind === "eq") renderEquation(choice.label, ghost);
+      else {
+        ghost.textContent = choice.label;
+        if (choice.label === UNKNOWN) ghost.classList.add("ac-q");
+      }
+      const fx = api2?.root?.querySelector(".gf-fx");
+      const land = () => {
+        filled.classList.remove("ac-slot--incoming");
+        filled.classList.add("ac-slot--filled");
+        sound.play("slot");
+      };
+      if (fx) flyToken(fx, fromRect || button, filled, ghost, { onLand: land });
+      else land();
+    }
+    const active = slots[partIndex];
+    if (!problem.solveUnknown && active) active.classList.add("ac-slot--active");
+  }
+  function activePart(problem) {
+    if (!problem.parts || !frameApi) return null;
+    return problem.parts[frameApi.partIndex] || null;
+  }
+  function firstMissCopy(problem, choice) {
+    const part = activePart(problem);
+    const asks = ROLE_WORDS[problem.role];
+    if (!problem.solveUnknown && (problem.form === "match" || part && part.kind === "eq")) {
+      if (choice && choice.label.includes("+")) return "An array is rows of equal groups. Use × to show rows × how many are in each row.";
+      return `Read the question again. It asks ${asks}. The ? goes in that spot: rows × in each row equals the total.`;
+    }
+    if (!problem.solveUnknown && part && part.kind === "tok") {
+      const blankSlots = problem.slots.filter((s) => s.type === "blank");
+      const slot = blankSlots[frameApi.partIndex];
+      if (slot && slot.value === UNKNOWN && choice && choice.label !== UNKNOWN) return `That number is not in the story. The story asks ${asks}, so that spot gets the ? symbol.`;
+      if (slot && slot.value !== UNKNOWN && choice && choice.label === UNKNOWN) return "The story tells you that number. Use the ? only for the number the story asks for.";
+      return "Read the story again. Rows come first, then how many in each row, then the total.";
+    }
+    if (problem.role === "each") return `Count by ${problem.rows} until you reach ${problem.total}. How many rounds did you count?`;
+    if (problem.role === "rows") return `Count by ${problem.each} until you reach ${problem.total}. How many rounds did you count?`;
+    return `Count by ${problem.each} for each row. Count on the stickers if it helps.`;
+  }
+  function firstMiss(problem, { choices }) {
+    const box = el("div", "ac-help");
+    const growth = GROWTH[(frameApi ? frameApi.problemIndex : 0) % GROWTH.length];
+    const choice = choices?.[0];
+    const picked = choice ? `You tapped ${choice.label}. ` : "";
+    box.append(el("p", "ac-help-copy", `${picked}${firstMissCopy(problem, choice)}`));
+    box.append(el("p", "ac-help-growth", growth));
+    return box;
+  }
+  function exampleFor(problem) {
+    const candidates = problem.rows * problem.each <= 6 ? [[2, 2], [3, 2], [2, 3]] : [[2, 3], [2, 2], [3, 2]];
+    const smaller = candidates.find(([rows2, each2]) => rows2 * each2 < problem.rows * problem.each && (rows2 !== problem.rows || each2 !== problem.each));
+    const different = candidates.find(([rows2, each2]) => rows2 !== problem.rows || each2 !== problem.each);
+    const [rows, each] = smaller || different;
+    return { rows, each, total: rows * each };
+  }
+  function exampleStory(role, ex) {
+    if (role === "each") return `${ex.total} stickers in ${ex.rows} rows. How many in each row?`;
+    if (role === "rows") return `${ex.total} stickers with ${ex.each} in each row. How many rows?`;
+    return `${ex.rows} rows with ${ex.each} in each row. How many stickers?`;
+  }
+  function teaching(problem) {
+    const ex = exampleFor(problem);
+    const part = activePart(problem);
+    const solving = Boolean(part && part.kind === "num");
+    const exParams = { rows: ex.rows, each: ex.each, role: problem.role };
+    const target = targetEquation(exParams);
+    const box = el("div", "ac-help ac-help--teach");
+    box.append(el("p", "ac-help-copy", solving ? "Use the equation as a clue. Count the stickers row by row until the equation is true. Here is a smaller story." : "Rows × in each row equals the total. Put the ? on the number the story asks for. Here is a smaller story."));
+    box.append(el("p", "ac-help-story", exampleStory(problem.role, ex)));
+    const pictureNode = arrayDisplay(ex.rows, ex.each, { size: "help", braces: true });
+    box.append(pictureNode);
+    const line = el("p", "ac-help-line");
+    const rowsNode = el("span", "ac-help-rows", "rows");
+    const eachNode = el("span", "ac-help-each", "in each row");
+    const totalNode = el("span", "ac-help-total", "total");
+    line.append(rowsNode, el("span", "ac-help-sign", TIMES), eachNode, el("span", "ac-help-sign", "="), totalNode);
+    box.append(line);
+    const eq = el("p", "ac-help-eq");
+    renderEquation(target, eq);
+    box.append(eq);
+    box.append(el("p", "ac-help-next", solving ? "Now count your array the same way." : "Now write your equation the same way."));
+    const reduced = reducedMotion();
+    const per = reduced ? 0 : 420;
+    let t = 400;
+    const lit = (node) => node.classList.add("ac-help-lit");
+    for (let r = 0; r < ex.rows; r += 1) {
+      teachingLater(() => {
+        highlightRow(pictureNode, r);
+        sound.play("count", r);
+        rowsNode.textContent = `${r + 1} row${r ? "s" : ""}`;
+      }, t + r * per);
+    }
+    t += ex.rows * per + 200;
+    teachingLater(() => {
+      highlightRow(pictureNode, null);
+      lit(rowsNode);
+    }, t);
+    t += 500;
+    teachingLater(() => {
+      eachNode.textContent = `${ex.each} in each row`;
+      lit(eachNode);
+      sound.play("count", 2);
+    }, t);
+    t += 700;
+    teachingLater(() => {
+      totalNode.textContent = `${ex.total} total`;
+      lit(totalNode);
+      sound.play("count", 4);
+    }, t);
+    t += 700;
+    if (solving) {
+      teachingLater(() => {
+        const q = eq.querySelector(".ac-q");
+        if (q) {
+          sound.play("peelOff");
+          peelReveal(q, ex[problem.role === "total" ? "total" : problem.role], { reduced, schedule: teachingLater, onLand: () => sound.play("reveal") });
+        }
+      }, t);
+    } else {
+      teachingLater(() => {
+        eq.classList.add("ac-help-eq--done");
+        sound.play("reveal");
+      }, t);
+    }
+    if (reduced) {
+      rowsNode.textContent = `${ex.rows} rows`;
+      eachNode.textContent = `${ex.each} in each row`;
+      totalNode.textContent = `${ex.total} total`;
+    }
+    return box;
+  }
+  function showTierToast(fx, word) {
+    const t = el("div", "gf-toast gf-toast--tier", word);
+    fx.append(t);
+    later(() => t.remove(), 900);
+  }
+  let equalsNode = null;
+  function clearEquals() {
+    equalsNode?.remove();
+    equalsNode = null;
+  }
+  function showEquals(problem) {
+    if (!currentCard) return null;
+    clearEquals();
+    const pill = el("p", "ac-equals");
+    renderEquation(problem.target, pill);
+    currentCard.append(pill);
+    equalsNode = pill;
+    return pill.querySelector(".ac-q");
+  }
+  function revealAt(problem, delay, fx) {
+    const reduced = reducedMotion();
+    if (problem.solveUnknown) {
+      later(() => {
+        const q = unknownSlot?.classList.contains("ac-q") ? unknownSlot : unknownSlot?.querySelector(".ac-q");
+        if (!q) return;
+        const sticker = el("span", "ac-q-sticker");
+        sticker.append(mysterySticker({ size: 40 }));
+        q.classList.add("ac-q--stuck");
+        q.append(sticker);
+        later(() => {
+          sticker.remove();
+          sound.play("peelOff");
+          peelReveal(q, problem.unknown, {
+            reduced,
+            schedule: later,
+            onLand: () => {
+              sound.play("reveal");
+              q.classList.remove("ac-q--stuck");
+              flyStars(fx, q, 4);
+            }
+          });
+        }, reduced ? 0 : 320);
+      }, delay);
+      return delay + (reduced ? 0 : 320 + PEEL_MS + LAND_MS);
+    }
+    later(() => {
+      let q = null;
+      if (problem.form === "match") q = showEquals(problem);
+      else if (problem.form === "model") q = equationSlot?.querySelector(".ac-q");
+      else q = slots.find((s) => s?.classList.contains("ac-q")) || null;
+      if (!q) return;
+      const sticker = el("span", "ac-q-sticker");
+      sticker.append(mysterySticker({ size: 40 }));
+      q.classList.add("ac-q--stuck");
+      q.append(sticker);
+      later(() => {
+        sticker.remove();
+        sound.play("peelOff");
+        peelReveal(q, problem.unknown, { reduced, onLand: () => {
+          sound.play("reveal");
+          q.classList.remove("ac-q--stuck");
+          flyStars(fx, q, 4);
+        } });
+      }, reduced ? 0 : 320);
+    }, delay);
+    return delay + (reduced ? 0 : 320 + PEEL_MS + LAND_MS) + 500;
+  }
+  function celebrate({ buttons, state, api: api2, problem }) {
+    sound.play("correct");
+    const fx = api2.root.querySelector(".gf-fx");
+    buttons.forEach((button) => flyStars(fx, button, 3));
+    const reduced = reducedMotion();
+    const { rows } = problem;
+    let delay = 300;
+    if (problem.solveUnknown) {
+      later(() => {
+        if (!currentArray) return;
+        currentArray.classList.add("af-array--solved");
+        if (reduced) return;
+        shineRows(currentArray);
+        for (let r = 0; r < rows; r += 1) later(() => sound.play("shine", r), 160 + r * 140);
+      }, delay);
+      const shineMs = reduced ? 0 : rows * 140 + 500;
+      const sequenceEnd = revealAt(problem, delay + shineMs, fx);
+      const tier2 = STREAK_TIERS.find((t) => t.at === state.streak);
+      if (tier2) later(() => {
+        sound.play("tier");
+        stickerConfetti(fx, tier2.burst);
+        showTierToast(fx, tier2.word);
+      }, 900);
+      directSequenceMs = Math.max(sequenceEnd, tier2 ? 900 : 0);
+      album.push({ rows, cols: problem.each, text: problem.solved });
+      return tier2;
+    }
+    if (currentPack) {
+      const pack = currentPack;
+      currentPack = null;
+      sound.play("open");
+      openPack(pack, problem.rows, problem.each, { reduced, onOpen: (array) => {
+        currentArray = array;
+        peelIn(rows);
+        currentCard?.classList.remove("ac-card--sealed");
+      } });
+      delay = reduced ? 200 : OPEN_MS + 200 + rows * 170;
+    }
+    later(() => {
+      if (!currentArray) return;
+      currentArray.classList.add("af-array--solved");
+      if (reduced) return;
+      shineRows(currentArray);
+      for (let r = 0; r < rows; r += 1) later(() => sound.play("shine", r), 160 + r * 140);
+    }, delay);
+    delay += reduced ? 0 : rows * 140 + 300;
+    if (unknownSlot) unknownSlot.classList.add("ac-slot--done");
+    revealAt(problem, delay, fx);
+    const tier = STREAK_TIERS.find((t) => t.at === state.streak);
+    if (tier) {
+      later(() => {
+        sound.play("tier");
+        stickerConfetti(fx, tier.burst);
+        showTierToast(fx, tier.word);
+      }, 900);
+    }
+    album.push({ rows, cols: problem.each, text: problem.solved });
+    return tier;
+  }
+  function advanceMs({ state, problem }) {
+    if (problem.solveUnknown) {
+      const delay = directSequenceMs;
+      directSequenceMs = 0;
+      return delay;
+    }
+    const tier = STREAK_TIERS.some((t) => t.at === state.streak);
+    if (reducedMotion()) return 1200 + (tier ? 600 : 0);
+    const rows = problem.rows;
+    const open = problem.form === "fill" && problem.picture === "cover" ? OPEN_MS + 200 + rows * 170 : 300;
+    return open + rows * 140 + 300 + 320 + PEEL_MS + LAND_MS + 900 + (tier ? 600 : 0);
+  }
+  let exampleTimer = null;
+  function startExample(host) {
+    const wrap = el("div", "ac-example");
+    wrap.append(el("p", "ac-example-label", "FIND THE MYSTERY NUMBER"));
+    const rows = 2;
+    const each = 3;
+    wrap.append(el("p", "ac-example-story", `${rows} rows of stickers with ${each} in each row. How many stickers?`));
+    const array = arrayDisplay(rows, each, { size: "example", braces: true, peel: !reducedMotion() });
+    wrap.append(array);
+    const eq = el("p", "ac-example-eq");
+    renderEquation(equation(rows, each, UNKNOWN), eq);
+    wrap.append(eq);
+    wrap.append(el("p", "ac-example-copy", "Every story hides one number. Write the equation with a ? for the mystery number, then peel the sticker to find it."));
+    host.append(wrap);
+    if (reducedMotion()) return;
+    const tick = () => {
+      const q = eq.querySelector(".ac-eq-token:last-child");
+      if (!q) return;
+      if (q.classList.contains("ac-slot--revealed")) {
+        q.classList.remove("ac-slot--revealed");
+        q.classList.add("ac-q");
+        q.textContent = UNKNOWN;
+        exampleTimer = setTimeout(tick, 1600);
+        return;
+      }
+      peelReveal(q, rows * each, { onLand: () => {
+        exampleTimer = setTimeout(tick, 1800);
+      } });
+    };
+    exampleTimer = setTimeout(tick, 1800);
+  }
+  function renderEnd(host) {
+    if (!album.length) return;
+    const title = el("p", "ac-album-title", "YOUR ALBUM PAGE");
+    const grid = el("div", "ac-album");
+    album.forEach((entry, i) => {
+      const page = albumPage(entry.rows, entry.cols, entry.text);
+      page.style.setProperty("--af-album-delay", `${i * 90}ms`);
+      grid.append(page);
+    });
+    host.append(title, grid);
+    later(() => sound.play("fanfare"), 500);
+  }
+  const publish = (state) => tracker.publish({
+    score: state.score,
+    streak: state.streak,
+    bestStreak: state.bestStreak,
+    questionsAnswered: state.questionsAnswered
+  });
+  const record = (problem, choices, correct, state) => {
+    tracker.recordQuestion({
+      question: problem.story,
+      params: problem.params,
+      answer: choices.map((c) => c.label).join(" + "),
+      correctAnswer: problem.solveUnknown ? String(problem.unknown) : problem.parts ? `${problem.target} + ${problem.unknown}` : problem.target,
+      correct,
+      firstTry: state.firstTry,
+      replay: false
+    });
+  };
+  let frameApi = null;
+  const onKey = (event) => {
+    if (event.ctrlKey && event.key.toLowerCase() === "t") {
+      event.preventDefault();
+      const result = checkGenerator(game, { count: 500, choiceCounts: [4, 6] });
+      console.log(`[${gameFile}] generator check: ${result.count} problems, ${result.distinct} distinct, ${result.errors.length} errors`, result.errors.slice(0, 20));
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  frameApi = globalThis.GameFrameStarter.mount(element, {
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    tag: THEME.tag,
+    startIcon: THEME.startIcon,
+    endIcon: THEME.endIcon,
+    endTitle: THEME.endTitle,
+    ariaLabel: `${THEME.title} game`,
+    totalQuestions: questions.length,
+    basePoints: options.basePoints ?? 10,
+    streakBonus: options.streakBonus !== false,
+    hotStreak: 5,
+    theme: { bgA: THEME.palette.bgA, bgB: THEME.palette.bgB, card: THEME.palette.card, ink: THEME.palette.ink, accent: THEME.palette.accent, good: THEME.palette.good, warm: THEME.palette.warm, dottedBorder: THEME.palette.dottedBorder, picture: THEME.palette.picture, pictureAlt: THEME.palette.pictureAlt },
+    startButton: options.startButton ?? "START",
+    playAgain: options.playAgain ?? "PLAY AGAIN",
+    advanceMs,
+    praise: () => THEME.praise[Math.floor(Math.random() * THEME.praise.length)],
+    firstMissTitle: () => "TAKE ANOTHER LOOK",
+    teachingTitle: () => "LET’S SOLVE ONE TOGETHER",
+    endMessage: ({ state }) => `You solved ${state.completed} sticker clue${state.completed === 1 ? "" : "s"}.`,
+    getProblem: (index) => frameProblem(index),
+    acceptPick: ({ problem, partIndex, choice, picks }) => acceptable(problem, partIndex, picks).includes(choice.id),
+    onPart,
+    renderProblem: (problem, host) => {
+      clearTeachingTimers();
+      clearEquals();
+      currentArray = null;
+      currentCard = null;
+      currentPack = null;
+      unknownSlot = null;
+      equationSlot = null;
+      slots = [];
+      directSequenceMs = 0;
+      if (problem.solveUnknown) renderFillCard(problem, host);
+      else if (problem.form === "model") renderModelCard(problem, host);
+      else if (problem.form === "fill") renderFillCard(problem, host);
+      else renderMatchCard(problem, host);
+    },
+    renderAnswer: (choice, host) => {
+      if (choice.kind === "eq") renderEquation(choice.label, host);
+      else host.textContent = choice.label;
+      const tile = host.closest(".gf-tile");
+      if (tile && choice.kind !== "eq") tile.classList.add("gf-tile--num");
+      if (tile && choice.label === UNKNOWN) tile.classList.add("gf-tile--q");
+    },
+    renderStartExample: (host) => startExample(host),
+    renderFirstMiss: (problem, context) => firstMiss(problem, context),
+    renderTeaching: (problem) => teaching(problem),
+    renderEnd: (host) => renderEnd(host),
+    onFound: ({ button, complete, api: api2 }) => {
+      if (complete) return;
+      sound.play("pick");
+      flyStars(api2.root.querySelector(".gf-fx"), button, 2);
+    },
+    onStart: ({ state }) => {
+      sound.unlock();
+      sound.play("tap");
+      clearTimers();
+      clearTeachingTimers();
+      if (exampleTimer) {
+        clearTimeout(exampleTimer);
+        exampleTimer = null;
+      }
+      album = [];
+      publish(state);
+    },
+    onStateChange: (state) => publish(state),
+    onCorrect: ({ choices, problem, buttons, state, api: api2 }) => {
+      record(problem, choices, true, state);
+      tracker.checkAutoSave();
+      if (!state.firstTry) tracker.markCorrected(problem.params);
+      celebrate({ buttons, state, api: api2, problem });
+    },
+    onWrong: ({ choices, problem, state }) => {
+      sound.play("wrong");
+      record(problem, choices, false, state);
+      tracker.markMissed(problem.params);
+      tracker.checkAutoSave();
+    },
+    onSoundToggle: (muted, { state }) => {
+      sound.setMuted(muted);
+      if (!muted && state.phase !== "start") {
+        sound.unlock();
+        sound.play("tap");
+      }
+    },
+    onEnd: () => {
+      clearTimers();
+      clearTeachingTimers();
+      clearEquals();
+      sound.play("complete");
+      const finished = album;
+      planSession();
+      album = finished;
+    },
+    onRetry: clearTeachingTimers,
+    onDestroy: () => {
+      clearTimers();
+      clearTeachingTimers();
+      if (exampleTimer) clearTimeout(exampleTimer);
+      sound.destroy();
+    }
+  });
+  element.classList.add("game-frame--ac");
+  const soundButton = element.querySelector(".gf-sound");
+  if (soundButton && sound.muted) soundButton.click();
+  Object.entries(cssVariables()).forEach(([key, value]) => element.style.setProperty(key, value));
+  const onVisibility = () => sound.setHidden(document.visibilityState === "hidden");
+  document.addEventListener("visibilitychange", onVisibility);
+  const destroy = frameApi.destroy;
+  frameApi.destroy = () => {
+    document.removeEventListener("visibilitychange", onVisibility);
+    document.removeEventListener("keydown", onKey);
+    destroy();
+  };
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  const api = Object.assign(frameApi, { tracker, game, sound, get questions() {
+    return questions;
+  } });
+  return api;
+}
+({
+  lesson: [
+    ...Object.values(PROMPTS),
+    ...Object.values(ROW_LABELS),
+    ...Object.values(STORIES).map((s) => s.text),
+    "{n} {w}",
+    "{n} rows"
+  ],
+  game: [THEME.title, THEME.subtitle, THEME.tag, THEME.endTitle, "START", "PLAY AGAIN", "TAKE ANOTHER LOOK", "LET’S SOLVE ONE TOGETHER", "FIND THE MYSTERY NUMBER", "YOUR ALBUM PAGE", "Write the equation to open the pack."]
+});
+function installHomeNavigation(root) {
+  const icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 3l9 8v10h-6v-7H9v7H3Z" fill="currentColor"/></svg>';
+  function home(label) {
+    const link = document.createElement("a");
+    link.href = "./index.html";
+    link.className = "game-home" + (label ? " game-home-labeled" : "");
+    link.setAttribute("aria-label", "Go home to game menu");
+    link.title = "Go home";
+    link.innerHTML = icon;
+    if (label) link.append(document.createTextNode("HOME"));
+    return link;
+  }
+  const headers = /* @__PURE__ */ new Set();
+  function update() {
+    for (const header of root.querySelectorAll(".mg-hud, .gf-hud")) {
+      if (headers.has(header)) continue;
+      headers.add(header);
+      header.classList.add("game-home-header");
+      header.prepend(home(false));
+    }
+    for (const stats of root.querySelectorAll(".mg-stats, .gf-stats")) {
+      const card = stats.parentElement;
+      if (card.querySelector(".game-end-actions")) continue;
+      const again = card.querySelector(".mg-big-btn, .gf-big-btn");
+      if (!again) continue;
+      const actions = document.createElement("div");
+      actions.className = "game-end-actions";
+      again.replaceWith(actions);
+      actions.append(again, home(true));
+    }
+  }
+  const observer = new MutationObserver(update);
+  observer.observe(root, { childList: true, subtree: true });
+  update();
+  return () => {
+    observer.disconnect();
+  };
+}
+mount(document.getElementById("game"), { gameFile: "array_clues_110.html" });
+installHomeNavigation(document.getElementById("game"));</script>
+  <style rel="stylesheet" crossorigin>/* The shell is adapted from the approved Game 107 surrounding frame.
+   Lesson content belongs in the problem-card adapter. */
+:root {
+  --gf-bg-a: #3156D8;
+  --gf-bg-b: #13213F;
+  --gf-card: #FFF4D6;
+  --gf-ink: #13213F;
+  --gf-accent: #F29B38;
+  --gf-good: #37C8C5;
+  --gf-warm: #E8A838;
+  --gf-dotted-border: #37C8C5;
+  --gf-picture: #E5F8F5;
+  --gf-picture-alt: #fffdf4;
+  --gf-outline: 4px;
+  --gf-shadow: 0 6px 0 var(--gf-ink);
+  --gf-font-shout: 'Bangers', Impact, cursive;
+  --gf-font-read: 'Fredoka', Nunito, system-ui, sans-serif;
+  --gf-card-radius: 22px;
+  --gf-card-gap: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+  color: #fff;
+  font-family: var(--gf-font-read);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button { font: inherit; }
+
+.game-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+.gf-hidden { display: none !important; }
+
+/* Start and end overlays. */
+.gf-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+}
+.gf-card {
+  width: min(920px, 100%);
+  max-height: calc(100% - 32px);
+  overflow: auto;
+  padding: 24px 22px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 24px;
+  box-shadow: var(--gf-shadow);
+  text-align: center;
+}
+.gf-start-card, .gf-end-card { width: min(560px, 100%); animation: ac-card-in .5s cubic-bezier(.2,.9,.3,1.15) both; }
+.gf-end-card .gf-emoji { animation: ac-star-in .7s cubic-bezier(.2,.9,.3,1.4) both; }
+@keyframes ac-star-in { 0% { transform: scale(0) rotate(-180deg); opacity: 0; } 60% { transform: scale(1.3) rotate(12deg); opacity: 1; } 100% { transform: none; opacity: 1; } }
+.gf-end-card .gf-stat { animation: ac-slot-in .4s cubic-bezier(.2,.9,.3,1.3) both; }
+.gf-end-card .gf-stat:nth-child(2) { animation-delay: 90ms; }
+.gf-end-card .gf-stat:nth-child(3) { animation-delay: 180ms; }
+.gf-emoji { font-size: 56px; line-height: 1; }
+.gf-title {
+  margin-top: 6px;
+  color: var(--gf-ink);
+  font-family: var(--gf-font-shout);
+  font-size: clamp(34px, 8vw, 52px);
+  letter-spacing: 2px;
+  text-shadow: 3px 3px 0 var(--gf-accent);
+}
+.gf-subtitle { margin-top: 4px; font-size: 20px; font-weight: 600; }
+.gf-tag {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 10px;
+  color: var(--gf-bg-b);
+  background: #f5f3ff;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.gf-example {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+  font-size: 18px;
+}
+.gf-example-label, .gf-sample-kicker { color: #355080; font-size: 13px; font-weight: 800; letter-spacing: 1px; }
+.gf-example-body { font-weight: 600; }
+.gf-big-btn {
+  min-height: 64px;
+  padding: 14px 40px;
+  color: var(--gf-ink);
+  background: var(--gf-accent);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: 30px;
+  letter-spacing: 2px;
+  transition: transform .08s, box-shadow .08s;
+}
+.gf-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-big-btn:focus-visible, .gf-retry:focus-visible, .gf-tile:focus-visible, .gf-sound:focus-visible {
+  outline: 4px solid #ffd93d;
+  outline-offset: 4px;
+}
+
+/* Shared header and progress. */
+.gf-shell { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 32px)); margin-inline: auto; }
+.gf-hud {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 0;
+  font-family: var(--gf-font-shout);
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgb(0 0 0 / 35%);
+}
+.gf-hud-title {
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: .15em;
+  font-size: clamp(15px, 4vw, 40px);
+  line-height: 1.2;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.gf-chips { display: flex; flex-shrink: 0; gap: 8px; }
+.gf-chip {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 12px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  font-size: 18px;
+  line-height: 1;
+  text-shadow: none;
+}
+.gf-chip--hot { background: var(--gf-accent); }
+.gf-progress {
+  height: 10px;
+  overflow: hidden;
+  background: rgb(0 0 0 / 25%);
+  border-radius: 999px;
+}
+.gf-progress > i { display: block; width: 0; height: 100%; background: var(--gf-good); transition: width .45s cubic-bezier(.2,.9,.3,1.15); }
+.gf-chip--bump { animation: ac-chip-bump .42s cubic-bezier(.2,.9,.3,1.4); }
+@keyframes ac-chip-bump { 0% { transform: scale(1); } 45% { transform: scale(1.18) rotate(-3deg); } 100% { transform: scale(1); } }
+
+/* Prompt, lesson card slot and answer grid. */
+.gf-stage {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 20px;
+  padding: 10px 0 calc(60px + 6px + env(safe-area-inset-bottom, 0px));
+}
+.gf-prompt {
+  flex: 0 0 auto;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: var(--gf-shadow);
+  font-size: 28px;
+  font-weight: 600;
+  text-align: center;
+}
+.gf-visual { display: flex; flex: 1 1 auto; min-height: 0; align-items: center; justify-content: center; }
+.gf-problem-card {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  padding: clamp(10px, 1.5vw, 16px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: var(--gf-card-radius);
+  box-shadow: 0 6px 0 var(--gf-ink);
+  text-align: center;
+}
+.gf-problem-slot {
+  display: grid;
+  width: min(720px, 100%);
+  min-height: 100px;
+  place-items: center;
+  padding: clamp(16px, 3vw, 30px);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+}
+.gf-sample-kicker { margin-bottom: 8px; }
+.gf-sample-title { font-size: clamp(24px, 5vw, 42px); }
+.gf-sample-detail { margin-top: 8px; font-size: clamp(16px, 3vw, 24px); font-weight: 600; }
+.gf-sound {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  padding: 0;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 50%;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  cursor: pointer;
+  font-size: 20px;
+}
+.gf-sound:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-tiles { display: grid; width: min(686px, 85%); align-self: center; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10.8px; }
+.gf-tile {
+  display: grid;
+  min-height: 104.85px;
+  place-items: center;
+  padding: 10px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 18px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-read);
+  font-size: clamp(24px, 4vw, 32px);
+  font-weight: 700;
+  transition: transform .08s, box-shadow .08s, background .15s;
+}
+.gf-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-tile:disabled { cursor: default; }
+.gf-tile.gf-right { background: var(--gf-good); animation: ac-tile-pop .38s cubic-bezier(.2,.9,.3,1.4); }
+.gf-tile.gf-wrong { background: var(--gf-warm); animation: ac-tile-wobble .46s ease-out; }
+@keyframes ac-tile-pop { 0% { transform: scale(1); } 40% { transform: scale(1.08) translateY(-4px); } 100% { transform: scale(1); } }
+@keyframes ac-tile-wobble {
+  0% { transform: translateX(0); }
+  20% { transform: translateX(-7px) rotate(-1.5deg); }
+  40% { transform: translateX(6px) rotate(1.2deg); }
+  60% { transform: translateX(-4px); }
+  80% { transform: translateX(3px); }
+  100% { transform: translateX(0); }
+}
+
+/* Toasts, modal feedback and end statistics. */
+.gf-fx { position: absolute; inset: 0; z-index: 30; overflow: hidden; pointer-events: none; }
+.gf-toast {
+  position: absolute;
+  top: 38%;
+  left: 50%;
+  color: #fff;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(45px, 9vw, 84px);
+  letter-spacing: 3px;
+  text-shadow: 4px 4px 0 var(--gf-ink);
+  transform: translate(-50%, -50%);
+  animation: gf-toast .9s ease-out forwards;
+}
+.gf-toast--warm { color: var(--gf-warm); font-size: clamp(28px, 7vw, 44px); }
+.gf-toast--tier { top: 46%; }
+.gf-popup {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 4;
+  display: grid;
+  width: min(600px, calc(100% - 32px));
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 32px);
+  align-content: center;
+  justify-items: center;
+  gap: clamp(8px, 1.8vh, 16px);
+  overflow-y: auto;
+  padding: clamp(16px, 2.5vh, 24px) clamp(18px, 2.5vw, 30px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: 0 8px 0 var(--gf-ink);
+  pointer-events: auto;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  animation: gf-popup-in .24s ease-out;
+}
+.gf-popup-title { max-width: 30ch; font-size: 28px; font-weight: 800; line-height: 1.15; }
+.gf-popup-content { width: 100%; font-size: 24px; font-weight: 700; line-height: 1.2; }
+.gf-popup-content:empty { display: none; }
+.gf-popup--cue .gf-popup-title { width: 100%; padding: 12px 18px; background: var(--gf-picture); border: 3px solid var(--gf-dotted-border); border-radius: 15px; }
+.gf-retry {
+  min-height: 44px;
+  margin-top: 2px;
+  padding: 7px 20px;
+  color: var(--gf-ink);
+  background: #ffd93d;
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(18px, 2.2vw, 27px);
+  letter-spacing: 1px;
+}
+.gf-retry:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.gf-stat { min-width: 110px; padding: 10px 18px; background: #f5f3ff; border: 3px solid var(--gf-ink); border-radius: 16px; }
+.gf-stat b { display: block; font-family: var(--gf-font-shout); font-size: 32px; letter-spacing: 1px; }
+@keyframes gf-popup-in { from { opacity: 0; transform: translate(-50%, -42%) scale(.9); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes gf-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+
+@media (max-width: 560px) {
+  .gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 20px)); }
+  .gf-hud { padding-block: 8px; }
+  .gf-chip { padding-inline: 9px; font-size: 16px; }
+  .gf-stage { gap: 14px; }
+  .gf-prompt { padding: 10px; font-size: 20px; }
+  .gf-tile { min-height: 66.6px; font-size: 24px; }
+  .gf-problem-card { padding: 8px; border-radius: 18px; }
+  .gf-popup { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
+  .gf-popup-title { font-size: 24px; }
+  .gf-popup-content { font-size: 20px; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .gf-tile { min-height: 57.15px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-stage { gap: 14px; padding-top: 4px; }
+  .gf-prompt { font-size: 20px; }
+  .gf-tiles { width: min(686px, 85%); grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .gf-tile { min-height: 54px; padding: 4px 10px; line-height: 1; }
+  .gf-problem-card { padding: 4px; border-radius: 16px; }
+  .gf-popup { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); padding: 10px; }
+  .gf-popup-content { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .game-frame *, .game-frame { animation: none !important; transition: none !important; }
+}
+
+/* ============================================================
+   Game 110 (ML 1.10): Sticker Album array clues. Everything below is
+   lesson-owned; the shell above is the Game 107 starter copy carried from
+   Games 108 and 109. Sticker art keeps its shared af- classes (art.js);
+   Game 110 layout and responses use ac-. Palette tokens (--af-*) are set
+   from theme.js at mount.
+   ============================================================ */
+body { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+.gf-screen { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+
+/* The Question Prompt is the frame's prompt bar above the Problem Card. The
+   card's dashed slot becomes the full card interior so the lesson lays it
+   out: Problem Statement on top, then the picture and the response rows. */
+.game-frame--ac .gf-stage { gap: 16px; }
+.game-frame--ac .gf-prompt { font-size: clamp(18px, 2.1vw, 24px); padding: 12px 14px; line-height: 1.25; }
+.game-frame--ac .gf-problem-card { grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); padding: clamp(10px, 1.6vw, 16px); }
+.game-frame--ac .gf-problem-slot {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  place-items: stretch;
+}
+
+/* Problem Card contents. */
+.ac-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  row-gap: clamp(8px, 1.6vh, 14px);
+  padding: 0 clamp(8px, 2vw, 24px);
+}
+.ac-story {
+  max-width: 62ch;
+  padding: 0 clamp(36px, 4vw, 48px);
+  font-size: clamp(17px, 1.9vw, 22px);
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--gf-ink);
+}
+/* Match (Guided Practice 1-2): the story beside the array so an 8-row
+   array keeps the full card height (captain: statement above the picture;
+   on a wide card the statement takes the left column, the picture the
+   right, and the phone stacks them). The solved equation pill sits under
+   the story. */
+.ac-card--match { grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); grid-template-rows: minmax(0, 1fr) auto; column-gap: clamp(14px, 3vw, 36px); align-items: center; }
+.ac-card--match .ac-story { grid-column: 1; grid-row: 1; padding: 0 8px; align-self: center; }
+.ac-card--match .af-array--card { grid-column: 2; grid-row: 1 / span 2; max-width: 100%; }
+.ac-card--match .ac-equals { grid-column: 1; grid-row: 2; }
+
+/* Split body (Modeled Review): Array Display left, response rows right. */
+.ac-body {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  align-items: center;
+  justify-items: center;
+  column-gap: clamp(14px, 3vw, 40px);
+  row-gap: clamp(8px, 1.6vh, 16px);
+}
+.ac-card--split .ac-body { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.ac-card--split .af-array--card { grid-column: 1; }
+.ac-card--split .ac-rows { grid-column: 2; }
+/* Stacked body (Game 105 2:2:1 direction): picture two shares, response
+   rows one share; the statement sits above as its own band. */
+.ac-card--stack .ac-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+.ac-card--stack .ac-rows { max-width: none; grid-auto-flow: column; justify-content: center; column-gap: clamp(16px, 3vw, 40px); }
+.ac-card--stack .ac-row { width: auto; }
+
+/* Response rows: "equation:" and "unknown:" writing lines. A blank is a
+   writing line; the active one glows; a filled one pops in. */
+.ac-rows { display: grid; gap: clamp(12px, 2.4vh, 24px); justify-items: start; width: 100%; max-width: 380px; }
+.ac-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: clamp(8px, 1.2vw, 14px); width: 100%; }
+.ac-row-label { font-size: clamp(16px, 1.8vw, 21px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); white-space: nowrap; }
+.ac-row-line { display: flex; align-items: center; gap: clamp(6px, 1vw, 10px); min-height: 52px; }
+.ac-unit-line { display: inline-flex; align-items: center; gap: 8px; }
+.ac-unit { font-size: clamp(17px, 2vw, 22px); font-weight: 700; }
+.ac-slot { position: relative; display: inline-grid; place-items: center; min-height: 48px; font-size: clamp(22px, 2.8vw, 32px); font-weight: 700; line-height: 1; white-space: nowrap; }
+.ac-slot--fixed { min-width: 1.3em; }
+.ac-slot--sign { font-size: clamp(20px, 2.4vw, 28px); }
+.ac-slot--blank {
+  min-width: 2em;
+  padding: 4px 10px;
+  background: #fff;
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 12px;
+  color: transparent;
+  transition: border-color .2s, box-shadow .2s, transform .2s;
+}
+.ac-slot--blank.ac-slot--wide { min-width: 6.4em; }
+.ac-slot--active {
+  border-color: var(--gf-accent);
+  box-shadow: 0 0 0 4px rgb(242 155 56 / 35%);
+  animation: ac-slot-pulse 1.1s ease-in-out infinite alternate;
+}
+@keyframes ac-slot-pulse { from { box-shadow: 0 0 0 3px rgb(242 155 56 / 30%); } to { box-shadow: 0 0 0 7px rgb(255 212 90 / 55%); transform: translateY(-2px); } }
+.ac-slot--filled {
+  color: var(--gf-ink);
+  background: #fff;
+  border: 3px solid var(--gf-good);
+  border-radius: 12px;
+  padding: 4px 10px;
+  animation: ac-slot-in .32s cubic-bezier(.2,.9,.3,1.3) both;
+}
+.ac-slot--done { border-color: var(--gf-accent); box-shadow: 0 0 0 4px rgb(255 212 90 / 55%); }
+@keyframes ac-slot-in { from { transform: translateY(-16px) scale(.6); opacity: 0; } to { transform: none; opacity: 1; } }
+.ac-scaffold { gap: clamp(6px, 1vw, 12px); }
+/* A new Problem Card rises in; a filled blank waits for its token to land. */
+.ac-card { animation: ac-card-in .42s cubic-bezier(.2,.9,.3,1.15) both; }
+@keyframes ac-card-in { from { opacity: 0; transform: translateY(18px) scale(.97); } to { opacity: 1; transform: none; } }
+.ac-slot--incoming { color: transparent; background: #fff; border: 3px dashed var(--gf-dotted-border); border-radius: 12px; padding: 4px 10px; }
+.ac-slot--incoming .ac-eq-token { color: transparent; background: transparent; border-color: transparent; }
+.ac-fly-token {
+  position: absolute;
+  z-index: 5;
+  display: inline-grid;
+  place-items: center;
+  padding: 4px 12px;
+  color: var(--gf-ink);
+  background: transparent;
+  border: 0;
+  border-radius: 12px;
+  box-shadow: none;
+  font-family: var(--gf-font-read);
+  font-size: clamp(22px, 3vw, 30px);
+  font-weight: 700;
+  transform: translate(-50%, -50%);
+  will-change: transform;
+}
+.ac-fly-token .ac-eq { font-size: clamp(20px, 2.8vw, 28px); }
+.ac-fly-token .ac-fly-content.ac-q { font-size: clamp(24px, 3vw, 34px); }
+
+/* The ? token: yellow like the mystery sticker wherever it appears. */
+.ac-eq { display: inline-flex !important; align-items: center; justify-content: center; gap: .3em; white-space: nowrap; }
+.ac-eq-token { display: inline-grid; place-items: center; }
+.ac-q {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.3em;
+  padding: 0 .2em;
+  color: var(--gf-ink);
+  background: var(--af-sticker, #FFD45A);
+  border: 2px solid var(--gf-ink);
+  border-radius: 8px;
+  font-family: var(--gf-font-shout);
+  letter-spacing: 1px;
+}
+.ac-slot.ac-q { font-family: var(--gf-font-shout); font-size: clamp(24px, 3vw, 34px); }
+.ac-q--stuck { overflow: visible; }
+.ac-q-sticker { position: absolute; inset: 0; display: grid; place-items: center; animation: ac-stick .3s cubic-bezier(.2,.9,.3,1.3) both; }
+.ac-q-sticker svg { width: 130%; height: 130%; }
+@keyframes ac-stick { from { transform: scale(1.6) rotate(-14deg); opacity: 0; } to { transform: none; opacity: 1; } }
+/* Peel: the sticker lifts from its bottom-right corner and flies off. */
+.ac-slot--peeling { color: transparent; }
+.ac-peel { position: absolute; inset: 0; display: grid; place-items: center; transform-origin: 0% 0%; animation: ac-peel .52s cubic-bezier(.5,0,.8,.4) both; }
+.ac-peel svg { width: 130%; height: 130%; }
+@keyframes ac-peel {
+  0% { transform: rotate(0) scale(1); opacity: 1; }
+  40% { transform: rotate(-24deg) scale(1.1) translate(10%, -10%); opacity: 1; }
+  100% { transform: rotate(-70deg) scale(.4) translate(120%, -200%); opacity: 0; }
+}
+.ac-slot--revealed { color: var(--gf-ink); background: #fff; border-color: var(--gf-good); font-family: var(--gf-font-read); }
+.ac-slot--land { animation: ac-land .36s cubic-bezier(.2,.9,.3,1.35) both; }
+@keyframes ac-land { 0% { transform: scale(.4); } 60% { transform: scale(1.25); } 100% { transform: none; } }
+
+/* The solved equation pill under a match array. */
+.ac-equals {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: .3em;
+  padding: 6px 18px;
+  background: #fff;
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 999px;
+  font-size: clamp(20px, 2.6vw, 30px);
+  font-weight: 700;
+  color: var(--gf-ink);
+  animation: ac-slot-in .36s cubic-bezier(.2,.9,.3,1.3) both;
+}
+
+/* The sealed sticker pack (fill form without a source drawing). */
+.ac-pack {
+  display: grid;
+  place-items: center;
+  width: min(100%, 360px);
+  height: auto;
+  max-height: 100%;
+  overflow: hidden;
+  padding: 10px 12px;
+  background:
+    repeating-linear-gradient(-45deg, transparent 0 14px, rgb(255 212 90 / 25%) 14px 28px),
+    var(--af-page, #fff);
+  border: 3px solid var(--gf-ink);
+  border-radius: 14px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+  transform-origin: 50% 100%;
+}
+.ac-pack-face { display: grid; justify-items: center; gap: 8px; }
+.ac-pack-face > svg { animation: af-wobble 2.2s ease-in-out infinite; }
+@keyframes af-wobble { 0%, 100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg) translateY(-3px); } }
+.ac-pack-copy { font-size: clamp(14px, 1.7vw, 17px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+.ac-pack--open { animation: ac-open .52s cubic-bezier(.4,0,.7,.3) both; }
+.ac-pack--open .ac-pack-face > svg { animation: none; }
+@keyframes ac-open {
+  0% { transform: none; opacity: 1; }
+  12% { transform: rotate(-4deg) scale(1.03); opacity: 1; }
+  24% { transform: rotate(4deg) scale(1.05); opacity: 1; }
+  36% { transform: rotate(-3deg) scale(1.08); opacity: 1; }
+  48% { transform: rotate(0) scale(1.1); opacity: 1; }
+  100% { transform: scale(1.2) rotate(8deg) translateY(-40%); opacity: 0; }
+}
+
+/* Array Display: a white album page with a grid of stickers. Sticker size
+   follows the container so rows and columns stay countable. */
+.af-array {
+  --af-gap: clamp(3px, 0.5vw, 5px);
+  --af-cell: 40px;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+}
+.af-array--card {
+  width: 100%;
+  height: 100%;
+  container-type: size;
+}
+.af-page {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: clamp(5px, 0.8vw, 8px);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 15px, var(--af-page-line, #DCE3F7) 15px 16px),
+    var(--af-page, #fff);
+  border: 3px solid var(--gf-ink);
+  border-radius: 14px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+}
+.af-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--af-cols), var(--af-cell));
+  grid-auto-rows: var(--af-cell);
+  gap: var(--af-gap);
+}
+.af-array--card .af-grid {
+  --af-cell: min(
+    calc((100cqw - 22px - (var(--af-cols) - 1) * var(--af-gap)) / var(--af-cols)),
+    calc((100cqh - 22px - (var(--af-rows) - 1) * var(--af-gap)) / var(--af-rows)),
+    64px
+  );
+}
+.af-cell {
+  position: relative;
+  display: grid;
+  width: var(--af-cell);
+  height: var(--af-cell);
+  place-items: center;
+}
+.af-cell > svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 2px 0 rgb(19 33 63 / 20%)); }
+.af-array--peel .af-cell {
+  animation: af-peel .38s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: calc(120ms + var(--af-r) * 170ms + var(--af-c) * 22ms);
+}
+@keyframes af-peel {
+  0% { opacity: 0; transform: translateY(-14px) rotate(-12deg) scale(.6); }
+  60% { opacity: 1; transform: translateY(2px) rotate(3deg) scale(1.08); }
+  100% { opacity: 1; transform: none; }
+}
+.af-cell--shine { animation: af-shine .5s ease-out both; animation-delay: var(--af-shine-delay, 0ms); }
+@keyframes af-shine {
+  0% { transform: scale(1); filter: brightness(1); }
+  40% { transform: scale(1.22) rotate(-6deg); filter: brightness(1.35) drop-shadow(0 0 6px #ffd45a); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+.af-array--solved .af-page { border-color: var(--gf-good); box-shadow: 0 4px 0 var(--gf-good); animation: ac-page-pop .55s cubic-bezier(.2,.9,.3,1.3); }
+@keyframes ac-page-pop { 0% { transform: scale(1); } 35% { transform: scale(1.04) rotate(-1deg); } 70% { transform: scale(.99) rotate(.5deg); } 100% { transform: scale(1); } }
+
+/* Braced help/example pictures: "R rows" beside, "C in each row" below. */
+.af-array--braced {
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  gap: 6px 10px;
+  align-items: center;
+  justify-items: center;
+}
+.af-array--braced .af-page { grid-column: 2; grid-row: 1; }
+.af-brace { font-size: clamp(14px, 1.8vw, 18px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+.af-brace--rows { grid-column: 1; grid-row: 1; max-width: 5ch; text-align: center; }
+.af-brace--cols { grid-column: 2; grid-row: 2; }
+.af-array--help { --af-cell: clamp(22px, 5vw, 32px); --af-gap: 4px; }
+.af-array--example { --af-cell: clamp(26px, 6vw, 40px); --af-gap: 5px; }
+.af-cell--lit > svg { filter: drop-shadow(0 0 5px #ffd45a) brightness(1.15); }
+.af-cell--current { animation: af-bump .3s ease-out; }
+@keyframes af-bump { 50% { transform: scale(1.2); } }
+
+/* Answer Grid: equation tiles, number tiles and the ? token. A part with
+   its own grid swaps the tiles in with a short rise. */
+/* Lesson-specific frame exception (recorded in REQUIREMENTS.md): Game 110
+   tiles are 84px on desktop and 50px on phones, so the Problem Card keeps
+   room for an 8-row array (Guided Practice 1). */
+.gf-tiles--multi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.game-frame--ac .gf-tile { min-height: 84px; }
+.gf-tile[data-found="true"] { background: var(--gf-good); }
+.gf-answer-content { display: inline-flex; align-items: center; justify-content: center; }
+.gf-tile .ac-eq { font-size: clamp(22px, 3.6vw, 30px); }
+.gf-tile .ac-q { font-size: 1em; padding: 0 .25em; }
+.gf-tile[data-muted="true"] { opacity: .38; box-shadow: 0 3px 0 var(--gf-ink); transform: translateY(3px); cursor: default; }
+.gf-tiles[data-count="6"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gf-tile--num { font-size: clamp(28px, 4.4vw, 36px); }
+.gf-tile--q .gf-answer-content { font-family: var(--gf-font-shout); font-size: clamp(32px, 5vw, 42px); letter-spacing: 1px; color: var(--gf-ink); background: var(--af-sticker, #FFD45A); border: 2px solid var(--gf-ink); border-radius: 10px; padding: 0 16px; }
+.gf-tiles--enter .gf-tile, .gf-tiles--swap .gf-tile {
+  animation: ac-tile-in .34s cubic-bezier(.2,.9,.3,1.3) backwards;
+  animation-delay: calc(var(--gf-tile-i, 0) * 55ms);
+}
+@keyframes ac-tile-in { from { transform: translateY(24px) scale(.85); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Help content inside the frame popups. */
+.ac-help { display: grid; justify-items: center; gap: 10px; width: 100%; }
+.ac-help-copy { max-width: 36ch; font-size: clamp(17px, 2.1vw, 21px); font-weight: 600; line-height: 1.3; }
+.ac-help-growth { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+.ac-help-story { padding: 6px 14px; background: var(--af-picture, #F3F6FF); border: 2px solid var(--gf-dotted-border); border-radius: 12px; font-size: clamp(16px, 2vw, 20px); font-weight: 700; }
+.ac-help--teach .af-array { justify-self: center; }
+.ac-help-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; font-size: clamp(16px, 2.2vw, 22px); font-weight: 700; }
+.ac-help-line span { padding: 4px 12px; background: var(--af-picture, #F3F6FF); border: 2px solid var(--gf-dotted-border); border-radius: 12px; transition: border-color .3s, background .3s; }
+.ac-help-line .ac-help-sign { padding: 0; background: none; border: 0; }
+.ac-help-line .ac-help-lit { border-color: var(--gf-good); background: #fff; }
+.ac-help-eq { display: inline-flex; align-items: center; gap: .3em; padding: 6px 16px; background: #fff; border: 3px solid var(--gf-good); border-radius: 999px; font-size: clamp(20px, 2.8vw, 28px); font-weight: 700; }
+.ac-help-eq--done { border-color: var(--gf-accent); box-shadow: 0 0 0 4px rgb(255 212 90 / 55%); animation: ac-tile-pop .38s cubic-bezier(.2,.9,.3,1.4); }
+.ac-help-eq .ac-q:not(.ac-slot--peeling):not(.ac-slot--revealed) { animation: ac-breathe 1.3s ease-in-out infinite; }
+@keyframes ac-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1) rotate(-3deg); } }
+.ac-help-growth { animation: ac-slot-in .4s cubic-bezier(.2,.9,.3,1.3) .25s both; }
+.ac-help-eq .ac-slot--revealed { border: 0; background: none; padding: 0; min-width: 0; }
+.ac-help-next { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+
+/* Start Lesson. */
+.ac-example { display: grid; justify-items: center; gap: 10px; }
+.ac-example-label { font-family: var(--gf-font-shout); font-size: 20px; letter-spacing: 1px; color: var(--af-bg-a, #6B3FA0); }
+.ac-example-story { font-size: 17px; font-weight: 600; }
+.ac-example-eq { display: inline-flex; min-height: 44px; align-items: center; gap: .3em; padding: 4px 16px; background: #fff; border: 2px solid var(--gf-good); border-radius: 999px; font-size: 26px; font-weight: 700; }
+.ac-example-eq .ac-slot--revealed { border: 0; background: none; padding: 0; min-width: 0; font-family: var(--gf-font-read); }
+.ac-example-copy { max-width: 46ch; font-size: 17px; font-weight: 600; line-height: 1.3; }
+
+/* End Screen album. */
+.ac-album-title { margin-top: 4px; font-family: var(--gf-font-shout); font-size: 22px; letter-spacing: 1px; color: var(--af-bg-a, #6B3FA0); }
+.ac-album { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 8px 0 14px; }
+.af-album-item {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 8px;
+  background: #fff;
+  border: 3px solid var(--gf-ink);
+  border-radius: 12px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  animation: af-album-in .4s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: var(--af-album-delay, 0ms);
+}
+@keyframes af-album-in { from { opacity: 0; transform: scale(.5) rotate(-8deg); } to { opacity: 1; transform: none; } }
+.af-album-mini { display: grid; grid-template-columns: repeat(var(--af-cols), 9px); gap: 2px; }
+.af-album-dot { display: block; width: 9px; height: 9px; border: 1px solid var(--gf-ink); border-radius: 2px; }
+.af-album-dot--star { background: var(--af-sticker, #FFD45A); }
+.af-album-dot--circle { background: var(--af-sticker-alt, #6BCBFF); border-radius: 50%; }
+.af-album-dot--diamond { background: var(--af-sticker-third, #FF8FAB); transform: rotate(45deg) scale(.8); }
+.af-album-text { font-size: 15px; font-weight: 700; }
+
+/* Celebration pieces. */
+.af-confetti {
+  position: absolute;
+  top: -20px;
+  width: 14px;
+  height: 14px;
+  background: var(--af-piece, #ffd45a);
+  border: 2px solid var(--gf-ink);
+  border-radius: 3px;
+  animation: af-fall linear forwards;
+}
+.af-confetti--circle { border-radius: 50%; }
+.af-confetti--diamond { transform: rotate(45deg); }
+@keyframes af-fall { to { transform: translateY(110vh) rotate(720deg); opacity: .85; } }
+.af-fly { position: absolute; font-size: 28px; color: #ffd45a; text-shadow: 2px 2px 0 var(--gf-ink); animation: af-fly .9s ease-out forwards; }
+@keyframes af-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+.gf-toast--tier { color: #ffd45a; font-size: clamp(36px, 8vw, 64px); }
+
+/* Compact phones. */
+@media (max-width: 560px) {
+  /* Fit on a 320x568 phone: the story, the picture and the response rows
+     share a 210px card, so every band is tightened before the picture is.
+     Measurements are recorded in BETA-NOTES.md; the picture is the band
+     that gives, and the fit conflict is flagged there for the captain. */
+  .ac-card { row-gap: 4px; padding: 0; }
+  .game-frame--ac .gf-prompt { padding: 6px 8px; font-size: 14px; line-height: 1.2; }
+  .game-frame--ac .gf-stage { gap: 8px; }
+  .game-frame--ac .gf-problem-card { padding: 6px 6px 5px; }
+  .ac-story { font-size: 13px; padding: 0 46px 0 2px; max-width: none; line-height: 1.2; }
+  .ac-body { row-gap: 4px; }
+  /* Split and stacked both stack on a phone: picture above, rows below. */
+  .ac-card--match { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; column-gap: 0; }
+  .ac-card--match .ac-story { grid-column: 1; grid-row: 1; }
+  .ac-card--match .af-array--card { grid-column: 1; grid-row: 2; }
+  .ac-card--match .ac-equals { grid-column: 1; grid-row: 3; }
+  .ac-card--split .ac-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; column-gap: 0; row-gap: 6px; }
+  .ac-card--split .af-array--card, .ac-card--split .ac-rows { grid-column: 1; }
+  .ac-card--stack .ac-body { grid-template-rows: minmax(0, 1fr) auto; row-gap: 6px; }
+  .ac-rows { max-width: none; gap: 3px; justify-items: center; }
+  .ac-card--stack .ac-rows { grid-auto-flow: row; column-gap: 0; }
+  .ac-row { grid-template-columns: auto auto; justify-content: center; gap: 6px; width: auto; }
+  .ac-row-label { font-size: 12px; }
+  .ac-row-line { min-height: 30px; gap: 4px; }
+  .ac-slot { min-height: 28px; font-size: 17px; }
+  .ac-slot--blank { padding: 2px 8px; border-width: 2px; }
+  .ac-slot--filled { padding: 2px 8px; border-width: 2px; }
+  .ac-slot--sign { font-size: 17px; }
+  .ac-slot.ac-q { font-size: 22px; }
+  .ac-unit { font-size: 15px; }
+  .ac-equals { padding: 3px 12px; font-size: 17px; border-width: 2px; }
+  /* Keep the page clear of the 44px sound control in the card's top-right
+     corner: the statement pads on the right, the picture centers below. */
+  .ac-pack { max-height: 140px; padding: 8px; }
+  .ac-pack-face > svg { width: 44px; height: 44px; }
+  .ac-pack-copy { font-size: 12px; }
+  .gf-tile .ac-eq { font-size: 19px; }
+  .gf-tiles[data-count="6"] .gf-tile { padding: 6px 4px; font-size: 19px; }
+  .gf-tile--num { font-size: 24px; }
+  .gf-tile--q .gf-answer-content { font-size: 26px; padding: 0 12px; }
+  .af-page { padding: 4px; border-width: 2px; box-shadow: 0 2px 0 var(--gf-ink); }
+  .af-array--card .af-grid {
+    --af-gap: 2px;
+    --af-cell: min(
+      calc((100cqw - 12px - (var(--af-cols) - 1) * var(--af-gap)) / var(--af-cols)),
+      calc((100cqh - 12px - (var(--af-rows) - 1) * var(--af-gap)) / var(--af-rows)),
+      64px
+    );
+  }
+  .gf-tiles--multi { gap: 8px; }
+  .game-frame--ac .gf-tile { min-height: 50px; }
+  .gf-stats { gap: 8px; margin: 10px 0; }
+  .gf-stat { min-width: 78px; padding: 6px 8px; font-size: 14px; }
+  .gf-stat b { font-size: 24px; }
+  .ac-album { gap: 6px; }
+  .af-album-item { padding: 5px; }
+  /* Popups: content aligns from the top when taller than the card, so the
+     title never scrolls out of reach. */
+  .game-frame--ac .gf-popup { align-content: safe center; gap: 6px; padding: 10px; }
+  .game-frame--ac .gf-popup-title { font-size: 20px; }
+  .ac-help { gap: 6px; }
+  .ac-help-copy { font-size: 14px; }
+  .ac-help-growth { font-size: 14px; }
+  .ac-help-story { font-size: 13px; padding: 4px 10px; }
+  .ac-help-line { font-size: 13px; gap: 4px; }
+  .ac-help-line span { padding: 2px 8px; }
+  .ac-help-eq { font-size: 18px; padding: 4px 12px; }
+  .ac-help-next { font-size: 14px; }
+  .af-array--help { --af-cell: 20px; --af-gap: 3px; }
+  .af-brace { font-size: 13px; }
+  .ac-example-copy, .ac-example-story { font-size: 17px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-tiles--multi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .gf-tiles[data-count="6"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .ac-card { row-gap: 6px; }
+}
+
+/* Answer slots retain their writing-box shape throughout answer transfer. */
+.ac-slot.ac-slot--blank { box-sizing: border-box; background: #fff; border: 3px dashed var(--gf-dotted-border); border-radius: 12px; padding: 4px 10px; }
+.ac-slot.ac-slot--active { border-color: var(--gf-accent); }
+.ac-slot.ac-slot--incoming { color: transparent; }
+.ac-slot.ac-slot--filled, .ac-slot.ac-slot--revealed { color: var(--gf-ink); }
+@media (max-width: 560px) { .ac-slot.ac-slot--blank { padding: 2px 8px; border-width: 2px; } }
+
+.ac-known-values { margin: 0; text-align: center; font-weight: 700; }
+.ac-slot.ac-slot--rows:not(.ac-slot--incoming) { color: var(--gf-ink); }
+.ac-card--fill:has(.ac-known-values) .ac-body { grid-template-rows: minmax(0, 1fr) auto auto; }
+
+.ac-labelled-slot { display: inline-grid; justify-items: center; gap: 3px; }
+.ac-labelled-slot .ac-unit { font-size: 16px; }
+/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: var(--mg-expression-label-line-height, 1.05);
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: var(--mg-expression-value-line-height, 1.15);
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+/* Equal side columns keep the title centered across the complete header. */
+.game-home-header:is(.mg-hud, .gf-hud) {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  align-items: center; gap: 8px;
+}
+.game-home-header > :is(.mg-hud-title, .gf-hud-title) { text-align: center; min-width: 0; width: 100%; }
+.game-home-header > :is(.mg-chips, .gf-chips) { justify-self: end; }
+.game-home {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  box-sizing: border-box; width: 48px; min-height: 48px; flex-shrink: 0;
+  background: var(--mg-card, #fff5d6); color: var(--mg-ink, #142343);
+  border: 3px solid var(--mg-ink, #142343); border-radius: 14px;
+  box-shadow: 0 4px 0 var(--mg-ink, #142343); text-shadow: none; text-decoration: none;
+  font: 700 20px var(--mg-font-read, 'Fredoka', sans-serif);
+}
+.game-home svg { width: 25px; height: 25px; }
+.game-home:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+.game-home:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mg-ink, #142343); }
+.game-end-actions { display: flex; justify-content: center; align-items: stretch; gap: 12px; margin-top: 12px; }
+.game-end-actions > .game-home-labeled { width: auto; min-height: 64px; padding: 10px 20px; }
+.game-end-actions > :is(.mg-big-btn, .gf-big-btn) { margin: 0; }
+.game-home-header > .gf-hud-title { font-size: clamp(15px, 2.6vw, 40px); white-space: normal; overflow-wrap: anywhere; }
+.game-home-header > :is(.mg-chips, .gf-chips) { width: max-content; white-space: nowrap; }
+.gf-root .game-home, .gf-game .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }
+.game-home-header > .mg-hud-title { white-space: normal; overflow-wrap: anywhere; }
+.gf-hud .game-home, .gf-end-card .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>

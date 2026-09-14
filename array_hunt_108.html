@@ -1,0 +1,2937 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+(function installGameFrame(global) {
+  const DEFAULT_THEME = Object.freeze({
+    bgA: "#3156D8",
+    bgB: "#13213F",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#37C8C5",
+    picture: "#E5F8F5",
+    pictureAlt: "#fffdf4"
+  });
+  const DEFAULT_PROBLEMS = Object.freeze([
+    { id: "sample-1", title: "Sample lesson card", detail: "Replace this panel with the first lesson problem.", prompt: "Choose the answer that fits.", answer: "c", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-2", title: "The next sample card", detail: "The frame keeps the same question and choices after a miss.", prompt: "Choose the answer that fits.", answer: "a", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-3", title: "One more sample card", detail: "Your adapter can render a picture, chart, or other lesson view here.", prompt: "Choose the answer that fits.", answer: "d", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] }
+  ]);
+  const DEFAULTS = Object.freeze({
+    title: "LESSON GAME",
+    subtitle: "A reusable frame for a new lesson.",
+    tag: "LESSON · STARTER",
+    startButton: "START",
+    playAgain: "PLAY AGAIN",
+    totalQuestions: DEFAULT_PROBLEMS.length,
+    basePoints: 10,
+    // Game 107 awards base points plus the new streak length. Set false when
+    // a lesson wants the frame without a streak bonus.
+    streakBonus: true,
+    advanceMs: 900,
+    hotStreak: 5
+  });
+  const isNode = (value) => Boolean(value && typeof value === "object" && value.nodeType);
+  function node(documentRef, tag, className, text) {
+    const element = documentRef.createElement(tag);
+    if (className) element.className = className;
+    if (text !== void 0 && text !== null) element.textContent = String(text);
+    return element;
+  }
+  function append(parent, ...children) {
+    children.flat(Infinity).forEach((child) => {
+      if (child !== null && child !== void 0) parent.append(child);
+    });
+    return parent;
+  }
+  function putContent(host, content) {
+    host.replaceChildren();
+    if (isNode(content)) host.append(content);
+    else if (content !== void 0 && content !== null) host.textContent = String(content);
+    return host;
+  }
+  function safeText(value, fallback = "") {
+    return value === void 0 || value === null ? fallback : String(value);
+  }
+  function normalizeChoice(choice, index) {
+    if (choice && typeof choice === "object") {
+      const id = safeText(choice.id, String(index));
+      return { ...choice, id, label: safeText(choice.label, id) };
+    }
+    const label = safeText(choice, String(index));
+    return { id: label, label };
+  }
+  function normalizeProblem(problem, index) {
+    const value = problem && typeof problem === "object" ? problem : {};
+    const choices = Array.isArray(value.choices) ? value.choices.map(normalizeChoice) : [];
+    if (!choices.length) throw new Error("Game frame problem needs at least one choice");
+    const answer = safeText(value.answer, "");
+    if (!answer || !choices.some((choice) => choice.id === answer)) {
+      throw new Error(`Game frame problem answer must match a choice id (problem ${index + 1})`);
+    }
+    const answers = Array.isArray(value.answers) && value.answers.length ? value.answers.map((id) => safeText(id, "")) : [answer];
+    if (answers.some((id) => !choices.some((choice) => choice.id === id))) {
+      throw new Error(`Game frame problem answers must match choice ids (problem ${index + 1})`);
+    }
+    return {
+      ...value,
+      id: safeText(value.id, `problem-${index + 1}`),
+      prompt: safeText(value.prompt, ""),
+      answer,
+      answers,
+      multi: Boolean(value.multi),
+      choices
+    };
+  }
+  function makeTheme(theme) {
+    return { ...DEFAULT_THEME, ...theme && typeof theme === "object" ? theme : {} };
+  }
+  function mount2(root, supplied = {}) {
+    if (!root || !root.ownerDocument) throw new Error("GameFrameStarter.mount needs a DOM element");
+    const documentRef = root.ownerDocument;
+    const view = documentRef.defaultView || global;
+    const config = { ...DEFAULTS, ...supplied };
+    const theme = makeTheme(config.theme);
+    const problems = Array.isArray(config.problems) && config.problems.length ? config.problems : DEFAULT_PROBLEMS;
+    const totalQuestions = Math.max(1, Number(config.totalQuestions) || problems.length);
+    const getProblem = typeof config.getProblem === "function" ? config.getProblem : (index) => problems[index % problems.length];
+    const renderProblem = typeof config.renderProblem === "function" ? config.renderProblem : (problem2, host) => renderDefaultProblem(problem2, host, documentRef);
+    const renderStartExample = typeof config.renderStartExample === "function" ? config.renderStartExample : (host) => renderDefaultStartExample(host, documentRef);
+    const renderAnswer = typeof config.renderAnswer === "function" ? config.renderAnswer : (choice, host) => host.textContent = safeText(choice.label, choice.id);
+    let destroyed = false;
+    let problem = null;
+    let problemIndex = 0;
+    let popup = null;
+    let advanceTimer = null;
+    let toastTimer = null;
+    let previousFocus = null;
+    const listeners = [];
+    const timers = /* @__PURE__ */ new Set();
+    const state = {
+      phase: "start",
+      score: 0,
+      streak: 0,
+      bestStreak: 0,
+      questionsAnswered: 0,
+      completed: 0,
+      canAnswer: false,
+      firstTry: true,
+      wrongAttempts: 0,
+      muted: false
+    };
+    root.replaceChildren();
+    root.classList.add("game-frame", "game-frame--standard");
+    root.setAttribute("role", "main");
+    root.setAttribute("aria-label", safeText(config.ariaLabel, `${config.title} game`));
+    Object.entries(theme).forEach(([key, value]) => root.style.setProperty(`--gf-${toKebab(key)}`, value));
+    if (documentRef.title === "Math Game" || !documentRef.title) documentRef.title = `${config.title} | Math Games`;
+    if (config.hidePrompt) root.classList.add("game-frame--card-prompt");
+    const startScreen = node(documentRef, "section", "gf-screen gf-screen--start");
+    const startCard = node(documentRef, "div", "gf-card gf-start-card");
+    const startIcon = node(documentRef, "div", "gf-emoji", config.startIcon || "✦");
+    startIcon.setAttribute("aria-hidden", "true");
+    const startTitle = node(documentRef, "h1", "gf-title", config.title);
+    const startSubtitle = node(documentRef, "p", "gf-subtitle", config.subtitle);
+    const startTag = node(documentRef, "p", "gf-tag", config.tag);
+    const startExample = node(documentRef, "div", "gf-example");
+    const startButton = node(documentRef, "button", "gf-big-btn", config.startButton);
+    startButton.type = "button";
+    append(startCard, startIcon, startTitle, startSubtitle, startTag, startExample, startButton);
+    startScreen.append(startCard);
+    const shell = node(documentRef, "div", "gf-shell");
+    const hud = node(documentRef, "header", "gf-hud");
+    const hudTitle = node(documentRef, "h2", "gf-hud-title", config.title);
+    const chips = node(documentRef, "div", "gf-chips");
+    const scoreChip = node(documentRef, "span", "gf-chip gf-chip--score", "Score 0");
+    const streakChip = node(documentRef, "span", "gf-chip gf-chip--streak", "0🔥");
+    append(chips, scoreChip, streakChip);
+    append(hud, hudTitle, chips);
+    const progress = node(documentRef, "div", "gf-progress");
+    const progressBar = node(documentRef, "i");
+    progress.append(progressBar);
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", "Question progress");
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(totalQuestions));
+    const stage = node(documentRef, "main", "gf-stage");
+    const prompt = node(documentRef, "h3", "gf-prompt");
+    prompt.tabIndex = -1;
+    prompt.setAttribute("aria-live", "polite");
+    const visual = node(documentRef, "div", "gf-visual");
+    const problemCard = node(documentRef, "section", "gf-problem-card");
+    problemCard.setAttribute("aria-label", "Lesson problem");
+    const problemSlot = node(documentRef, "div", "gf-problem-slot");
+    const soundButton = node(documentRef, "button", "gf-sound", "🔊");
+    soundButton.type = "button";
+    soundButton.setAttribute("aria-pressed", "false");
+    soundButton.setAttribute("aria-label", "Sound on. Turn sound off");
+    append(problemCard, problemSlot, soundButton);
+    visual.append(problemCard);
+    const tiles = node(documentRef, "div", "gf-tiles");
+    tiles.setAttribute("role", "group");
+    tiles.setAttribute("aria-label", "Answer choices");
+    append(stage, prompt, visual, tiles);
+    const fx = node(documentRef, "div", "gf-fx");
+    const endScreen = node(documentRef, "section", "gf-screen gf-screen--end gf-hidden");
+    const endCard = node(documentRef, "div", "gf-card gf-end-card");
+    const endIcon = node(documentRef, "div", "gf-emoji", config.endIcon || "✦");
+    endIcon.setAttribute("aria-hidden", "true");
+    const endTitle = node(documentRef, "h1", "gf-title", config.endTitle || "NICE WORK!");
+    const endLine = node(documentRef, "p", "gf-subtitle");
+    const stats = node(documentRef, "div", "gf-stats");
+    const againButton = node(documentRef, "button", "gf-big-btn", config.playAgain);
+    againButton.type = "button";
+    const endExtra = node(documentRef, "div", "gf-end-extra");
+    append(endCard, endIcon, endTitle, endLine, stats, endExtra, againButton);
+    endScreen.append(endCard);
+    append(root, startScreen, shell, endScreen, fx);
+    append(shell, hud, progress, stage);
+    renderStartExample(startExample, { state, config, document: documentRef });
+    function listen(target, eventName, handler, options) {
+      target.addEventListener(eventName, handler, options);
+      listeners.push(() => target.removeEventListener(eventName, handler, options));
+    }
+    function later(callback, ms) {
+      const id = view.setTimeout(() => {
+        timers.delete(id);
+        if (!destroyed) callback();
+      }, ms);
+      timers.add(id);
+      return id;
+    }
+    function cancelTimer(id) {
+      if (id == null) return;
+      view.clearTimeout(id);
+      timers.delete(id);
+    }
+    function cancelAllTimers() {
+      timers.forEach((id) => view.clearTimeout(id));
+      timers.clear();
+      advanceTimer = null;
+      toastTimer = null;
+    }
+    function setInert(element, inert) {
+      if (inert) {
+        element.setAttribute("inert", "");
+        element.setAttribute("aria-hidden", "true");
+      } else {
+        element.removeAttribute("inert");
+        element.removeAttribute("aria-hidden");
+      }
+    }
+    function updateHud() {
+      scoreChip.textContent = `Score ${state.score}`;
+      streakChip.textContent = `${state.streak}🔥`;
+      streakChip.classList.toggle("gf-chip--hot", state.streak >= config.hotStreak);
+      const current = Math.min(totalQuestions, state.completed);
+      progressBar.style.width = `${current / totalQuestions * 100}%`;
+      progress.setAttribute("aria-valuenow", String(current));
+      progress.setAttribute("aria-valuetext", `${current} of ${totalQuestions} questions`);
+      if (typeof config.onStateChange === "function") config.onStateChange({ ...state }, api);
+    }
+    function showToast(text, kind = "good") {
+      if (!text) return;
+      const toast = node(documentRef, "div", `gf-toast gf-toast--${kind}`, text);
+      fx.append(toast);
+      if (toastTimer) cancelTimer(toastTimer);
+      toastTimer = later(() => toast.remove(), 900);
+    }
+    function focusableIn(panel) {
+      return Array.from(panel.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
+    }
+    function closePopup(restore = true) {
+      if (!popup) return;
+      const current = popup;
+      popup = null;
+      current.panel.removeEventListener("keydown", current.onKeyDown);
+      current.retry.removeEventListener("click", current.onRetry);
+      current.panel.remove();
+      setInert(shell, false);
+      tiles.querySelectorAll("button").forEach((button) => {
+        if (button.dataset.used === "true" || button.dataset.found === "true") return;
+        button.disabled = false;
+        button.removeAttribute("aria-disabled");
+        button.classList.remove("gf-wrong");
+      });
+      if (restore && previousFocus && previousFocus.isConnected !== false) {
+        try {
+          previousFocus.focus({ preventScroll: true });
+        } catch {
+          previousFocus.focus();
+        }
+      }
+      previousFocus = null;
+    }
+    function openPopup({ kind, title, content, returnFocus }) {
+      closePopup(false);
+      const panel = node(documentRef, "section", `gf-popup gf-popup--${kind}`);
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+      const titleNode = node(documentRef, "p", "gf-popup-title", title);
+      titleNode.id = `gf-popup-title-${Date.now()}-${Math.floor(Math.random() * 1e3)}`;
+      panel.setAttribute("aria-labelledby", titleNode.id);
+      const contentHost = node(documentRef, "div", "gf-popup-content");
+      if (content !== void 0 && content !== null) putContent(contentHost, content);
+      const retry = node(documentRef, "button", "gf-retry", "TRY AGAIN");
+      retry.type = "button";
+      append(panel, titleNode, contentHost, retry);
+      fx.append(panel);
+      setInert(shell, true);
+      tiles.querySelectorAll("button").forEach((button) => {
+        button.disabled = true;
+        button.setAttribute("aria-disabled", "true");
+      });
+      previousFocus = returnFocus || documentRef.activeElement;
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          retry.click();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = focusableIn(panel);
+        if (!focusable.length) {
+          event.preventDefault();
+          return;
+        }
+        const currentIndex = focusable.indexOf(documentRef.activeElement);
+        const nextIndex = event.shiftKey ? (currentIndex <= 0 ? focusable.length : currentIndex) - 1 : (currentIndex + 1) % focusable.length;
+        event.preventDefault();
+        focusable[nextIndex].focus();
+      };
+      panel.addEventListener("keydown", onKeyDown);
+      const onRetry = () => {
+        const canRetry = state.phase === "question" && Boolean(problem);
+        closePopup();
+        if (canRetry) {
+          state.canAnswer = true;
+          updateHud();
+        }
+      };
+      retry.addEventListener("click", onRetry);
+      popup = { panel, retry, onKeyDown, onRetry };
+      retry.focus();
+      return popup;
+    }
+    function renderQuestion({ focus = true } = {}) {
+      if (state.completed >= totalQuestions) return finish();
+      const rawProblem = getProblem(problemIndex, { ...state });
+      problem = normalizeProblem(rawProblem, problemIndex);
+      prompt.textContent = problem.prompt || config.prompt || "Choose an answer.";
+      putContent(problemSlot, null);
+      renderProblem(problem, problemSlot, { state: { ...state }, config, document: documentRef, api });
+      tiles.replaceChildren();
+      tiles.dataset.count = String(problem.choices.length);
+      tiles.classList.toggle("gf-tiles--multi", problem.multi);
+      problem.choices.forEach((choice) => {
+        const button = node(documentRef, "button", "gf-tile");
+        button.type = "button";
+        button.dataset.choiceId = choice.id;
+        button.setAttribute("aria-label", safeText(choice.ariaLabel, `Choose ${choice.label}`));
+        const content = node(documentRef, "span", "gf-answer-content");
+        renderAnswer(choice, content, { problem, state: { ...state }, document: documentRef, api });
+        button.append(content);
+        listen(button, "click", () => problem.multi ? tapMulti(choice, button) : answer(choice, button));
+        tiles.append(button);
+      });
+      state.phase = "question";
+      state.canAnswer = true;
+      state.firstTry = state.wrongAttempts === 0;
+      if (focus) prompt.focus({ preventScroll: true });
+      if (typeof config.onQuestion === "function") config.onQuestion(problem, api);
+    }
+    function foundButtons() {
+      return Array.from(tiles.querySelectorAll("button.gf-tile")).filter((button) => button.dataset.found === "true");
+    }
+    function tapMulti(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      if (button.dataset.found === "true") return;
+      if (!problem.answers.includes(choice.id)) {
+        settle(false, { choice, choices: [choice], button, buttons: [button] });
+        return;
+      }
+      button.dataset.found = "true";
+      button.classList.add("gf-right");
+      button.disabled = true;
+      button.setAttribute("aria-disabled", "true");
+      const found = foundButtons();
+      const complete = found.length >= problem.answers.length;
+      if (typeof config.onFound === "function") config.onFound({ choice, button, complete, problem, state: { ...state }, api });
+      if (!complete) return;
+      const choices = found.map((candidate) => problem.choices.find((entry) => entry.id === candidate.dataset.choiceId));
+      settle(true, { choice, choices, button, buttons: found });
+    }
+    function answer(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      settle(choice.id === problem.answer, { choice, choices: [choice], button, buttons: [button] });
+    }
+    function settle(correct, { choice, choices, button, buttons }) {
+      state.canAnswer = false;
+      if (correct) {
+        buttons.forEach((candidate) => candidate.classList.add("gf-right"));
+        tiles.querySelectorAll("button").forEach((candidate) => {
+          candidate.disabled = true;
+        });
+        state.completed += 1;
+        state.questionsAnswered += 1;
+        state.streak += 1;
+        state.bestStreak = Math.max(state.bestStreak, state.streak);
+        state.score += Number(config.basePoints) + (config.streakBonus === false ? 0 : state.streak);
+        state.wrongAttempts = 0;
+        updateHud();
+        showToast(typeof config.praise === "function" ? config.praise({ choice, problem, state: { ...state } }) : "NICE WORK!");
+        if (typeof config.onCorrect === "function") config.onCorrect({ choice, choices, problem, button, buttons, state: { ...state }, api });
+        const currentIndex = problemIndex;
+        problemIndex += 1;
+        const delay = typeof config.advanceMs === "function" ? config.advanceMs({ state: { ...state }, problem }) : config.advanceMs;
+        advanceTimer = later(() => {
+          advanceTimer = null;
+          if (currentIndex !== problemIndex - 1 || destroyed) return;
+          if (state.completed >= totalQuestions) finish();
+          else renderQuestion();
+          if (typeof config.onAdvance === "function") config.onAdvance({ state: { ...state }, api });
+        }, Math.max(0, Number(delay) || 0));
+      } else {
+        const firstTry = state.firstTry;
+        buttons.forEach((candidate) => candidate.classList.add("gf-wrong"));
+        state.wrongAttempts += 1;
+        state.streak = 0;
+        state.firstTry = false;
+        updateHud();
+        if (typeof config.onWrong === "function") config.onWrong({ choice, choices, problem, button, buttons, state: { ...state, firstTry }, api });
+        const teaching = state.wrongAttempts >= 2;
+        const title = teaching ? typeof config.teachingTitle === "function" ? config.teachingTitle({ problem, state: { ...state } }) : "LET’S WORK IT OUT TOGETHER" : typeof config.firstMissTitle === "function" ? config.firstMissTitle({ problem, state: { ...state } }) : "TAKE ANOTHER LOOK";
+        const content = teaching ? typeof config.renderTeaching === "function" ? config.renderTeaching(problem, { choices, state: { ...state }, document: documentRef, api }) : "Your teaching explanation goes here." : typeof config.renderFirstMiss === "function" ? config.renderFirstMiss(problem, { choices, state: { ...state }, document: documentRef, api }) : null;
+        openPopup({ kind: teaching ? "teaching" : "cue", title, content, returnFocus: button });
+      }
+    }
+    function startFresh() {
+      closePopup(false);
+      cancelAllTimers();
+      state.phase = "question";
+      state.score = 0;
+      state.streak = 0;
+      state.bestStreak = 0;
+      state.questionsAnswered = 0;
+      state.completed = 0;
+      state.canAnswer = false;
+      state.firstTry = true;
+      state.wrongAttempts = 0;
+      problemIndex = 0;
+      problem = null;
+      shell.classList.remove("gf-hidden");
+      startScreen.classList.add("gf-hidden");
+      endScreen.classList.add("gf-hidden");
+      setInert(startScreen, true);
+      setInert(endScreen, true);
+      setInert(shell, false);
+      updateHud();
+      renderQuestion();
+      if (typeof config.onStart === "function") config.onStart({ state: { ...state }, api });
+    }
+    function finish() {
+      if (destroyed) return;
+      cancelTimer(advanceTimer);
+      advanceTimer = null;
+      closePopup(false);
+      state.phase = "end";
+      state.canAnswer = false;
+      shell.classList.add("gf-hidden");
+      setInert(shell, true);
+      endLine.textContent = typeof config.endMessage === "function" ? config.endMessage({ state: { ...state } }) : `You completed ${state.completed} question${state.completed === 1 ? "" : "s"}.`;
+      stats.replaceChildren();
+      [["Score", state.score], ["Best streak", state.bestStreak], ["Questions", state.completed]].forEach(([label, value]) => {
+        const stat = node(documentRef, "div", "gf-stat", label);
+        stat.prepend(node(documentRef, "b", null, value));
+        stats.append(stat);
+      });
+      endExtra.replaceChildren();
+      if (typeof config.renderEnd === "function") config.renderEnd(endExtra, { state: { ...state }, document: documentRef, api });
+      endScreen.classList.remove("gf-hidden");
+      setInert(endScreen, false);
+      againButton.focus({ preventScroll: true });
+      updateHud();
+      if (typeof config.onEnd === "function") config.onEnd({ state: { ...state }, api });
+    }
+    function toggleSound() {
+      state.muted = !state.muted;
+      soundButton.textContent = state.muted ? "🔇" : "🔊";
+      soundButton.setAttribute("aria-pressed", state.muted ? "true" : "false");
+      soundButton.setAttribute("aria-label", state.muted ? "Sound off. Turn sound on" : "Sound on. Turn sound off");
+      if (typeof config.onSoundToggle === "function") config.onSoundToggle(state.muted, { state: { ...state }, api });
+    }
+    const api = {
+      root,
+      state,
+      get problem() {
+        return problem;
+      },
+      get problemIndex() {
+        return problemIndex;
+      },
+      start: startFresh,
+      answer(choiceId) {
+        const button = Array.from(tiles.querySelectorAll("button")).find((candidate) => candidate.dataset.choiceId === String(choiceId));
+        button?.click();
+      },
+      finish,
+      closePopup,
+      renderQuestion,
+      updateHud,
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        cancelAllTimers();
+        closePopup(false);
+        listeners.splice(0).forEach((remove) => remove());
+        root.replaceChildren();
+        root.classList.remove("game-frame", "game-frame--standard");
+        root.removeAttribute("role");
+        root.removeAttribute("aria-label");
+        if (typeof config.onDestroy === "function") config.onDestroy({ state: { ...state } });
+      }
+    };
+    listen(startButton, "click", startFresh);
+    listen(againButton, "click", startFresh);
+    listen(soundButton, "click", toggleSound);
+    setInert(startScreen, false);
+    setInert(shell, true);
+    setInert(endScreen, true);
+    return api;
+  }
+  function renderDefaultStartExample(host, documentRef) {
+    const label = node(documentRef, "p", "gf-example-label", "STARTER EXAMPLE");
+    const body = node(documentRef, "p", "gf-example-body", "Replace this example with the lesson introduction.");
+    append(host, label, body);
+  }
+  function renderDefaultProblem(problem, host, documentRef) {
+    const label = node(documentRef, "p", "gf-sample-kicker", "ADAPTER SLOT");
+    const title = node(documentRef, "h4", "gf-sample-title", problem.title || "Lesson content goes here");
+    const detail = node(documentRef, "p", "gf-sample-detail", problem.detail || "Render the lesson-specific problem in this card.");
+    append(host, label, title, detail);
+  }
+  function toKebab(value) {
+    return String(value).replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+  }
+  global.GameFrameStarter = Object.freeze({ mount: mount2, DEFAULT_PROBLEMS });
+})(globalThis);
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+const ROWS = Object.freeze([2, 5]);
+const COLS = Object.freeze([3, 10]);
+const MAX_PRODUCT = 50;
+const FORMS = Object.freeze(["select", "match", "which"]);
+const TIMES = "×";
+const ranges = Object.freeze({ rows: ROWS, cols: COLS });
+const PROMPTS = Object.freeze({
+  select: "Tap all of the expressions that represent the array.",
+  match: "Match the array to its expression.",
+  which: "Which expression represents the array?"
+});
+const expression = (a, b) => `${a} ${TIMES} ${b}`;
+const caption = (rows, cols) => `${rows} rows of ${cols}`;
+function shuffleWith(rng, list) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = rng.int(0, i);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+function permutation(rng, n) {
+  return shuffleWith(rng, Array.from({ length: n }, (_, i) => i));
+}
+function applyOrder(list, order) {
+  return order.map((i) => list[i]);
+}
+function pickArray(rng) {
+  for (; ; ) {
+    const rows = rng.int(ROWS[0], ROWS[1]);
+    const cols = rng.int(Math.max(COLS[0], rows + 1), COLS[1]);
+    if (rows * cols <= MAX_PRODUCT) return [rows, cols];
+  }
+}
+function inRange([r, c]) {
+  return r >= 1 && c >= 1 && r <= 10 && c <= 10;
+}
+function nearMisses(rows, cols) {
+  const correct = /* @__PURE__ */ new Set([expression(rows, cols), expression(cols, rows)]);
+  const candidates = [];
+  for (const pair of [[rows + 1, cols], [rows - 1, cols], [rows, cols + 1], [rows, cols - 1]]) {
+    for (const [a, b] of [pair, [pair[1], pair[0]]]) {
+      if (!inRange([a, b]) || correct.has(expression(a, b))) continue;
+      if (!candidates.some(([r, c]) => r === a && c === b)) candidates.push([a, b]);
+    }
+  }
+  return candidates;
+}
+function selectDistractors(rng, rows, cols) {
+  return shuffleWith(rng, nearMisses(rows, cols)).slice(0, 2);
+}
+function whichDistractors(rows, cols) {
+  return nearMisses(rows, cols).slice(0, 3).map((pair) => ({ kind: "mult", pair }));
+}
+function generate(rng) {
+  const form = FORMS[rng.int(0, FORMS.length - 1)];
+  return generateForm(rng, form);
+}
+function generateForm(rng, form) {
+  if (form === "select") {
+    const [rows, cols] = pickArray(rng);
+    return { form, rows, cols, d: selectDistractors(rng, rows, cols), order: permutation(rng, 4) };
+  }
+  if (form === "which") {
+    const [rows, cols] = pickArray(rng);
+    return { form, rows, cols, order: permutation(rng, 4) };
+  }
+  if (form === "match") {
+    const arrays = [];
+    const products = /* @__PURE__ */ new Set();
+    while (arrays.length < 3) {
+      const pair = pickArray(rng);
+      const product = pair[0] * pair[1];
+      if (products.has(product)) continue;
+      products.add(product);
+      arrays.push(pair);
+    }
+    const flip = arrays.map(() => rng.int(0, 1));
+    return { form, rows: arrays[0][0], cols: arrays[0][1], arrays, flip, order: permutation(rng, 3) };
+  }
+  throw new Error(`unknown form ${form}`);
+}
+function selectProblem(params) {
+  const { rows, cols, d, order } = params;
+  const base = [
+    { id: expression(rows, cols), label: expression(rows, cols), correct: true, a: rows, b: cols },
+    { id: expression(cols, rows), label: expression(cols, rows), correct: true, a: cols, b: rows },
+    ...d.map(([a, b]) => ({ id: expression(a, b), label: expression(a, b), correct: false, a, b }))
+  ];
+  const choices = applyOrder(base, order);
+  const answers = choices.filter((c) => c.correct).map((c) => c.id);
+  return {
+    params,
+    form: "select",
+    rows,
+    cols,
+    caption: caption(rows, cols),
+    prompt: PROMPTS.select,
+    choices,
+    answer: expression(rows, cols),
+    answers,
+    multi: true
+  };
+}
+function whichProblem(params) {
+  const { rows, cols, order } = params;
+  const base = [
+    { id: expression(rows, cols), label: expression(rows, cols), correct: true, kind: "mult", a: rows, b: cols },
+    ...whichDistractors(rows, cols).map(({ kind, pair: [a, b] }) => {
+      const label = expression(a, b);
+      return { id: label, label, correct: false, kind, a, b };
+    })
+  ];
+  const choices = applyOrder(base, order);
+  return {
+    params,
+    form: "which",
+    rows,
+    cols,
+    caption: caption(rows, cols),
+    prompt: PROMPTS.which,
+    choices,
+    answer: expression(rows, cols),
+    answers: [expression(rows, cols)],
+    multi: false
+  };
+}
+function matchProblem(params) {
+  const { arrays, flip, order } = params;
+  const expressions = arrays.map(([r, c], i) => flip[i] ? expression(c, r) : expression(r, c));
+  const targetOrder = order;
+  const letters = ["A", "B", "C"];
+  const targets = targetOrder.map((sourceIndex, k) => ({
+    id: letters[k],
+    letter: letters[k],
+    label: expressions[sourceIndex],
+    sourceIndex,
+    value: arrays[sourceIndex][0] * arrays[sourceIndex][1]
+  }));
+  const steps = arrays.map(([rows, cols], sourceIndex) => {
+    const answer = targets.find((t) => t.sourceIndex === sourceIndex).id;
+    return {
+      key: `array-${sourceIndex}`,
+      sourceIndex,
+      rows,
+      cols,
+      prompt: PROMPTS.match,
+      choices: targets.map((t) => ({ id: t.id, label: `${t.letter}. ${t.label}`, letter: t.letter, expression: t.label, value: t.value })),
+      answer,
+      answers: [answer],
+      multi: false
+    };
+  });
+  return {
+    params,
+    form: "match",
+    prompt: PROMPTS.match,
+    sources: arrays.map(([rows, cols], i) => ({ id: `array-${i}`, rows, cols })),
+    targets,
+    steps
+  };
+}
+function build(params) {
+  if (params.form === "select") return selectProblem(params);
+  if (params.form === "which") return whichProblem(params);
+  if (params.form === "match") return matchProblem(params);
+  throw new Error(`unknown form ${params?.form}`);
+}
+function checkArray(rows, cols, errors, label) {
+  if (rows < ROWS[0] || rows > ROWS[1]) errors.push(`${label} rows ${rows} outside range`);
+  if (cols < COLS[0] || cols > COLS[1]) errors.push(`${label} cols ${cols} outside range`);
+  if (cols <= rows) errors.push(`${label} must have more columns than rows`);
+  if (rows * cols > MAX_PRODUCT) errors.push(`${label} product ${rows * cols} above ${MAX_PRODUCT}`);
+}
+function check(problem) {
+  const errors = [];
+  if (problem.form === "select") {
+    checkArray(problem.rows, problem.cols, errors, "select");
+    if (problem.choices.length !== 4) errors.push("select needs four expressions");
+    const correct = problem.choices.filter((c) => c.correct);
+    if (correct.length !== 2) errors.push("select needs exactly two correct expressions");
+    if (!correct.every((c) => c.a === problem.rows && c.b === problem.cols || c.a === problem.cols && c.b === problem.rows)) errors.push("select correct choices must be both factor orders");
+    if (problem.choices.some((c) => !c.correct && (c.a === problem.rows && c.b === problem.cols || c.a === problem.cols && c.b === problem.rows))) errors.push("select distractor equals the array");
+    if (!problem.answers.includes(problem.answer)) errors.push("select answer must be one of answers");
+    if (problem.answers.length !== 2) errors.push("select answers must list both orders");
+  } else if (problem.form === "which") {
+    checkArray(problem.rows, problem.cols, errors, "which");
+    if (problem.choices.length !== 4) errors.push("which needs four expressions");
+    if (problem.choices.filter((c) => c.correct).length !== 1) errors.push("which needs exactly one correct expression");
+    if (problem.choices.some((c) => c.kind !== "mult")) errors.push("which needs multiplication expressions only");
+    if (problem.choices.some((c) => !c.correct && (c.a === problem.rows && c.b === problem.cols || c.a === problem.cols && c.b === problem.rows))) errors.push("which wrong multiplication equals the array");
+  } else if (problem.form === "match") {
+    if (problem.steps.length !== 3) errors.push("match needs three arrays");
+    const products = new Set(problem.sources.map((s) => s.rows * s.cols));
+    if (products.size !== 3) errors.push("match arrays must have distinct products");
+    problem.sources.forEach((s, i) => checkArray(s.rows, s.cols, errors, `match array ${i + 1}`));
+    problem.steps.forEach((step) => {
+      const target = problem.targets.find((t) => t.id === step.answer);
+      const [a, b] = target.label.split(` ${TIMES} `).map(Number);
+      if (!(a === step.rows && b === step.cols || a === step.cols && b === step.rows)) errors.push(`match step ${step.key} answer ${target.label} does not represent ${step.rows} x ${step.cols}`);
+    });
+    const answers = new Set(problem.steps.map((s) => s.answer));
+    if (answers.size !== 3) errors.push("match steps must use each expression once");
+  } else {
+    errors.push(`unknown form ${problem.form}`);
+  }
+  if (problem.form === "select" || problem.form === "which") {
+    if (new Set(problem.choices.map((c) => c.id)).size !== 4) errors.push("choices must be distinct");
+    for (const c of problem.choices.filter((choice) => !choice.correct)) {
+      const distance = Math.min(Math.abs(c.a - problem.rows) + Math.abs(c.b - problem.cols), Math.abs(c.a - problem.cols) + Math.abs(c.b - problem.rows));
+      if (!inRange([c.a, c.b]) || distance !== 1) errors.push("distractors must be one factor off");
+    }
+  }
+  return errors;
+}
+function identity(params) {
+  if (params.form === "match") return `match:${params.arrays.map(([r, c]) => `${r}x${c}`).join(",")}`;
+  return `${params.form}:${params.rows}x${params.cols}`;
+}
+const BETA_PLAN = Object.freeze([
+  { form: "select", rows: 2, cols: 10, d: [[10, 1], [2, 9]], order: [2, 0, 3, 1] },
+  { form: "match", arrays: [[2, 3], [2, 6], [2, 5]], flip: [0, 1, 0], order: [2, 0, 1] },
+  { form: "select", rows: 3, cols: 5, d: [[4, 5], [3, 6]], order: [2, 0, 1, 3] },
+  { form: "which", rows: 3, cols: 5, order: [3, 0, 2, 1] },
+  { form: "select", rows: 5, cols: 6, d: [[4, 6], [6, 4]], order: [0, 1, 2, 3] }
+]);
+const RANDOM_FORMS = Object.freeze(["select", "which"]);
+function sessionQuestions(rng, { fixed = BETA_PLAN, randomCount = 3, randomForms = RANDOM_FORMS } = {}) {
+  const seen = /* @__PURE__ */ new Set();
+  const problems = [];
+  const add = (params) => {
+    const id = identity(params);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    problems.push(build(params));
+    return true;
+  };
+  fixed.forEach((params) => add(params));
+  let guard = 0;
+  let added = 0;
+  while (added < randomCount && guard < 500) {
+    guard += 1;
+    if (add(generateForm(rng, randomForms[rng.int(0, randomForms.length - 1)]))) added += 1;
+  }
+  const questions = [];
+  problems.forEach((problem, problemIndex) => {
+    if (problem.steps) {
+      problem.steps.forEach((step, stepIndex) => questions.push({ problem, problemIndex, step, stepIndex }));
+    } else {
+      questions.push({ problem, problemIndex, step: problem, stepIndex: 0 });
+    }
+  });
+  return questions;
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  BETA_PLAN,
+  COLS,
+  FORMS,
+  MAX_PRODUCT,
+  PROMPTS,
+  RANDOM_FORMS,
+  ROWS,
+  TIMES,
+  build,
+  caption,
+  check,
+  expression,
+  generate,
+  generateForm,
+  identity,
+  pickArray,
+  ranges,
+  selectDistractors,
+  sessionQuestions,
+  whichDistractors
+}, Symbol.toStringTag, { value: "Module" }));
+const THEME = Object.freeze({
+  key: "sticker_album",
+  title: "ARRAY HUNT",
+  worldName: "Sticker Album",
+  subtitle: "Find every expression that matches the sticker array.",
+  tag: "ML 1.08 · ARRAYS AND EXPRESSIONS",
+  startIcon: "★",
+  endIcon: "★",
+  endTitle: "ALBUM PAGE COMPLETE!",
+  // Countable unit noun, used in accessible descriptions and help copy.
+  unit: "sticker",
+  units: "stickers",
+  // Shell palette. The dark blue ink keeps the shared frame's outline rule.
+  palette: Object.freeze({
+    bgA: "#6B3FA0",
+    bgB: "#2A1E5C",
+    bgMid: "#4D5FD0",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#4D9DE0",
+    picture: "#F3F6FF",
+    pictureAlt: "#fffdf4",
+    page: "#FFFFFF",
+    pageLine: "#DCE3F7",
+    sticker: "#FFD45A",
+    stickerAlt: "#6BCBFF",
+    stickerThird: "#FF8FAB",
+    stickerInk: "#13213F"
+  }),
+  // Three sticker shapes cycle across an array so a row still reads as one
+  // row: every unit is the same size on the same page grid.
+  shapes: Object.freeze(["star", "circle", "diamond"]),
+  // Celebration pieces that fall on a streak tier.
+  confettiColors: Object.freeze(["#FFD45A", "#6BCBFF", "#FF8FAB", "#B28DFF", "#37C8C5", "#F29B38"]),
+  praise: Object.freeze(["NICE!", "YES!", "GOT IT!", "GREAT JOB!", "WELL DONE!", "YOU DID IT!"])
+});
+function cssVariables(theme = THEME) {
+  const out = {};
+  for (const [key, value] of Object.entries(theme.palette)) {
+    out[`--ah-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`] = value;
+  }
+  return out;
+}
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+  return node;
+}
+function starPoints(cx, cy, outer, inner) {
+  const points = [];
+  for (let i = 0; i < 10; i += 1) {
+    const radius = i % 2 === 0 ? outer : inner;
+    const angle = Math.PI / 5 * i - Math.PI / 2;
+    points.push(`${(cx + radius * Math.cos(angle)).toFixed(2)},${(cy + radius * Math.sin(angle)).toFixed(2)}`);
+  }
+  return points.join(" ");
+}
+function stickerSvg(shape = "star", { size = 40, color } = {}) {
+  const { palette } = THEME;
+  const fill = color || { star: palette.sticker, circle: palette.stickerAlt, diamond: palette.stickerThird }[shape] || palette.sticker;
+  const root = svg("svg", { viewBox: "0 0 40 40", width: size, height: size, "aria-hidden": "true", focusable: "false", class: `ah-sticker ah-sticker--${shape}` });
+  root.append(svg("rect", { x: 2, y: 2, width: 36, height: 36, rx: 8, fill: "#fff", stroke: palette.stickerInk, "stroke-width": 2.5 }));
+  if (shape === "star") {
+    root.append(svg("polygon", { points: starPoints(20, 21, 13, 5.6), fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+  } else if (shape === "circle") {
+    root.append(svg("circle", { cx: 20, cy: 20, r: 11.5, fill, stroke: palette.stickerInk, "stroke-width": 2 }));
+    root.append(svg("circle", { cx: 16, cy: 16, r: 3, fill: "#fff", opacity: 0.85 }));
+  } else {
+    root.append(svg("polygon", { points: "20,7 33,20 20,33 7,20", fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+    root.append(svg("polygon", { points: "20,12 27,20 20,22 13,20", fill: "#fff", opacity: 0.55 }));
+  }
+  return root;
+}
+function shapeFor(rowIndex, colIndex) {
+  return THEME.shapes[rowIndex % THEME.shapes.length];
+}
+function arrayLabel(rows, cols) {
+  return `${rows} rows of ${cols} ${THEME.units}, ${rows * cols} in all`;
+}
+function arrayDisplay(rows, cols, { size = "card", braces = false, peel = false, label } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = `ah-array ah-array--${size}${braces ? " ah-array--braced" : ""}${peel ? " ah-array--peel" : ""}`;
+  wrap.setAttribute("role", "img");
+  wrap.setAttribute("aria-label", label || arrayLabel(rows, cols));
+  wrap.style.setProperty("--ah-rows", rows);
+  wrap.style.setProperty("--ah-cols", cols);
+  const page = document.createElement("div");
+  page.className = "ah-page";
+  const grid = document.createElement("div");
+  grid.className = "ah-grid";
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const cell = document.createElement("span");
+      cell.className = "ah-cell";
+      cell.style.setProperty("--ah-r", r);
+      cell.style.setProperty("--ah-c", c);
+      cell.style.setProperty("--ah-i", r * cols + c);
+      cell.append(stickerSvg(shapeFor(r)));
+      grid.append(cell);
+    }
+  }
+  page.append(grid);
+  if (braces) {
+    const rowBrace = document.createElement("span");
+    rowBrace.className = "ah-brace ah-brace--rows";
+    rowBrace.textContent = `${rows} rows`;
+    const colBrace = document.createElement("span");
+    colBrace.className = "ah-brace ah-brace--cols";
+    colBrace.textContent = `${cols} in each row`;
+    wrap.append(rowBrace, page, colBrace);
+  } else {
+    wrap.append(page);
+  }
+  return wrap;
+}
+function shineRows(arrayNode, { rowMs = 140 } = {}) {
+  const cells = arrayNode.querySelectorAll(".ah-cell");
+  const rows = Number(arrayNode.style.getPropertyValue("--ah-rows")) || 1;
+  cells.forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--ah-r")) || 0;
+    cell.style.setProperty("--ah-shine-delay", `${r * rowMs}ms`);
+    cell.classList.remove("ah-cell--shine");
+    void cell.offsetWidth;
+    cell.classList.add("ah-cell--shine");
+  });
+  return rows * rowMs + 500;
+}
+function highlightRow(arrayNode, rowIndex) {
+  arrayNode.querySelectorAll(".ah-cell").forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--ah-r")) || 0;
+    cell.classList.toggle("ah-cell--lit", rowIndex === null ? false : r <= rowIndex);
+    cell.classList.toggle("ah-cell--current", r === rowIndex);
+  });
+}
+function albumPage(rows, cols, expressionText) {
+  const item = document.createElement("div");
+  item.className = "ah-album-item";
+  item.style.setProperty("--ah-rows", rows);
+  item.style.setProperty("--ah-cols", cols);
+  const mini = document.createElement("div");
+  mini.className = "ah-album-mini";
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const dot = document.createElement("i");
+      dot.className = `ah-album-dot ah-album-dot--${shapeFor(r)}`;
+      mini.append(dot);
+    }
+  }
+  const text = document.createElement("span");
+  text.className = "ah-album-text";
+  text.textContent = expressionText;
+  item.append(mini, text);
+  return item;
+}
+const MUTE_KEY = "array_hunt_108.muted";
+function readMuted(storage) {
+  try {
+    return storage?.getItem?.(MUTE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function createSound({ storage = null } = {}) {
+  let muted = readMuted(storage);
+  let ctx2 = null;
+  let gate = null;
+  let hidden = false;
+  const nodes = /* @__PURE__ */ new Set();
+  const ready = () => Boolean(ctx2 && gate);
+  const tone = ({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.14 }) => {
+    if (!ready() || muted) return;
+    const t0 = ctx2.currentTime + at;
+    const osc = ctx2.createOscillator();
+    const g = ctx2.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+    osc.connect(g).connect(gate);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    const entry = { osc, g };
+    nodes.add(entry);
+    osc.onended = () => {
+      nodes.delete(entry);
+      try {
+        osc.disconnect();
+        g.disconnect();
+      } catch {
+      }
+    };
+  };
+  const SOUNDS = {
+    // The engine's canonical set, same frequencies and shapes.
+    correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09, gain: 0.18 })),
+    wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+    complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16, gain: 0.18 })),
+    tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle", gain: 0.18 })),
+    tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+    // Game 108's own signature sounds.
+    // A sticker peeling onto the page, one per row while the array appears.
+    peel: (row = 0) => tone({ freq: 392 * 2 ** (row * 2 / 12), to: 392 * 2 ** ((row * 2 + 3) / 12), type: "triangle", dur: 0.11, gain: 0.07 }),
+    // Toggling an expression on or off.
+    pick: () => [660, 880].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.07 })),
+    unpick: () => [880, 660].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.06 })),
+    // The shine sweep after a correct answer, one note per row.
+    shine: (row = 0) => tone({ freq: 1047 * 2 ** (row * 2 / 12), type: "triangle", dur: 0.12, gain: 0.06 }),
+    // Counting a row in the teaching help.
+    count: (index = 0) => tone({ freq: 330 * 2 ** (index / 12), type: "triangle", dur: 0.14, gain: 0.08 }),
+    // A page turn in the matching set.
+    page: () => {
+      tone({ freq: 300, to: 620, type: "sawtooth", dur: 0.14, gain: 0.05 });
+      tone({ freq: 1200, dur: 0.05, at: 0.12, gain: 0.05, type: "triangle" });
+    },
+    fanfare: () => [523, 659, 784, 1047, 1319].forEach((f, i) => tone({ freq: f, at: i * 0.1, dur: 0.18, type: "triangle", gain: 0.1 }))
+  };
+  function stopAll() {
+    if (!ctx2) return;
+    const now = ctx2.currentTime;
+    nodes.forEach(({ osc, g }) => {
+      try {
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(0, now);
+      } catch {
+      }
+      try {
+        osc.stop(now);
+      } catch {
+      }
+    });
+    nodes.clear();
+  }
+  function applyGate() {
+    if (!ready()) return;
+    const now = ctx2.currentTime;
+    gate.gain.cancelScheduledValues(now);
+    gate.gain.setValueAtTime(muted ? 0 : 1, now);
+    if (muted || hidden) ctx2.suspend?.()?.catch?.(() => {
+    });
+    else ctx2.resume?.()?.catch?.(() => {
+    });
+  }
+  return {
+    get muted() {
+      return muted;
+    },
+    unlock() {
+      ctx2 = initAudio();
+      if (ctx2 && !gate) {
+        gate = ctx2.createGain();
+        gate.gain.value = muted ? 0 : 1;
+        gate.connect(ctx2.destination);
+      }
+      applyGate();
+      return ctx2;
+    },
+    setMuted(value) {
+      muted = Boolean(value);
+      try {
+        storage?.setItem?.(MUTE_KEY, muted ? "1" : "0");
+      } catch {
+      }
+      if (muted) stopAll();
+      applyGate();
+    },
+    toggle() {
+      this.setMuted(!muted);
+      return muted;
+    },
+    setHidden(value) {
+      hidden = Boolean(value);
+      if (hidden) stopAll();
+      applyGate();
+    },
+    play(name, ...args) {
+      if (muted || hidden) return;
+      SOUNDS[name]?.(...args);
+    },
+    stopAll,
+    destroy() {
+      stopAll();
+      try {
+        gate?.disconnect();
+      } catch {
+      }
+      gate = null;
+    }
+  };
+}
+const SHAPES = ["star", "circle", "diamond"];
+function reducedMotion() {
+  return Boolean(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+function stickerConfetti(root, count = 24) {
+  if (reducedMotion()) return;
+  for (let i = 0; i < count; i += 1) {
+    const piece = document.createElement("i");
+    piece.className = `ah-confetti ah-confetti--${SHAPES[i % SHAPES.length]}`;
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.setProperty("--ah-piece", THEME.confettiColors[i % THEME.confettiColors.length]);
+    piece.style.animationDelay = `${Math.random() * 0.4}s`;
+    piece.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    piece.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.append(piece);
+    piece.addEventListener("animationend", () => piece.remove());
+  }
+}
+function flyStars(root, from, count = 4) {
+  if (reducedMotion() || !from?.getBoundingClientRect) return;
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const star = document.createElement("span");
+    star.className = "ah-fly";
+    star.textContent = "★";
+    star.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    star.style.top = `${r.top - base.top + r.height / 2}px`;
+    star.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    star.style.animationDelay = `${i * 0.05}s`;
+    root.append(star);
+    star.addEventListener("animationend", () => star.remove());
+  }
+}
+function createMatchingCard({ prompt, sources, targets, activeSourceId, renderSource, renderTarget }) {
+  const card = document.createElement("section");
+  card.className = "gf-matching-card";
+  card.setAttribute("aria-label", "Matching problem");
+  const heading = document.createElement("div");
+  heading.className = "gf-matching-prompt";
+  heading.textContent = prompt;
+  card.append(heading);
+  const board = document.createElement("div");
+  board.className = "gf-matching-columns";
+  const sourceNodes = /* @__PURE__ */ new Map();
+  for (const [items, kind, render] of [[sources, "source", renderSource], [targets, "target", renderTarget]]) {
+    const column = document.createElement("div");
+    column.className = `gf-matching-${kind}s`;
+    for (const [index, item] of items.entries()) {
+      const node = document.createElement("article");
+      node.className = `gf-matching-${kind}`;
+      node.dataset.id = item.id;
+      if (kind === "target") {
+        const label = document.createElement("strong");
+        label.textContent = String.fromCharCode(65 + index);
+        node.append(label);
+      } else {
+        sourceNodes.set(item.id, node);
+      }
+      const content = document.createElement("div");
+      content.className = "gf-matching-content";
+      render(item, content);
+      node.append(content);
+      column.append(node);
+    }
+    board.append(column);
+  }
+  card.append(board);
+  function setActiveSource(id) {
+    for (const [sourceId, node] of sourceNodes) {
+      node.classList.toggle("gf-matching-active", sourceId === id);
+      if (sourceId === id) node.setAttribute("aria-current", "true");
+      else node.removeAttribute("aria-current");
+    }
+  }
+  setActiveSource(activeSourceId);
+  return { element: card, setActiveSource };
+}
+const game = defineGame({
+  meta: {
+    name: "array_hunt",
+    lesson: "108",
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    emoji: THEME.startIcon,
+    tag: THEME.tag,
+    questions: 0
+  },
+  ...gen
+});
+const GROWTH = [
+  "Almost! Try again!",
+  "Great effort! Keep going!",
+  "Mistakes help your brain grow!",
+  "Look again. You got this!",
+  "So close! One more try!"
+];
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== void 0 && text !== null) node.textContent = String(text);
+  return node;
+}
+function listLabels(choices) {
+  const labels = choices.map((c) => c.expression || c.label);
+  if (labels.length <= 1) return labels.join("");
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
+function mount(element, options = {}) {
+  if (!element) throw new Error("array_hunt.mount needs a DOM element");
+  const gameFile = options.gameFile ?? "array_hunt_108.html";
+  const tracker = connectTracker({ gameFile, interval: options.autoSaveInterval ?? 3 });
+  const storage = options.storage ?? (() => {
+    try {
+      return globalThis.localStorage;
+    } catch {
+      return null;
+    }
+  })();
+  const sound = createSound({ storage });
+  const seedBase = options.seed ?? Date.now();
+  let session = 0;
+  let questions = [];
+  let album = [];
+  const timers = /* @__PURE__ */ new Set();
+  const later = (fn, ms) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const clearTimers = () => {
+    timers.forEach((id) => clearTimeout(id));
+    timers.clear();
+  };
+  function planSession() {
+    session += 1;
+    const rng = createRng(Number(seedBase) + session * 7919);
+    questions = sessionQuestions(rng, { fixed: options.fixed ?? BETA_PLAN, randomCount: options.randomCount ?? 3 });
+    album = [];
+  }
+  planSession();
+  function frameProblem(index) {
+    const q = questions[index];
+    if (!q) throw new Error(`no question at ${index}`);
+    return {
+      id: `${session}-${index}`,
+      prompt: q.step.prompt,
+      choices: q.step.choices,
+      answer: q.step.answer,
+      answers: q.step.answers,
+      multi: Boolean(q.step.multi),
+      params: q.problem.params,
+      form: q.problem.form,
+      q
+    };
+  }
+  let currentArray = null;
+  function peelIn(arrayNode, rows) {
+    if (reducedMotion()) return;
+    for (let r = 0; r < rows; r += 1) later(() => sound.play("peel", r), 120 + r * 170);
+  }
+  function renderSingleCard(problem, host) {
+    const { rows, cols } = problem.q.problem;
+    const card = el("div", `ah-card ah-card--${problem.form}`);
+    card.append(el("h4", "ah-prompt", problem.prompt));
+    const array = arrayDisplay(rows, cols, { size: "card", peel: !reducedMotion() });
+    card.append(array);
+    host.append(card);
+    currentArray = array;
+    peelIn(array, rows);
+  }
+  function renderMatchCard(problem, host) {
+    const { q } = problem;
+    const done = /* @__PURE__ */ new Set();
+    questions.forEach((other) => {
+      if (other.problemIndex === q.problemIndex && other.stepIndex < q.stepIndex) done.add(other.step.sourceIndex);
+    });
+    const matched = /* @__PURE__ */ new Map();
+    q.problem.steps.forEach((step) => {
+      if (done.has(step.sourceIndex)) matched.set(step.answer, step.sourceIndex);
+    });
+    const card = createMatchingCard({
+      prompt: problem.prompt,
+      sources: q.problem.sources,
+      targets: q.problem.targets,
+      activeSourceId: `array-${q.step.sourceIndex}`,
+      renderSource(item, contentHost) {
+        const node = arrayDisplay(item.rows, item.cols, { size: "match", peel: !reducedMotion() && item.id === `array-${q.step.sourceIndex}` && q.stepIndex === 0 });
+        contentHost.append(node);
+        if (item.id === `array-${q.step.sourceIndex}`) currentArray = node;
+      },
+      renderTarget(item, contentHost) {
+        contentHost.append(el("span", "ah-target-expression", item.label));
+      }
+    });
+    card.element.classList.add("ah-card", "ah-card--match");
+    card.element.querySelectorAll(".gf-matching-source").forEach((node) => {
+      const index = Number(node.dataset.id.split("-")[1]);
+      node.classList.toggle("ah-matched", done.has(index));
+    });
+    card.element.querySelectorAll(".gf-matching-target").forEach((node) => {
+      node.classList.toggle("ah-matched", matched.has(node.dataset.id));
+    });
+    host.append(card.element);
+    if (q.stepIndex === 0) peelIn(currentArray, q.step.rows);
+    else if (!reducedMotion()) sound.play("page");
+  }
+  function firstMiss(problem, { choices }) {
+    const box = el("div", "ah-help");
+    const growth = GROWTH[(problem.q.problemIndex + (problem.q.stepIndex || 0)) % GROWTH.length];
+    if (problem.form === "select") {
+      const picked = choices?.length ? `You tapped ${listLabels(choices)}. ` : "";
+      const copy2 = el("p", "ah-help-copy", `${picked}Read the array two ways:`);
+      copy2.append(document.createElement("br"), "Rows × in each row", document.createElement("br"), "In each row × rows");
+      box.append(copy2);
+    } else if (problem.form === "which") {
+      box.append(el("p", "ah-help-copy", "Count the rows, then count how many are in each row. Equal rows show multiplication, not adding."));
+    } else {
+      box.append(el("p", "ah-help-copy", "Count the rows and the columns of the glowing array. Look for those two numbers, in either order."));
+    }
+    box.append(el("p", "ah-help-growth", growth));
+    return box;
+  }
+  function exampleArrayFor(rows, cols) {
+    const exRows = rows === 2 ? 3 : 2;
+    const exCols = cols === 4 ? 5 : 4;
+    return [exRows, exCols];
+  }
+  function teaching(problem) {
+    const { rows, cols } = problem.q.step.rows ? problem.q.step : problem.q.problem;
+    const [exRows, exCols] = exampleArrayFor(rows, cols);
+    const box = el("div", "ah-help ah-help--teach");
+    let copy2;
+    if (problem.form === "which") copy2 = "Count the rows, then count how many are in one row. Equal rows are groups, so an array shows rows × in each row, not adding. Here is a smaller example.";
+    else if (problem.form === "match") copy2 = "Count the rows of the glowing array, then count how many are in one row. Look for those two numbers, in either order. Here is a smaller example.";
+    else copy2 = "Count the rows, then count how many are in one row. Rows × in each row is one expression, and the same numbers the other way round is the other. Here is a smaller example.";
+    box.append(el("p", "ah-help-copy", copy2));
+    const picture = arrayDisplay(exRows, exCols, { size: "help", braces: true });
+    box.append(picture);
+    const line = el("p", "ah-help-line");
+    line.append(el("span", "ah-help-rows", `${exRows} rows`), el("span", "ah-help-times", "×"), el("span", "ah-help-cols", `${exCols} in each row`));
+    box.append(line);
+    const both = problem.form === "which" ? `${expression(exRows, exCols)}, not ${exRows} + ${exCols}` : `${expression(exRows, exCols)} and ${expression(exCols, exRows)}`;
+    box.append(el("p", "ah-help-both", both));
+    box.append(el("p", "ah-help-next", "Now count your array the same way."));
+    highlightRow(picture, null);
+    const perRow = reducedMotion() ? 0 : 420;
+    for (let r = 0; r < exRows; r += 1) {
+      later(() => {
+        highlightRow(picture, r);
+        sound.play("count", r);
+        line.querySelector(".ah-help-rows").textContent = `${r + 1} row${r ? "s" : ""}`;
+      }, 350 + r * perRow);
+    }
+    later(() => {
+      highlightRow(picture, null);
+      line.querySelector(".ah-help-rows").textContent = `${exRows} rows`;
+      line.classList.add("ah-help-line--done");
+    }, 350 + exRows * perRow + 300);
+    return box;
+  }
+  function showTierToast(fx, word) {
+    const t = el("div", "gf-toast gf-toast--tier", word);
+    fx.append(t);
+    later(() => t.remove(), 900);
+  }
+  function celebrate({ buttons, state, api: api2, problem }) {
+    sound.play("correct");
+    const fx = api2.root.querySelector(".gf-fx");
+    buttons.forEach((button) => flyStars(fx, button, 3));
+    if (currentArray) {
+      const rows2 = problem.q.step.rows || problem.q.problem.rows;
+      if (!reducedMotion()) {
+        shineRows(currentArray);
+        for (let r = 0; r < rows2; r += 1) later(() => sound.play("shine", r), 160 + r * 140);
+      }
+      currentArray.classList.add("ah-array--solved");
+    }
+    const tier = STREAK_TIERS.find((t) => t.at === state.streak);
+    if (tier) {
+      later(() => {
+        sound.play("tier");
+        stickerConfetti(fx, tier.burst);
+        showTierToast(fx, tier.word);
+      }, 350);
+    }
+    const q = problem.q;
+    const rows = q.step.rows || q.problem.rows;
+    const cols = q.step.cols || q.problem.cols;
+    album.push({ rows, cols, text: expression(rows, cols) });
+    return tier;
+  }
+  function startExample(host) {
+    const wrap = el("div", "ah-example");
+    wrap.append(el("p", "ah-example-label", "HOW TO READ AN ARRAY"));
+    const rows = 2;
+    const cols = 3;
+    const array = arrayDisplay(rows, cols, { size: "example", braces: true, peel: !reducedMotion() });
+    wrap.append(array);
+    const line = el("p", "ah-example-line");
+    line.append(el("b", null, `${rows} rows`), el("span", null, " of "), el("b", null, `${cols}`), el("span", null, " is "), el("b", "ah-example-expr", expression(rows, cols)));
+    const otherWay = el("span", "ah-example-other-way", "and also ");
+    otherWay.append(el("b", "ah-example-expr", expression(cols, rows)));
+    line.append(otherWay);
+    wrap.append(line);
+    const copy2 = el("p", "ah-example-copy");
+    ["Tap each expression that", "matches the array.", "Correct choices lock in.", "Fill your album page."].forEach((text, index) => {
+      if (index) copy2.append(document.createElement("br"));
+      copy2.append(document.createTextNode(text));
+    });
+    wrap.append(copy2);
+    host.append(wrap);
+  }
+  function renderEnd(host) {
+    if (!album.length) return;
+    const title = el("p", "ah-album-title", "YOUR ALBUM PAGE");
+    const grid = el("div", "ah-album");
+    album.forEach((entry, i) => {
+      const page = albumPage(entry.rows, entry.cols, entry.text);
+      page.style.setProperty("--ah-album-delay", `${i * 90}ms`);
+      grid.append(page);
+    });
+    host.append(title, grid);
+    later(() => sound.play("fanfare"), 500);
+  }
+  const publish = (state) => tracker.publish({
+    score: state.score,
+    streak: state.streak,
+    bestStreak: state.bestStreak,
+    questionsAnswered: state.questionsAnswered
+  });
+  const record = (problem, choices, correct, state) => {
+    tracker.recordQuestion({
+      question: problem.prompt,
+      params: problem.params,
+      answer: choices.map((c) => c.label).join(" + "),
+      correctAnswer: problem.answers.map((id) => problem.choices.find((c) => c.id === id)?.label).join(" + "),
+      correct,
+      firstTry: state.firstTry,
+      replay: false
+    });
+  };
+  const frameApi = globalThis.GameFrameStarter.mount(element, {
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    tag: THEME.tag,
+    startIcon: THEME.startIcon,
+    endIcon: THEME.endIcon,
+    endTitle: THEME.endTitle,
+    ariaLabel: `${THEME.title} game`,
+    totalQuestions: questions.length,
+    basePoints: options.basePoints ?? 10,
+    streakBonus: options.streakBonus !== false,
+    hotStreak: 5,
+    hidePrompt: true,
+    theme: { bgA: THEME.palette.bgA, bgB: THEME.palette.bgB, card: THEME.palette.card, ink: THEME.palette.ink, accent: THEME.palette.accent, good: THEME.palette.good, warm: THEME.palette.warm, dottedBorder: THEME.palette.dottedBorder, picture: THEME.palette.picture, pictureAlt: THEME.palette.pictureAlt },
+    startButton: options.startButton ?? "START",
+    playAgain: options.playAgain ?? "PLAY AGAIN",
+    advanceMs: ({ state, problem }) => {
+      const rows = problem.q.step.rows || problem.q.problem.rows;
+      const tier = STREAK_TIERS.some((t) => t.at === state.streak);
+      return (reducedMotion() ? 900 : 700 + rows * 140) + (tier ? 600 : 0);
+    },
+    praise: () => THEME.praise[Math.floor(Math.random() * THEME.praise.length)],
+    firstMissTitle: () => "TAKE ANOTHER LOOK",
+    teachingTitle: () => "LET’S COUNT IT TOGETHER",
+    endMessage: ({ state }) => `You filled ${state.completed} sticker array${state.completed === 1 ? "" : "s"}.`,
+    getProblem: (index) => frameProblem(index),
+    onQuestion: (problem, api2) => {
+      if (problem.form !== "match") return;
+      const done = /* @__PURE__ */ new Set();
+      questions.forEach((other) => {
+        if (other.problemIndex === problem.q.problemIndex && other.stepIndex < problem.q.stepIndex) done.add(other.step.answer);
+      });
+      api2.root.querySelectorAll(".gf-tile").forEach((tile) => {
+        if (done.has(tile.dataset.choiceId)) {
+          tile.dataset.used = "true";
+          tile.disabled = true;
+          tile.setAttribute("aria-disabled", "true");
+        }
+      });
+    },
+    renderProblem: (problem, host) => {
+      currentArray = null;
+      if (problem.form === "match") renderMatchCard(problem, host);
+      else renderSingleCard(problem, host);
+    },
+    renderAnswer: (choice, host) => {
+      if (choice.letter) {
+        host.append(el("span", "ah-answer-letter", choice.letter), el("span", "ah-answer-expression", choice.expression));
+      } else {
+        host.textContent = choice.label;
+      }
+    },
+    renderStartExample: (host) => startExample(host),
+    renderFirstMiss: (problem, context) => firstMiss(problem, context),
+    renderTeaching: (problem) => teaching(problem),
+    renderEnd: (host) => renderEnd(host),
+    onFound: ({ button, complete, api: api2 }) => {
+      if (complete) return;
+      sound.play("pick");
+      flyStars(api2.root.querySelector(".gf-fx"), button, 2);
+    },
+    onStart: ({ state }) => {
+      sound.unlock();
+      sound.play("tap");
+      clearTimers();
+      album = [];
+      publish(state);
+    },
+    onStateChange: (state) => publish(state),
+    onCorrect: ({ choices, problem, buttons, state, api: api2 }) => {
+      record(problem, choices, true, state);
+      tracker.checkAutoSave();
+      if (!state.firstTry) tracker.markCorrected(problem.params);
+      celebrate({ buttons, state, api: api2, problem });
+    },
+    onWrong: ({ choices, problem, state }) => {
+      sound.play("wrong");
+      record(problem, choices, false, state);
+      tracker.markMissed(problem.params);
+      tracker.checkAutoSave();
+    },
+    onSoundToggle: (muted, { state }) => {
+      sound.setMuted(muted);
+      if (!muted && state.phase !== "start") {
+        sound.unlock();
+        sound.play("tap");
+      }
+    },
+    onEnd: () => {
+      clearTimers();
+      sound.play("complete");
+      const finished = album;
+      planSession();
+      album = finished;
+    },
+    onDestroy: () => {
+      clearTimers();
+      sound.destroy();
+    }
+  });
+  const soundButton = element.querySelector(".gf-sound");
+  if (soundButton && sound.muted) soundButton.click();
+  Object.entries(cssVariables()).forEach(([key, value]) => element.style.setProperty(key, value));
+  const onVisibility = () => sound.setHidden(document.visibilityState === "hidden");
+  document.addEventListener("visibilitychange", onVisibility);
+  const destroy = frameApi.destroy;
+  frameApi.destroy = () => {
+    document.removeEventListener("visibilitychange", onVisibility);
+    destroy();
+  };
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  const api = Object.assign(frameApi, { tracker, game, sound, get questions() {
+    return questions;
+  } });
+  return api;
+}
+({
+  lesson: [PROMPTS.select, PROMPTS.match, PROMPTS.which],
+  game: [THEME.title, THEME.subtitle, THEME.tag, THEME.endTitle, "START", "PLAY AGAIN", "TAKE ANOTHER LOOK", "LET’S COUNT IT TOGETHER", "HOW TO READ AN ARRAY", "YOUR ALBUM PAGE"]
+});
+function installHomeNavigation(root) {
+  const icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 3l9 8v10h-6v-7H9v7H3Z" fill="currentColor"/></svg>';
+  function home(label) {
+    const link = document.createElement("a");
+    link.href = "./index.html";
+    link.className = "game-home" + (label ? " game-home-labeled" : "");
+    link.setAttribute("aria-label", "Go home to game menu");
+    link.title = "Go home";
+    link.innerHTML = icon;
+    if (label) link.append(document.createTextNode("HOME"));
+    return link;
+  }
+  const headers = /* @__PURE__ */ new Set();
+  function update() {
+    for (const header of root.querySelectorAll(".mg-hud, .gf-hud")) {
+      if (headers.has(header)) continue;
+      headers.add(header);
+      header.classList.add("game-home-header");
+      header.prepend(home(false));
+    }
+    for (const stats of root.querySelectorAll(".mg-stats, .gf-stats")) {
+      const card = stats.parentElement;
+      if (card.querySelector(".game-end-actions")) continue;
+      const again = card.querySelector(".mg-big-btn, .gf-big-btn");
+      if (!again) continue;
+      const actions = document.createElement("div");
+      actions.className = "game-end-actions";
+      again.replaceWith(actions);
+      actions.append(again, home(true));
+    }
+  }
+  const observer = new MutationObserver(update);
+  observer.observe(root, { childList: true, subtree: true });
+  update();
+  return () => {
+    observer.disconnect();
+  };
+}
+mount(document.getElementById("game"), { gameFile: "array_hunt_108.html" });
+installHomeNavigation(document.getElementById("game"));</script>
+  <style rel="stylesheet" crossorigin>/* The shell is adapted from the approved Game 107 surrounding frame.
+   Lesson content belongs in the problem-card adapter. */
+:root {
+  --gf-bg-a: #3156D8;
+  --gf-bg-b: #13213F;
+  --gf-card: #FFF4D6;
+  --gf-ink: #13213F;
+  --gf-accent: #F29B38;
+  --gf-good: #37C8C5;
+  --gf-warm: #E8A838;
+  --gf-dotted-border: #37C8C5;
+  --gf-picture: #E5F8F5;
+  --gf-picture-alt: #fffdf4;
+  --gf-outline: 4px;
+  --gf-shadow: 0 6px 0 var(--gf-ink);
+  --gf-font-shout: 'Bangers', Impact, cursive;
+  --gf-font-read: 'Fredoka', Nunito, system-ui, sans-serif;
+  --gf-card-radius: 22px;
+  --gf-card-gap: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+  color: #fff;
+  font-family: var(--gf-font-read);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button { font: inherit; }
+
+.game-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+.gf-hidden { display: none !important; }
+
+/* Start and end overlays. */
+.gf-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+}
+.gf-card {
+  width: min(920px, 100%);
+  max-height: calc(100% - 32px);
+  overflow: auto;
+  padding: 24px 22px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 24px;
+  box-shadow: var(--gf-shadow);
+  text-align: center;
+}
+.gf-start-card, .gf-end-card { width: min(560px, 100%); }
+.gf-emoji { font-size: 56px; line-height: 1; }
+.gf-title {
+  margin-top: 6px;
+  color: var(--gf-ink);
+  font-family: var(--gf-font-shout);
+  font-size: clamp(34px, 8vw, 52px);
+  letter-spacing: 2px;
+  text-shadow: 3px 3px 0 var(--gf-accent);
+}
+.gf-subtitle { margin-top: 4px; font-size: 20px; font-weight: 600; }
+.gf-tag {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 10px;
+  color: var(--gf-bg-b);
+  background: #f5f3ff;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.gf-example {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+  font-size: 18px;
+}
+.gf-example-label, .gf-sample-kicker { color: #355080; font-size: 13px; font-weight: 800; letter-spacing: 1px; }
+.gf-example-body { font-weight: 600; }
+.gf-big-btn {
+  min-height: 64px;
+  padding: 14px 40px;
+  color: var(--gf-ink);
+  background: var(--gf-accent);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: 30px;
+  letter-spacing: 2px;
+  transition: transform .08s, box-shadow .08s;
+}
+.gf-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-big-btn:focus-visible, .gf-retry:focus-visible, .gf-tile:focus-visible, .gf-sound:focus-visible {
+  outline: 4px solid #ffd93d;
+  outline-offset: 4px;
+}
+
+/* Shared header and progress. */
+.gf-shell { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 32px)); margin-inline: auto; }
+.gf-hud {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 0;
+  font-family: var(--gf-font-shout);
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgb(0 0 0 / 35%);
+}
+.gf-hud-title {
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: .15em;
+  font-size: clamp(15px, 4vw, 40px);
+  line-height: 1.2;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.gf-chips { display: flex; flex-shrink: 0; gap: 8px; }
+.gf-chip {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 12px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  font-size: 18px;
+  line-height: 1;
+  text-shadow: none;
+}
+.gf-chip--hot { background: var(--gf-accent); }
+.gf-progress {
+  height: 10px;
+  overflow: hidden;
+  background: rgb(0 0 0 / 25%);
+  border-radius: 999px;
+}
+.gf-progress > i { display: block; width: 0; height: 100%; background: var(--gf-good); transition: width .3s; }
+
+/* Prompt, lesson card slot and answer grid. */
+.gf-stage {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 20px;
+  padding: 10px 0 calc(60px + 6px + env(safe-area-inset-bottom, 0px));
+}
+.gf-prompt {
+  flex: 0 0 auto;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: var(--gf-shadow);
+  font-size: 28px;
+  font-weight: 600;
+  text-align: center;
+}
+.gf-visual { display: flex; flex: 1 1 auto; min-height: 0; align-items: center; justify-content: center; }
+.gf-problem-card {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  padding: clamp(10px, 1.5vw, 16px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: var(--gf-card-radius);
+  box-shadow: 0 6px 0 var(--gf-ink);
+  text-align: center;
+}
+.gf-problem-slot {
+  display: grid;
+  width: min(720px, 100%);
+  min-height: 100px;
+  place-items: center;
+  padding: clamp(16px, 3vw, 30px);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+}
+.gf-sample-kicker { margin-bottom: 8px; }
+.gf-sample-title { font-size: clamp(24px, 5vw, 42px); }
+.gf-sample-detail { margin-top: 8px; font-size: clamp(16px, 3vw, 24px); font-weight: 600; }
+.gf-sound {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  padding: 0;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 50%;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  cursor: pointer;
+  font-size: 20px;
+}
+.gf-sound:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-tiles { display: grid; width: min(686px, 85%); align-self: center; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10.8px; }
+.gf-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gf-tile {
+  display: grid;
+  min-height: 104.85px;
+  place-items: center;
+  padding: 10px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 18px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-read);
+  font-size: clamp(24px, 4vw, 32px);
+  font-weight: 700;
+  transition: transform .08s, box-shadow .08s, background .15s;
+}
+.gf-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-tile:disabled { cursor: default; }
+.gf-tile.gf-right { background: var(--gf-good); }
+.gf-tile.gf-wrong { background: var(--gf-warm); }
+
+/* Toasts, modal feedback and end statistics. */
+.gf-fx { position: absolute; inset: 0; z-index: 30; overflow: hidden; pointer-events: none; }
+.gf-toast {
+  position: absolute;
+  top: 38%;
+  left: 50%;
+  color: #fff;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(45px, 9vw, 84px);
+  letter-spacing: 3px;
+  text-shadow: 4px 4px 0 var(--gf-ink);
+  transform: translate(-50%, -50%);
+  animation: gf-toast .9s ease-out forwards;
+}
+.gf-toast--warm { color: var(--gf-warm); font-size: clamp(28px, 7vw, 44px); }
+.gf-popup {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 4;
+  display: grid;
+  width: min(600px, calc(100% - 32px));
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 32px);
+  align-content: center;
+  justify-items: center;
+  gap: clamp(8px, 1.8vh, 16px);
+  overflow-y: auto;
+  padding: clamp(16px, 2.5vh, 24px) clamp(18px, 2.5vw, 30px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: 0 8px 0 var(--gf-ink);
+  pointer-events: auto;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  animation: gf-popup-in .24s ease-out;
+}
+.gf-popup-title { max-width: 30ch; font-size: 28px; font-weight: 800; line-height: 1.15; }
+.gf-popup-content { width: 100%; font-size: 24px; font-weight: 700; line-height: 1.2; }
+.gf-popup-content:empty { display: none; }
+.gf-popup--cue .gf-popup-title { width: 100%; padding: 12px 18px; background: var(--gf-picture); border: 3px solid var(--gf-dotted-border); border-radius: 15px; }
+.gf-retry {
+  min-height: 44px;
+  margin-top: 2px;
+  padding: 7px 20px;
+  color: var(--gf-ink);
+  background: #ffd93d;
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(18px, 2.2vw, 27px);
+  letter-spacing: 1px;
+}
+.gf-retry:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.gf-stat { min-width: 110px; padding: 10px 18px; background: #f5f3ff; border: 3px solid var(--gf-ink); border-radius: 16px; }
+.gf-stat b { display: block; font-family: var(--gf-font-shout); font-size: 32px; letter-spacing: 1px; }
+@keyframes gf-popup-in { from { opacity: 0; transform: translate(-50%, -42%) scale(.9); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes gf-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+
+@media (max-width: 560px) {
+  .gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 20px)); }
+  .gf-hud { padding-block: 8px; }
+  .gf-chip { padding-inline: 9px; font-size: 16px; }
+  .gf-stage { gap: 14px; }
+  .gf-prompt { padding: 10px; font-size: 20px; }
+  .gf-tile { min-height: 66.6px; font-size: 24px; }
+  .gf-problem-card { padding: 8px; border-radius: 18px; }
+  .gf-popup { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
+  .gf-popup-title { font-size: 24px; }
+  .gf-popup-content { font-size: 20px; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .gf-tile { min-height: 57.15px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-stage { gap: 14px; padding-top: 4px; }
+  .gf-prompt { font-size: 20px; }
+  .gf-tiles { width: min(686px, 85%); grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .gf-tile { min-height: 54px; padding: 4px 10px; line-height: 1; }
+  .gf-problem-card { padding: 4px; border-radius: 16px; }
+  .gf-popup { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); padding: 10px; }
+  .gf-popup-content { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .game-frame *, .game-frame { animation: none !important; transition: none !important; }
+}
+
+/* ============================================================
+   Game 108 (ML 1.08): Sticker Album arrays. Everything below is
+   lesson-owned; the shell above is the Game 107 starter copy.
+   Palette tokens (--ah-*) are set from theme.js at mount.
+   ============================================================ */
+body { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+.gf-screen { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+
+/* Question Prompt lives at the top of the Problem Card; the frame prompt
+   stays for assistive tech. */
+.game-frame--card-prompt .gf-prompt {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+  box-shadow: none;
+}
+.game-frame--card-prompt .gf-stage { gap: 16px; }
+.game-frame--card-prompt .gf-problem-card { grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); padding: clamp(12px, 2vw, 22px); }
+.game-frame--card-prompt .gf-problem-slot {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  place-items: stretch;
+}
+
+/* Problem Card contents: prompt, Array Display, caption. Generous, even
+   spacing, with the array sized to the room it has. */
+.ah-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  row-gap: clamp(10px, 2.4vh, 22px);
+  padding: clamp(4px, 1vh, 10px) clamp(8px, 2vw, 24px);
+}
+.ah-prompt {
+  max-width: 40ch;
+  font-size: clamp(19px, 2.2vw, 26px);
+  font-weight: 600;
+  line-height: 1.2;
+}
+.ah-caption {
+  padding: 4px 16px;
+  font-size: clamp(17px, 2.2vw, 22px);
+  font-weight: 700;
+  color: var(--gf-ink);
+  background: var(--ah-picture, #F3F6FF);
+  border: 3px solid var(--gf-dotted-border);
+  border-radius: 999px;
+}
+
+/* Array Display: a white album page with a grid of stickers. Sticker size
+   follows the container so rows and columns stay countable. */
+.ah-array {
+  --ah-gap: clamp(3px, 0.8vw, 8px);
+  --ah-cell: 40px;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+}
+.ah-array--card, .ah-array--match { container-type: size; }
+.ah-array--card {
+  width: 100%;
+  height: 100%;
+}
+.ah-page {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: clamp(6px, 1vw, 10px);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 15px, var(--ah-page-line, #DCE3F7) 15px 16px),
+    var(--ah-page, #fff);
+  border: 3px solid var(--gf-ink);
+  border-radius: 14px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+}
+.ah-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--ah-cols), var(--ah-cell));
+  grid-auto-rows: var(--ah-cell);
+  gap: var(--ah-gap);
+}
+/* Fit: the page's inner area is the container; each cell takes the largest
+   size that lets every column and every row fit with the gap. */
+.ah-array--card .ah-grid {
+  --ah-cell: min(
+    calc((100cqw - 26px - (var(--ah-cols) - 1) * var(--ah-gap)) / var(--ah-cols)),
+    calc((100cqh - 26px - (var(--ah-rows) - 1) * var(--ah-gap)) / var(--ah-rows)),
+    72px
+  );
+}
+.ah-cell {
+  position: relative;
+  display: grid;
+  width: var(--ah-cell);
+  height: var(--ah-cell);
+  place-items: center;
+}
+.ah-cell > svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 2px 0 rgb(19 33 63 / 20%)); }
+.ah-array--peel .ah-cell {
+  animation: ah-peel .38s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: calc(120ms + var(--ah-r) * 170ms + var(--ah-c) * 22ms);
+}
+@keyframes ah-peel {
+  0% { opacity: 0; transform: translateY(-14px) rotate(-12deg) scale(.6); }
+  60% { opacity: 1; transform: translateY(2px) rotate(3deg) scale(1.08); }
+  100% { opacity: 1; transform: none; }
+}
+.ah-cell--shine { animation: ah-shine .5s ease-out both; animation-delay: var(--ah-shine-delay, 0ms); }
+@keyframes ah-shine {
+  0% { transform: scale(1); filter: brightness(1); }
+  40% { transform: scale(1.22) rotate(-6deg); filter: brightness(1.35) drop-shadow(0 0 6px #ffd45a); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+.ah-array--solved .ah-page { border-color: var(--gf-good); box-shadow: 0 4px 0 var(--gf-good); }
+
+/* Braced help/example pictures: "R rows" beside, "C in each row" below. */
+.ah-array--braced {
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  gap: 6px 10px;
+  align-items: center;
+  justify-items: center;
+}
+.ah-array--braced .ah-page { grid-column: 2; grid-row: 1; }
+.ah-brace {
+  font-size: clamp(14px, 1.8vw, 18px);
+  font-weight: 700;
+  color: var(--ah-bg-a, #6B3FA0);
+}
+.ah-brace--rows { grid-column: 1; grid-row: 1; max-width: 5ch; text-align: center; writing-mode: horizontal-tb; }
+.ah-brace--cols { grid-column: 2; grid-row: 2; }
+.ah-array--help { --ah-cell: clamp(22px, 5vw, 34px); --ah-gap: 4px; }
+.ah-array--example { --ah-cell: clamp(26px, 6vw, 40px); --ah-gap: 5px; }
+.ah-cell--lit > svg { filter: drop-shadow(0 0 5px #ffd45a) brightness(1.15); }
+.ah-cell--current { animation: ah-bump .3s ease-out; }
+@keyframes ah-bump { 50% { transform: scale(1.2); } }
+
+/* Matching Problem Card (Game 106 format): arrays left, expressions right. */
+.ah-card--match {
+  --matching-left: 1.5fr;
+  --matching-right: 1fr;
+  --matching-gap: clamp(16px, 5vw, 64px);
+  grid-template-rows: auto minmax(0, 1fr);
+  justify-items: stretch;
+  width: min(100%, 860px);
+  height: 100%;
+  margin: 0 auto;
+  padding: clamp(4px, 1vh, 10px) clamp(4px, 1vw, 12px);
+  gap: clamp(10px, 2vh, 18px);
+}
+.ah-card--match .gf-matching-columns { height: 100%; }
+.ah-card--match .gf-matching-sources { gap: clamp(8px, 1.5vh, 14px); }
+.ah-card--match .gf-matching-targets { gap: clamp(8px, 1.5vh, 14px); align-content: center; }
+.ah-card--match .gf-matching-prompt {
+  font-size: clamp(20px, 2.6vw, 30px);
+  font-weight: 600;
+  line-height: 1.2;
+}
+.ah-card--match .gf-matching-columns { align-items: stretch; }
+.ah-card--match .gf-matching-source {
+  display: grid;
+  place-items: center;
+  padding: 6px 10px;
+  background: var(--ah-page, #fff);
+  border-width: 3px;
+  border-radius: 14px;
+  transition: transform .2s, box-shadow .2s, opacity .2s;
+}
+.ah-card--match .gf-matching-content { display: grid; place-items: center; width: 100%; height: 100%; min-height: 0; }
+.ah-array--match { width: 100%; height: 100%; }
+.ah-array--match .ah-page { padding: 4px 6px; border-width: 2px; box-shadow: none; background: none; }
+.ah-array--match .ah-grid {
+  --ah-gap: 3px;
+  --ah-cell: min(
+    calc((100cqw - 16px - (var(--ah-cols) - 1) * var(--ah-gap)) / var(--ah-cols)),
+    calc((100cqh - 12px - (var(--ah-rows) - 1) * var(--ah-gap)) / var(--ah-rows)),
+    38px
+  );
+}
+.ah-card--match .gf-matching-active {
+  border-color: var(--gf-accent);
+  box-shadow: 0 0 0 3px var(--gf-accent), 0 5px 0 var(--gf-ink);
+  transform: scale(1.03);
+  animation: ah-glow 1.4s ease-in-out infinite alternate;
+}
+@keyframes ah-glow { from { box-shadow: 0 0 0 3px var(--gf-accent), 0 5px 0 var(--gf-ink); } to { box-shadow: 0 0 0 6px #ffd45a, 0 5px 0 var(--gf-ink); } }
+.ah-card--match .gf-matching-source.ah-matched { opacity: .45; }
+.ah-card--match .gf-matching-target {
+  gap: 10px;
+  min-height: 56px;
+  padding: 6px 12px;
+  border-width: 3px;
+  border-radius: 14px;
+  font-family: var(--gf-font-read);
+}
+.ah-card--match .gf-matching-target > strong {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  background: var(--ah-sticker, #FFD45A);
+  border: 2px solid var(--gf-ink);
+  border-radius: 50%;
+  font-size: 18px;
+}
+.ah-card--match .gf-matching-target.ah-matched { opacity: .45; }
+.ah-target-expression { font-size: clamp(22px, 3vw, 32px); font-weight: 700; }
+
+/* Answer Grid: select-all. A found expression locks in as a right tile.
+   Lesson-specific frame exception (recorded in REQUIREMENTS.md): select-all
+   tiles are shorter than the starter's 104.85px so the Array Display keeps
+   countable stickers for five-row arrays. */
+.gf-tiles--multi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gf-tiles--multi .gf-tile { min-height: 84px; }
+.gf-tile[data-found="true"] { background: var(--gf-good); }
+.gf-tile[data-found="true"] .gf-answer-content::before {
+  content: '\2713';
+  margin-right: 8px;
+}
+.ah-answer-letter {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  margin-right: 10px;
+  place-items: center;
+  background: var(--ah-sticker, #FFD45A);
+  border: 2px solid var(--gf-ink);
+  border-radius: 50%;
+  font-size: 20px;
+  vertical-align: middle;
+}
+.gf-answer-content { display: inline-flex; align-items: center; justify-content: center; }
+
+/* A matched expression's tile stays visible but used. */
+.gf-tile[data-used="true"] { opacity: .45; box-shadow: 0 3px 0 var(--gf-ink); transform: translateY(3px); }
+
+/* Help content inside the frame popups. */
+.ah-help { display: grid; justify-items: center; gap: 10px; width: 100%; }
+.ah-help-copy { max-width: 34ch; font-size: clamp(18px, 2.2vw, 22px); font-weight: 600; line-height: 1.3; }
+.ah-help-growth { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--ah-bg-a, #6B3FA0); }
+.ah-help--teach .ah-array { justify-self: center; }
+.ah-help-line { display: flex; align-items: center; gap: 10px; font-size: clamp(18px, 2.4vw, 24px); font-weight: 700; }
+.ah-help-line span { padding: 4px 12px; background: var(--ah-picture, #F3F6FF); border: 2px solid var(--gf-dotted-border); border-radius: 12px; }
+.ah-help-line .ah-help-times { padding: 0; background: none; border: 0; }
+.ah-help-line--done span { border-color: var(--gf-good); }
+.ah-help-next { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--ah-bg-a, #6B3FA0); }
+.ah-help-both { padding: 6px 16px; background: #fff; border: 3px solid var(--gf-good); border-radius: 999px; font-size: clamp(20px, 2.8vw, 28px); font-weight: 700; }
+
+/* Start Lesson. */
+.ah-example { display: grid; justify-items: center; gap: 10px; }
+.ah-example-label { font-family: var(--gf-font-shout); font-size: 20px; letter-spacing: 1px; color: var(--ah-bg-a, #6B3FA0); }
+.ah-example-line { font-size: 17px; font-weight: 600; line-height: 1.5; }
+.ah-example-other-way { display: block; white-space: nowrap; }
+.ah-example-expr { display: inline-block; margin-block: 2px; white-space: nowrap; padding: 2px 10px; background: #fff; border: 2px solid var(--gf-good); border-radius: 10px; }
+.ah-example-copy { max-width: 46ch; font-size: 17px; font-weight: 600; line-height: 1.3; }
+
+/* End Screen album. */
+.ah-album-title { margin-top: 4px; font-family: var(--gf-font-shout); font-size: 22px; letter-spacing: 1px; color: var(--ah-bg-a, #6B3FA0); }
+.ah-album { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 8px 0 14px; }
+.ah-album-item {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 8px;
+  background: #fff;
+  border: 3px solid var(--gf-ink);
+  border-radius: 12px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  animation: ah-album-in .4s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: var(--ah-album-delay, 0ms);
+}
+@keyframes ah-album-in { from { opacity: 0; transform: scale(.5) rotate(-8deg); } to { opacity: 1; transform: none; } }
+.ah-album-mini { display: grid; grid-template-columns: repeat(var(--ah-cols), 9px); gap: 2px; }
+.ah-album-dot { display: block; width: 9px; height: 9px; border: 1px solid var(--gf-ink); border-radius: 2px; }
+.ah-album-dot--star { background: var(--ah-sticker, #FFD45A); }
+.ah-album-dot--circle { background: var(--ah-sticker-alt, #6BCBFF); border-radius: 50%; }
+.ah-album-dot--diamond { background: var(--ah-sticker-third, #FF8FAB); transform: rotate(45deg) scale(.8); }
+.ah-album-text { font-size: 15px; font-weight: 700; }
+
+/* Celebration pieces. */
+.ah-confetti {
+  position: absolute;
+  top: -20px;
+  width: 14px;
+  height: 14px;
+  background: var(--ah-piece, #ffd45a);
+  border: 2px solid var(--gf-ink);
+  border-radius: 3px;
+  animation: ah-fall linear forwards;
+}
+.ah-confetti--circle { border-radius: 50%; }
+.ah-confetti--diamond { transform: rotate(45deg); }
+@keyframes ah-fall { to { transform: translateY(110vh) rotate(720deg); opacity: .85; } }
+.ah-fly { position: absolute; font-size: 28px; color: #ffd45a; text-shadow: 2px 2px 0 var(--gf-ink); animation: ah-fly .9s ease-out forwards; }
+@keyframes ah-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+.gf-toast--tier { color: #ffd45a; font-size: clamp(36px, 8vw, 64px); }
+
+/* Compact phones. */
+@media (max-width: 560px) {
+  .ah-card { row-gap: 8px; padding: 2px 0; }
+  /* Clear the 44px sound control in the card's top-right corner. */
+  .ah-card .ah-prompt, .ah-card--match .gf-matching-prompt { padding-inline: 38px; font-size: 16px; }
+  .ah-caption { padding: 3px 12px; font-size: 15px; border-width: 2px; }
+  .ah-page { padding: 4px; border-width: 2px; box-shadow: 0 2px 0 var(--gf-ink); }
+  .ah-array--card .ah-grid {
+    --ah-gap: 2px;
+    --ah-cell: min(
+      calc((100cqw - 12px - (var(--ah-cols) - 1) * var(--ah-gap)) / var(--ah-cols)),
+      calc((100cqh - 12px - (var(--ah-rows) - 1) * var(--ah-gap)) / var(--ah-rows)),
+      72px
+    );
+  }
+  .gf-tiles--multi { gap: 8px; }
+  .gf-tiles--multi .gf-tile { min-height: 50px; }
+  /* Matching tiles: letter above the expression so three fit across. */
+  .gf-tiles[data-count="3"] .gf-answer-content { flex-direction: column; gap: 2px; }
+  .gf-tiles[data-count="3"] .gf-tile { padding: 6px 4px; font-size: 20px; line-height: 1; }
+  .gf-stats { gap: 8px; margin: 10px 0; }
+  .gf-stat { min-width: 78px; padding: 6px 8px; font-size: 14px; }
+  .gf-stat b { font-size: 24px; }
+  .ah-album { gap: 6px; }
+  .ah-album-item { padding: 5px; }
+  .ah-answer-letter { width: 28px; height: 28px; margin-right: 6px; font-size: 16px; }
+  .ah-card--match { --matching-gap: 10px; --matching-left: 1.3fr; gap: 8px; }
+  .ah-card--match .gf-matching-prompt { font-size: 17px; }
+  .ah-card--match .gf-matching-target { min-height: 44px; padding: 4px 8px; gap: 6px; }
+  .ah-card--match .gf-matching-target > strong { width: 26px; height: 26px; font-size: 15px; }
+  .ah-target-expression { font-size: 18px; }
+  .ah-help-copy { font-size: 16px; }
+  .ah-help-line { font-size: 16px; gap: 6px; }
+  .ah-help-both { font-size: 20px; }
+  .ah-array--help { --ah-cell: 20px; --ah-gap: 3px; }
+  .ah-brace { font-size: 13px; }
+  .ah-example-copy, .ah-example-line { font-size: 17px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-tiles--multi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .ah-card { row-gap: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ah-array--peel .ah-cell, .ah-cell--shine, .ah-album-item, .ah-card--match .gf-matching-active { animation: none !important; }
+}
+/* Game 106 matching layout, using the starter's palette. */
+.gf-matching-card { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 8px; min-width: 0; }
+.gf-matching-prompt { font-weight: 700; text-align: center; }
+.gf-matching-columns { display: grid; grid-template-columns: minmax(0, var(--matching-left, 1.35fr)) minmax(0, var(--matching-right, 1fr)); gap: var(--matching-gap, clamp(24px, 9vw, 112px)); min-width: 0; min-height: 0; }
+.gf-matching-sources, .gf-matching-targets { display: grid; grid-auto-rows: minmax(0, 1fr); gap: 8px; min-width: 0; min-height: 0; }
+.gf-matching-source, .gf-matching-target { min-width: 0; min-height: 0; padding: 6px 8px; border: 2px solid var(--gf-ink); border-radius: 12px; background: var(--gf-picture); }
+.gf-matching-target { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; align-self: center; min-height: 64px; background: var(--gf-picture-alt); }
+.gf-matching-active { border-color: var(--gf-warm); box-shadow: 0 0 0 2px var(--gf-warm); }
+.gf-matching-content { min-width: 0; }
+/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: var(--mg-expression-label-line-height, 1.05);
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: var(--mg-expression-value-line-height, 1.15);
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+/* Equal side columns keep the title centered across the complete header. */
+.game-home-header:is(.mg-hud, .gf-hud) {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  align-items: center; gap: 8px;
+}
+.game-home-header > :is(.mg-hud-title, .gf-hud-title) { text-align: center; min-width: 0; width: 100%; }
+.game-home-header > :is(.mg-chips, .gf-chips) { justify-self: end; }
+.game-home {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  box-sizing: border-box; width: 48px; min-height: 48px; flex-shrink: 0;
+  background: var(--mg-card, #fff5d6); color: var(--mg-ink, #142343);
+  border: 3px solid var(--mg-ink, #142343); border-radius: 14px;
+  box-shadow: 0 4px 0 var(--mg-ink, #142343); text-shadow: none; text-decoration: none;
+  font: 700 20px var(--mg-font-read, 'Fredoka', sans-serif);
+}
+.game-home svg { width: 25px; height: 25px; }
+.game-home:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+.game-home:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mg-ink, #142343); }
+.game-end-actions { display: flex; justify-content: center; align-items: stretch; gap: 12px; margin-top: 12px; }
+.game-end-actions > .game-home-labeled { width: auto; min-height: 64px; padding: 10px 20px; }
+.game-end-actions > :is(.mg-big-btn, .gf-big-btn) { margin: 0; }
+.game-home-header > .gf-hud-title { font-size: clamp(15px, 2.6vw, 40px); white-space: normal; overflow-wrap: anywhere; }
+.game-home-header > :is(.mg-chips, .gf-chips) { width: max-content; white-space: nowrap; }
+.gf-root .game-home, .gf-game .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }
+.game-home-header > .mg-hud-title { white-space: normal; overflow-wrap: anywhere; }
+.gf-hud .game-home, .gf-end-card .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>

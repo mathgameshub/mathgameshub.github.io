@@ -892,7 +892,10 @@ function helpPanel(step, params, firstMiss = false) {
   retry.textContent = "TRY AGAIN";
   if (firstMiss) {
     instruction.textContent = step.key === "groups" ? "Count the groups." : "Count how many are in each group.";
-    panel.append(instruction, retry);
+    const banner = document.createElement("h2");
+    banner.className = "mg-first-miss-banner";
+    banner.textContent = "TAKE ANOTHER LOOK";
+    panel.append(banner, instruction, retry);
   } else panel.append(instruction, picture, retry);
   return { panel, retry, groups: visual.groups, each: visual.each };
 }
@@ -1007,7 +1010,46 @@ function mount(element, options = {}) {
     }
   };
 }
-mount(document.getElementById("game"), { gameFile: "expression_builder_103.html" });</script>
+function installHomeNavigation(root) {
+  const icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 3l9 8v10h-6v-7H9v7H3Z" fill="currentColor"/></svg>';
+  function home(label) {
+    const link = document.createElement("a");
+    link.href = "./index.html";
+    link.className = "game-home" + (label ? " game-home-labeled" : "");
+    link.setAttribute("aria-label", "Go home to game menu");
+    link.title = "Go home";
+    link.innerHTML = icon;
+    if (label) link.append(document.createTextNode("HOME"));
+    return link;
+  }
+  const headers = /* @__PURE__ */ new Set();
+  function update() {
+    for (const header of root.querySelectorAll(".mg-hud, .gf-hud")) {
+      if (headers.has(header)) continue;
+      headers.add(header);
+      header.classList.add("game-home-header");
+      header.prepend(home(false));
+    }
+    for (const stats of root.querySelectorAll(".mg-stats, .gf-stats")) {
+      const card = stats.parentElement;
+      if (card.querySelector(".game-end-actions")) continue;
+      const again = card.querySelector(".mg-big-btn, .gf-big-btn");
+      if (!again) continue;
+      const actions = document.createElement("div");
+      actions.className = "game-end-actions";
+      again.replaceWith(actions);
+      actions.append(again, home(true));
+    }
+  }
+  const observer = new MutationObserver(update);
+  observer.observe(root, { childList: true, subtree: true });
+  update();
+  return () => {
+    observer.disconnect();
+  };
+}
+mount(document.getElementById("game"), { gameFile: "expression_builder_103.html" });
+installHomeNavigation(document.getElementById("game"));</script>
   <style rel="stylesheet" crossorigin>/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
    reading. Saturated gradients from Eric's palette, white cards, thick
    outlines, chunky shadows, confetti. Games override the --mg-* tokens
@@ -1787,7 +1829,37 @@ body {
   .mg-shell-standard .eb-expression.mg-expression-row .eb-expression-slot--groups {
     margin-right: calc((100% - (100% - var(--mg-expression-operator-size) * .5 - 5.4px) * .77) / 2);
   }
-}</style>
+}
+
+/* First-miss banner follows the approved Game 109 header. */
+.eb-game .mg-first-miss-banner { box-sizing: border-box; width: 100%; max-width: 30ch; margin: 0; padding: 12px 18px; background: #F3F6FF; color: #13213F; border: 3px solid #4D9DE0; border-radius: 15px; font-family: var(--mg-font-read, Fredoka, sans-serif); font-size: 28px; font-weight: 800; line-height: 1.15; text-align: center; grid-column: 1 / -1; }
+@media (max-width: 560px) { .eb-game .mg-first-miss-banner { font-size: 24px; } }
+/* Equal side columns keep the title centered across the complete header. */
+.game-home-header:is(.mg-hud, .gf-hud) {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  align-items: center; gap: 8px;
+}
+.game-home-header > :is(.mg-hud-title, .gf-hud-title) { text-align: center; min-width: 0; width: 100%; }
+.game-home-header > :is(.mg-chips, .gf-chips) { justify-self: end; }
+.game-home {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  box-sizing: border-box; width: 48px; min-height: 48px; flex-shrink: 0;
+  background: var(--mg-card, #fff5d6); color: var(--mg-ink, #142343);
+  border: 3px solid var(--mg-ink, #142343); border-radius: 14px;
+  box-shadow: 0 4px 0 var(--mg-ink, #142343); text-shadow: none; text-decoration: none;
+  font: 700 20px var(--mg-font-read, 'Fredoka', sans-serif);
+}
+.game-home svg { width: 25px; height: 25px; }
+.game-home:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+.game-home:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mg-ink, #142343); }
+.game-end-actions { display: flex; justify-content: center; align-items: stretch; gap: 12px; margin-top: 12px; }
+.game-end-actions > .game-home-labeled { width: auto; min-height: 64px; padding: 10px 20px; }
+.game-end-actions > :is(.mg-big-btn, .gf-big-btn) { margin: 0; }
+.game-home-header > .gf-hud-title { font-size: clamp(15px, 2.6vw, 40px); white-space: normal; overflow-wrap: anywhere; }
+.game-home-header > :is(.mg-chips, .gf-chips) { width: max-content; white-space: nowrap; }
+.gf-root .game-home, .gf-game .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }
+.game-home-header > .mg-hud-title { white-space: normal; overflow-wrap: anywhere; }
+.gf-hud .game-home, .gf-end-card .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }</style>
 </head>
 <body>
   <div id="game"></div>

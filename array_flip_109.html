@@ -1,0 +1,3543 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="tracker.js"></script>
+
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Math Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Fredoka:wght@400;600;700&display=swap" rel="stylesheet">
+  <script type="module">
+(function installGameFrame(global) {
+  const DEFAULT_THEME = Object.freeze({
+    bgA: "#3156D8",
+    bgB: "#13213F",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#37C8C5",
+    picture: "#E5F8F5",
+    pictureAlt: "#fffdf4"
+  });
+  const DEFAULT_PROBLEMS = Object.freeze([
+    { id: "sample-1", title: "Sample lesson card", detail: "Replace this panel with the first lesson problem.", prompt: "Choose the answer that fits.", answer: "c", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-2", title: "The next sample card", detail: "The frame keeps the same question and choices after a miss.", prompt: "Choose the answer that fits.", answer: "a", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] },
+    { id: "sample-3", title: "One more sample card", detail: "Your adapter can render a picture, chart, or other lesson view here.", prompt: "Choose the answer that fits.", answer: "d", choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }, { id: "d", label: "D" }] }
+  ]);
+  const DEFAULTS = Object.freeze({
+    title: "LESSON GAME",
+    subtitle: "A reusable frame for a new lesson.",
+    tag: "LESSON · STARTER",
+    startButton: "START",
+    playAgain: "PLAY AGAIN",
+    totalQuestions: DEFAULT_PROBLEMS.length,
+    basePoints: 10,
+    // Game 107 awards base points plus the new streak length. Set false when
+    // a lesson wants the frame without a streak bonus.
+    streakBonus: true,
+    advanceMs: 900,
+    hotStreak: 5
+  });
+  const isNode = (value) => Boolean(value && typeof value === "object" && value.nodeType);
+  function node(documentRef, tag, className, text) {
+    const element = documentRef.createElement(tag);
+    if (className) element.className = className;
+    if (text !== void 0 && text !== null) element.textContent = String(text);
+    return element;
+  }
+  function append(parent, ...children) {
+    children.flat(Infinity).forEach((child) => {
+      if (child !== null && child !== void 0) parent.append(child);
+    });
+    return parent;
+  }
+  function putContent(host, content) {
+    host.replaceChildren();
+    if (isNode(content)) host.append(content);
+    else if (content !== void 0 && content !== null) host.textContent = String(content);
+    return host;
+  }
+  function safeText(value, fallback = "") {
+    return value === void 0 || value === null ? fallback : String(value);
+  }
+  function normalizeChoice(choice, index) {
+    if (choice && typeof choice === "object") {
+      const id = safeText(choice.id, String(index));
+      return { ...choice, id, label: safeText(choice.label, id) };
+    }
+    const label = safeText(choice, String(index));
+    return { id: label, label };
+  }
+  function normalizeProblem(problem, index) {
+    const value = problem && typeof problem === "object" ? problem : {};
+    const choices = Array.isArray(value.choices) ? value.choices.map(normalizeChoice) : [];
+    if (!choices.length) throw new Error("Game frame problem needs at least one choice");
+    const answer = safeText(value.answer, "");
+    if (!answer || !choices.some((choice) => choice.id === answer)) {
+      throw new Error(`Game frame problem answer must match a choice id (problem ${index + 1})`);
+    }
+    const answers = Array.isArray(value.answers) && value.answers.length ? value.answers.map((id) => safeText(id, "")) : [answer];
+    if (answers.some((id) => !choices.some((choice) => choice.id === id))) {
+      throw new Error(`Game frame problem answers must match choice ids (problem ${index + 1})`);
+    }
+    const parts = Array.isArray(value.parts) && value.parts.length ? value.parts.map((part) => ({ ...part && typeof part === "object" ? part : {} })) : null;
+    return {
+      ...value,
+      id: safeText(value.id, `problem-${index + 1}`),
+      prompt: safeText(value.prompt, ""),
+      answer,
+      answers,
+      multi: Boolean(value.multi) || Boolean(parts),
+      parts,
+      choices
+    };
+  }
+  function makeTheme(theme) {
+    return { ...DEFAULT_THEME, ...theme && typeof theme === "object" ? theme : {} };
+  }
+  function mount2(root, supplied = {}) {
+    if (!root || !root.ownerDocument) throw new Error("GameFrameStarter.mount needs a DOM element");
+    const documentRef = root.ownerDocument;
+    const view = documentRef.defaultView || global;
+    const config = { ...DEFAULTS, ...supplied };
+    const theme = makeTheme(config.theme);
+    const problems = Array.isArray(config.problems) && config.problems.length ? config.problems : DEFAULT_PROBLEMS;
+    const totalQuestions = Math.max(1, Number(config.totalQuestions) || problems.length);
+    const getProblem = typeof config.getProblem === "function" ? config.getProblem : (index) => problems[index % problems.length];
+    const renderProblem = typeof config.renderProblem === "function" ? config.renderProblem : (problem2, host) => renderDefaultProblem(problem2, host, documentRef);
+    const renderStartExample = typeof config.renderStartExample === "function" ? config.renderStartExample : (host) => renderDefaultStartExample(host, documentRef);
+    const renderAnswer = typeof config.renderAnswer === "function" ? config.renderAnswer : (choice, host) => host.textContent = safeText(choice.label, choice.id);
+    let destroyed = false;
+    let problem = null;
+    let problemIndex = 0;
+    let popup = null;
+    let partIndex = 0;
+    let picks = [];
+    let advanceTimer = null;
+    let toastTimer = null;
+    let previousFocus = null;
+    const listeners = [];
+    const timers = /* @__PURE__ */ new Set();
+    const state = {
+      phase: "start",
+      score: 0,
+      streak: 0,
+      bestStreak: 0,
+      questionsAnswered: 0,
+      completed: 0,
+      canAnswer: false,
+      firstTry: true,
+      wrongAttempts: 0,
+      muted: false
+    };
+    root.replaceChildren();
+    root.classList.add("game-frame", "game-frame--standard");
+    root.setAttribute("role", "main");
+    root.setAttribute("aria-label", safeText(config.ariaLabel, `${config.title} game`));
+    Object.entries(theme).forEach(([key, value]) => root.style.setProperty(`--gf-${toKebab(key)}`, value));
+    if (documentRef.title === "Math Game" || !documentRef.title) documentRef.title = `${config.title} | Math Games`;
+    if (config.hidePrompt) root.classList.add("game-frame--card-prompt");
+    const startScreen = node(documentRef, "section", "gf-screen gf-screen--start");
+    const startCard = node(documentRef, "div", "gf-card gf-start-card");
+    const startIcon = node(documentRef, "div", "gf-emoji", config.startIcon || "✦");
+    startIcon.setAttribute("aria-hidden", "true");
+    const startTitle = node(documentRef, "h1", "gf-title", config.title);
+    const startSubtitle = node(documentRef, "p", "gf-subtitle", config.subtitle);
+    const startTag = node(documentRef, "p", "gf-tag", config.tag);
+    const startExample = node(documentRef, "div", "gf-example");
+    const startButton = node(documentRef, "button", "gf-big-btn", config.startButton);
+    startButton.type = "button";
+    append(startCard, startIcon, startTitle, startSubtitle, startTag, startExample, startButton);
+    startScreen.append(startCard);
+    const shell = node(documentRef, "div", "gf-shell");
+    const hud = node(documentRef, "header", "gf-hud");
+    const hudTitle = node(documentRef, "h2", "gf-hud-title", config.title);
+    const chips = node(documentRef, "div", "gf-chips");
+    const scoreChip = node(documentRef, "span", "gf-chip gf-chip--score", "Score 0");
+    const streakChip = node(documentRef, "span", "gf-chip gf-chip--streak", "0🔥");
+    append(chips, scoreChip, streakChip);
+    append(hud, hudTitle, chips);
+    const progress = node(documentRef, "div", "gf-progress");
+    const progressBar = node(documentRef, "i");
+    progress.append(progressBar);
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", "Question progress");
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(totalQuestions));
+    const stage = node(documentRef, "main", "gf-stage");
+    const prompt = node(documentRef, "h3", "gf-prompt");
+    prompt.tabIndex = -1;
+    prompt.setAttribute("aria-live", "polite");
+    const visual = node(documentRef, "div", "gf-visual");
+    const problemCard = node(documentRef, "section", "gf-problem-card");
+    problemCard.setAttribute("aria-label", "Lesson problem");
+    const problemSlot = node(documentRef, "div", "gf-problem-slot");
+    const soundButton = node(documentRef, "button", "gf-sound", "🔊");
+    soundButton.type = "button";
+    soundButton.setAttribute("aria-pressed", "false");
+    soundButton.setAttribute("aria-label", "Sound on. Turn sound off");
+    append(problemCard, problemSlot, soundButton);
+    visual.append(problemCard);
+    const tiles = node(documentRef, "div", "gf-tiles");
+    tiles.setAttribute("role", "group");
+    tiles.setAttribute("aria-label", "Answer choices");
+    append(stage, prompt, visual, tiles);
+    const fx = node(documentRef, "div", "gf-fx");
+    const endScreen = node(documentRef, "section", "gf-screen gf-screen--end gf-hidden");
+    const endCard = node(documentRef, "div", "gf-card gf-end-card");
+    const endIcon = node(documentRef, "div", "gf-emoji", config.endIcon || "✦");
+    endIcon.setAttribute("aria-hidden", "true");
+    const endTitle = node(documentRef, "h1", "gf-title", config.endTitle || "NICE WORK!");
+    const endLine = node(documentRef, "p", "gf-subtitle");
+    const stats = node(documentRef, "div", "gf-stats");
+    const againButton = node(documentRef, "button", "gf-big-btn", config.playAgain);
+    againButton.type = "button";
+    const endExtra = node(documentRef, "div", "gf-end-extra");
+    append(endCard, endIcon, endTitle, endLine, stats, endExtra, againButton);
+    endScreen.append(endCard);
+    append(root, startScreen, shell, endScreen, fx);
+    append(shell, hud, progress, stage);
+    renderStartExample(startExample, { state, config, document: documentRef });
+    function listen(target, eventName, handler, options) {
+      target.addEventListener(eventName, handler, options);
+      listeners.push(() => target.removeEventListener(eventName, handler, options));
+    }
+    function later(callback, ms) {
+      const id = view.setTimeout(() => {
+        timers.delete(id);
+        if (!destroyed) callback();
+      }, ms);
+      timers.add(id);
+      return id;
+    }
+    function cancelTimer(id) {
+      if (id == null) return;
+      view.clearTimeout(id);
+      timers.delete(id);
+    }
+    function cancelAllTimers() {
+      timers.forEach((id) => view.clearTimeout(id));
+      timers.clear();
+      advanceTimer = null;
+      toastTimer = null;
+    }
+    function setInert(element, inert) {
+      if (inert) {
+        element.setAttribute("inert", "");
+        element.setAttribute("aria-hidden", "true");
+      } else {
+        element.removeAttribute("inert");
+        element.removeAttribute("aria-hidden");
+      }
+    }
+    function updateHud() {
+      scoreChip.textContent = `Score ${state.score}`;
+      streakChip.textContent = `${state.streak}🔥`;
+      streakChip.classList.toggle("gf-chip--hot", state.streak >= config.hotStreak);
+      const current = Math.min(totalQuestions, state.completed);
+      progressBar.style.width = `${current / totalQuestions * 100}%`;
+      progress.setAttribute("aria-valuenow", String(current));
+      progress.setAttribute("aria-valuetext", `${current} of ${totalQuestions} questions`);
+      if (typeof config.onStateChange === "function") config.onStateChange({ ...state }, api);
+    }
+    function showToast(text, kind = "good") {
+      if (!text) return;
+      const toast = node(documentRef, "div", `gf-toast gf-toast--${kind}`, text);
+      fx.append(toast);
+      if (toastTimer) cancelTimer(toastTimer);
+      toastTimer = later(() => toast.remove(), 900);
+    }
+    function focusableIn(panel) {
+      return Array.from(panel.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter((element) => !element.disabled && element.getAttribute("aria-hidden") !== "true");
+    }
+    function closePopup(restore = true) {
+      if (!popup) return;
+      const current = popup;
+      popup = null;
+      current.panel.removeEventListener("keydown", current.onKeyDown);
+      current.retry.removeEventListener("click", current.onRetry);
+      current.panel.remove();
+      setInert(shell, false);
+      tiles.querySelectorAll("button").forEach((button) => {
+        if (button.dataset.used === "true" || button.dataset.found === "true" || button.dataset.muted === "true") return;
+        button.disabled = false;
+        button.removeAttribute("aria-disabled");
+        button.classList.remove("gf-wrong");
+      });
+      if (restore && previousFocus && previousFocus.isConnected !== false) {
+        try {
+          previousFocus.focus({ preventScroll: true });
+        } catch {
+          previousFocus.focus();
+        }
+      }
+      previousFocus = null;
+    }
+    function openPopup({ kind, title, content, returnFocus }) {
+      closePopup(false);
+      const panel = node(documentRef, "section", `gf-popup gf-popup--${kind}`);
+      panel.setAttribute("role", "dialog");
+      panel.setAttribute("aria-modal", "true");
+      const titleNode = node(documentRef, "p", "gf-popup-title", title);
+      titleNode.id = `gf-popup-title-${Date.now()}-${Math.floor(Math.random() * 1e3)}`;
+      panel.setAttribute("aria-labelledby", titleNode.id);
+      const contentHost = node(documentRef, "div", "gf-popup-content");
+      if (content !== void 0 && content !== null) putContent(contentHost, content);
+      const retry = node(documentRef, "button", "gf-retry", "TRY AGAIN");
+      retry.type = "button";
+      append(panel, titleNode, contentHost, retry);
+      fx.append(panel);
+      setInert(shell, true);
+      tiles.querySelectorAll("button").forEach((button) => {
+        button.disabled = true;
+        button.setAttribute("aria-disabled", "true");
+      });
+      previousFocus = returnFocus || documentRef.activeElement;
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          retry.click();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = focusableIn(panel);
+        if (!focusable.length) {
+          event.preventDefault();
+          return;
+        }
+        const currentIndex = focusable.indexOf(documentRef.activeElement);
+        const nextIndex = event.shiftKey ? (currentIndex <= 0 ? focusable.length : currentIndex) - 1 : (currentIndex + 1) % focusable.length;
+        event.preventDefault();
+        focusable[nextIndex].focus();
+      };
+      panel.addEventListener("keydown", onKeyDown);
+      const onRetry = () => {
+        const canRetry = state.phase === "question" && Boolean(problem);
+        closePopup();
+        if (canRetry) {
+          state.canAnswer = true;
+          updateHud();
+        }
+      };
+      retry.addEventListener("click", onRetry);
+      popup = { panel, retry, onKeyDown, onRetry };
+      retry.focus();
+      return popup;
+    }
+    function renderQuestion({ focus = true } = {}) {
+      if (state.completed >= totalQuestions) return finish();
+      const rawProblem = getProblem(problemIndex, { ...state });
+      problem = normalizeProblem(rawProblem, problemIndex);
+      prompt.textContent = problem.prompt || config.prompt || "Choose an answer.";
+      putContent(problemSlot, null);
+      renderProblem(problem, problemSlot, { state: { ...state }, config, document: documentRef, api });
+      tiles.replaceChildren();
+      tiles.dataset.count = String(problem.choices.length);
+      tiles.classList.toggle("gf-tiles--multi", problem.multi);
+      problem.choices.forEach((choice) => {
+        const button = node(documentRef, "button", "gf-tile");
+        button.type = "button";
+        button.dataset.choiceId = choice.id;
+        button.setAttribute("aria-label", safeText(choice.ariaLabel, `Choose ${choice.label}`));
+        const content = node(documentRef, "span", "gf-answer-content");
+        renderAnswer(choice, content, { problem, state: { ...state }, document: documentRef, api });
+        button.append(content);
+        listen(button, "click", () => problem.multi ? tapMulti(choice, button) : answer(choice, button));
+        tiles.append(button);
+      });
+      state.phase = "question";
+      state.canAnswer = true;
+      state.firstTry = state.wrongAttempts === 0;
+      partIndex = 0;
+      picks = [];
+      if (focus) prompt.focus({ preventScroll: true });
+      if (typeof config.onQuestion === "function") config.onQuestion(problem, api);
+      if (problem.parts) notifyPart({ choice: null, button: null, complete: false });
+    }
+    function notifyPart(extra) {
+      if (typeof config.onPart === "function") {
+        config.onPart({ problem, partIndex, part: problem.parts[partIndex] || null, picks: picks.slice(), state: { ...state }, api, ...extra });
+      }
+    }
+    function acceptPick(choice) {
+      if (typeof config.acceptPick === "function") return Boolean(config.acceptPick({ problem, partIndex, part: problem.parts[partIndex], choice, picks: picks.slice() }));
+      const part = problem.parts[partIndex];
+      const answers = Array.isArray(part.answers) ? part.answers : problem.answers;
+      return answers.includes(choice.id) && !picks.includes(choice.id);
+    }
+    function tapPart(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      if (button.dataset.found === "true" || button.dataset.muted === "true") return;
+      if (!acceptPick(choice)) {
+        settle(false, { choice, choices: [choice], button, buttons: [button] });
+        return;
+      }
+      button.dataset.found = "true";
+      button.classList.add("gf-right");
+      button.disabled = true;
+      button.setAttribute("aria-disabled", "true");
+      picks.push(choice.id);
+      partIndex += 1;
+      const complete = partIndex >= problem.parts.length;
+      if (!complete) state.wrongAttempts = 0;
+      notifyPart({ choice, button, complete });
+      if (typeof config.onFound === "function") config.onFound({ choice, button, complete, problem, state: { ...state }, api });
+      if (!complete) return;
+      const found = foundButtons();
+      const choices = picks.map((id) => problem.choices.find((entry) => entry.id === id));
+      settle(true, { choice, choices, button, buttons: found });
+    }
+    function foundButtons() {
+      return Array.from(tiles.querySelectorAll("button.gf-tile")).filter((button) => button.dataset.found === "true");
+    }
+    function tapMulti(choice, button) {
+      if (problem && problem.parts) return tapPart(choice, button);
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      if (button.dataset.found === "true") return;
+      if (!problem.answers.includes(choice.id)) {
+        settle(false, { choice, choices: [choice], button, buttons: [button] });
+        return;
+      }
+      button.dataset.found = "true";
+      button.classList.add("gf-right");
+      button.disabled = true;
+      button.setAttribute("aria-disabled", "true");
+      const found = foundButtons();
+      const complete = found.length >= problem.answers.length;
+      if (typeof config.onFound === "function") config.onFound({ choice, button, complete, problem, state: { ...state }, api });
+      if (!complete) return;
+      const choices = found.map((candidate) => problem.choices.find((entry) => entry.id === candidate.dataset.choiceId));
+      settle(true, { choice, choices, button, buttons: found });
+    }
+    function answer(choice, button) {
+      if (!state.canAnswer || state.phase !== "question" || !problem) return;
+      settle(choice.id === problem.answer, { choice, choices: [choice], button, buttons: [button] });
+    }
+    function settle(correct, { choice, choices, button, buttons }) {
+      state.canAnswer = false;
+      if (correct) {
+        buttons.forEach((candidate) => candidate.classList.add("gf-right"));
+        tiles.querySelectorAll("button").forEach((candidate) => {
+          candidate.disabled = true;
+        });
+        state.completed += 1;
+        state.questionsAnswered += 1;
+        state.streak += 1;
+        state.bestStreak = Math.max(state.bestStreak, state.streak);
+        state.score += Number(config.basePoints) + (config.streakBonus === false ? 0 : state.streak);
+        state.wrongAttempts = 0;
+        updateHud();
+        showToast(typeof config.praise === "function" ? config.praise({ choice, problem, state: { ...state } }) : "NICE WORK!");
+        if (typeof config.onCorrect === "function") config.onCorrect({ choice, choices, problem, button, buttons, state: { ...state }, api });
+        const currentIndex = problemIndex;
+        problemIndex += 1;
+        const delay = typeof config.advanceMs === "function" ? config.advanceMs({ state: { ...state }, problem }) : config.advanceMs;
+        advanceTimer = later(() => {
+          advanceTimer = null;
+          if (currentIndex !== problemIndex - 1 || destroyed) return;
+          if (state.completed >= totalQuestions) finish();
+          else renderQuestion();
+          if (typeof config.onAdvance === "function") config.onAdvance({ state: { ...state }, api });
+        }, Math.max(0, Number(delay) || 0));
+      } else {
+        const firstTry = state.firstTry;
+        buttons.forEach((candidate) => candidate.classList.add("gf-wrong"));
+        state.wrongAttempts += 1;
+        state.streak = 0;
+        state.firstTry = false;
+        updateHud();
+        if (typeof config.onWrong === "function") config.onWrong({ choice, choices, problem, button, buttons, state: { ...state, firstTry }, api });
+        const teaching = state.wrongAttempts >= 2;
+        const title = teaching ? typeof config.teachingTitle === "function" ? config.teachingTitle({ problem, state: { ...state } }) : "LET’S WORK IT OUT TOGETHER" : typeof config.firstMissTitle === "function" ? config.firstMissTitle({ problem, state: { ...state } }) : "TAKE ANOTHER LOOK";
+        const content = teaching ? typeof config.renderTeaching === "function" ? config.renderTeaching(problem, { choices, state: { ...state }, document: documentRef, api }) : "Your teaching explanation goes here." : typeof config.renderFirstMiss === "function" ? config.renderFirstMiss(problem, { choices, state: { ...state }, document: documentRef, api }) : null;
+        openPopup({ kind: teaching ? "teaching" : "cue", title, content, returnFocus: button });
+      }
+    }
+    function startFresh() {
+      closePopup(false);
+      cancelAllTimers();
+      state.phase = "question";
+      state.score = 0;
+      state.streak = 0;
+      state.bestStreak = 0;
+      state.questionsAnswered = 0;
+      state.completed = 0;
+      state.canAnswer = false;
+      state.firstTry = true;
+      state.wrongAttempts = 0;
+      problemIndex = 0;
+      problem = null;
+      shell.classList.remove("gf-hidden");
+      startScreen.classList.add("gf-hidden");
+      endScreen.classList.add("gf-hidden");
+      setInert(startScreen, true);
+      setInert(endScreen, true);
+      setInert(shell, false);
+      updateHud();
+      renderQuestion();
+      if (typeof config.onStart === "function") config.onStart({ state: { ...state }, api });
+    }
+    function finish() {
+      if (destroyed) return;
+      cancelTimer(advanceTimer);
+      advanceTimer = null;
+      closePopup(false);
+      state.phase = "end";
+      state.canAnswer = false;
+      shell.classList.add("gf-hidden");
+      setInert(shell, true);
+      endLine.textContent = typeof config.endMessage === "function" ? config.endMessage({ state: { ...state } }) : `You completed ${state.completed} question${state.completed === 1 ? "" : "s"}.`;
+      stats.replaceChildren();
+      [["Score", state.score], ["Best streak", state.bestStreak], ["Questions", state.completed]].forEach(([label, value]) => {
+        const stat = node(documentRef, "div", "gf-stat", label);
+        stat.prepend(node(documentRef, "b", null, value));
+        stats.append(stat);
+      });
+      endExtra.replaceChildren();
+      if (typeof config.renderEnd === "function") config.renderEnd(endExtra, { state: { ...state }, document: documentRef, api });
+      endScreen.classList.remove("gf-hidden");
+      setInert(endScreen, false);
+      againButton.focus({ preventScroll: true });
+      updateHud();
+      if (typeof config.onEnd === "function") config.onEnd({ state: { ...state }, api });
+    }
+    function toggleSound() {
+      state.muted = !state.muted;
+      soundButton.textContent = state.muted ? "🔇" : "🔊";
+      soundButton.setAttribute("aria-pressed", state.muted ? "true" : "false");
+      soundButton.setAttribute("aria-label", state.muted ? "Sound off. Turn sound on" : "Sound on. Turn sound off");
+      if (typeof config.onSoundToggle === "function") config.onSoundToggle(state.muted, { state: { ...state }, api });
+    }
+    const api = {
+      root,
+      state,
+      get problem() {
+        return problem;
+      },
+      get problemIndex() {
+        return problemIndex;
+      },
+      get partIndex() {
+        return partIndex;
+      },
+      get picks() {
+        return picks.slice();
+      },
+      start: startFresh,
+      answer(choiceId) {
+        const button = Array.from(tiles.querySelectorAll("button")).find((candidate) => candidate.dataset.choiceId === String(choiceId));
+        button?.click();
+      },
+      finish,
+      closePopup,
+      renderQuestion,
+      updateHud,
+      destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        cancelAllTimers();
+        closePopup(false);
+        listeners.splice(0).forEach((remove) => remove());
+        root.replaceChildren();
+        root.classList.remove("game-frame", "game-frame--standard");
+        root.removeAttribute("role");
+        root.removeAttribute("aria-label");
+        if (typeof config.onDestroy === "function") config.onDestroy({ state: { ...state } });
+      }
+    };
+    listen(startButton, "click", startFresh);
+    listen(againButton, "click", startFresh);
+    listen(soundButton, "click", toggleSound);
+    setInert(startScreen, false);
+    setInert(shell, true);
+    setInert(endScreen, true);
+    return api;
+  }
+  function renderDefaultStartExample(host, documentRef) {
+    const label = node(documentRef, "p", "gf-example-label", "STARTER EXAMPLE");
+    const body = node(documentRef, "p", "gf-example-body", "Replace this example with the lesson introduction.");
+    append(host, label, body);
+  }
+  function renderDefaultProblem(problem, host, documentRef) {
+    const label = node(documentRef, "p", "gf-sample-kicker", "ADAPTER SLOT");
+    const title = node(documentRef, "h4", "gf-sample-title", problem.title || "Lesson content goes here");
+    const detail = node(documentRef, "p", "gf-sample-detail", problem.detail || "Render the lesson-specific problem in this card.");
+    append(host, label, title, detail);
+  }
+  function toKebab(value) {
+    return String(value).replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+  }
+  global.GameFrameStarter = Object.freeze({ mount: mount2, DEFAULT_PROBLEMS });
+})(globalThis);
+function createRng(seed = Date.now()) {
+  let a = seed >>> 0;
+  const next = () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+  const rng = {
+    next,
+    // Integer in [min, max], both inclusive.
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    pick(list) {
+      return list[Math.floor(next() * list.length)];
+    },
+    shuffle(list) {
+      const out = list.slice();
+      for (let i = out.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(next() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+      }
+      return out;
+    },
+    chance(p) {
+      return next() < p;
+    }
+  };
+  return rng;
+}
+const REQUIRED = ["requireLogin", "startAutoSave", "recordQuestion", "checkAutoSave", "markMissed", "getMissedProblem", "markCorrected"];
+const GLOBALS = ["questionsAnswered", "score", "streak", "bestStreak"];
+function fallbackPool() {
+  let pool = [];
+  const keyOf = (p) => JSON.stringify(p);
+  return {
+    markMissed(params) {
+      const k = keyOf(params);
+      if (!pool.some((m) => keyOf(m.params) === k)) pool.push({ params, attempts: 0 });
+    },
+    getMissedProblem() {
+      if (pool.length === 0) return null;
+      const prob = Math.min(0.6, 0.3 + pool.length * 0.05);
+      if (Math.random() > prob) return null;
+      const pick = [...pool].sort((a, b) => a.attempts - b.attempts)[0];
+      pick.attempts += 1;
+      return pick.params;
+    },
+    markCorrected(params) {
+      const k = keyOf(params);
+      pool = pool.filter((m) => keyOf(m.params) !== k);
+    }
+  };
+}
+function connectTracker({ gameFile, interval = 3, win = globalThis }) {
+  const gt = win.GameTracker ?? (typeof GameTracker !== "undefined" ? GameTracker : void 0);
+  const live = Boolean(gt) && REQUIRED.every((m) => typeof gt[m] === "function");
+  const pool = live ? gt : fallbackPool();
+  const globals = Object.fromEntries(GLOBALS.map((k) => [k, 0]));
+  const publish = (state) => {
+    for (const k of GLOBALS) {
+      globals[k] = state[k];
+      win[k] = state[k];
+    }
+  };
+  publish(globals);
+  return {
+    live,
+    gameFile,
+    publish,
+    async requireLogin() {
+      return live ? gt.requireLogin() : { id: "guest", first_name: "Player", class_code: "PLAY" };
+    },
+    startAutoSave() {
+      if (live) gt.startAutoSave({ gameFile, interval });
+    },
+    recordQuestion(record) {
+      if (live) gt.recordQuestion({ gameFile, ...record });
+    },
+    checkAutoSave() {
+      if (live) gt.checkAutoSave();
+    },
+    markMissed: (params) => pool.markMissed(params),
+    getMissedProblem: () => pool.getMissedProblem(),
+    markCorrected: (params) => pool.markCorrected(params)
+  };
+}
+let ctx = null;
+function initAudio() {
+  if (ctx) return ctx;
+  const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+  if (!AC) return null;
+  try {
+    const nextCtx = new AC();
+    ctx = nextCtx;
+    if (ctx.state === "suspended") {
+      const resume = ctx.resume();
+      resume?.catch?.(() => {
+        if (ctx === nextCtx) ctx = null;
+      });
+    }
+    return ctx;
+  } catch {
+    ctx = null;
+    return null;
+  }
+}
+const STREAK_TIERS = [
+  { at: 3, word: "STREAK!", burst: 12 },
+  { at: 6, word: "ON FIRE!", burst: 24 },
+  { at: 10, word: "FLAWLESS!", burst: 40 },
+  { at: 12, word: "LEGENDARY!", burst: 60 },
+  { at: 15, word: "UNSTOPPABLE!", burst: 90 }
+];
+function checkGenerator(game2, { count = 500, seed = 1, choiceCounts = [3, 4] } = {}) {
+  const rng = createRng(seed);
+  const errors = [];
+  const seenParams = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i += 1) {
+    let params;
+    let problem;
+    try {
+      params = game2.generate(rng);
+      problem = game2.build(params, rng);
+    } catch (e) {
+      errors.push(`#${i}: threw ${e.message}`);
+      continue;
+    }
+    const tag = `#${i} ${JSON.stringify(params)}`;
+    if (JSON.stringify(JSON.parse(JSON.stringify(params))) !== JSON.stringify(params)) errors.push(`${tag}: params must be JSON-safe`);
+    if (!problem || typeof problem !== "object") {
+      errors.push(`${tag}: build returned nothing`);
+      continue;
+    }
+    if (JSON.stringify(problem.params) !== JSON.stringify(params)) errors.push(`${tag}: problem.params must equal the input params`);
+    const validateStep = (step, label, requireValue = false) => {
+      if (typeof step?.prompt !== "string" || !step.prompt.trim()) errors.push(`${tag}: ${label} prompt must be non-empty text`);
+      const choices = step?.choices;
+      if (!Array.isArray(choices) || !choiceCounts.includes(choices.length)) errors.push(`${tag}: ${label} expected ${choiceCounts.join(" or ")} choices, got ${choices && choices.length}`);
+      else {
+        const ids = choices.map((c) => c && c.id);
+        const labels = choices.map((c) => c && String(c.label));
+        if (new Set(ids).size !== ids.length) errors.push(`${tag}: ${label} choice ids must be unique`);
+        if (new Set(labels).size !== labels.length) errors.push(`${tag}: ${label} choice labels must be unique (${labels.join(" | ")})`);
+        if (!ids.includes(step.answer)) errors.push(`${tag}: ${label} answer ${step.answer} is not a choice id`);
+        if (choices.some((c) => !c || c.label == null)) errors.push(`${tag}: ${label} every choice needs a label`);
+        if (requireValue && choices.some((c) => typeof c?.value !== "number" || !Number.isFinite(c.value))) errors.push(`${tag}: ${label} every choice needs a finite numeric value`);
+      }
+    };
+    if (problem.steps) {
+      if (!Array.isArray(problem.steps) || problem.steps.length === 0) errors.push(`${tag}: steps must be a non-empty array`);
+      else {
+        const keys = problem.steps.map((step) => step && step.key);
+        if (keys.some((key) => typeof key !== "string" || !key)) errors.push(`${tag}: every step needs a key`);
+        if (new Set(keys).size !== keys.length) errors.push(`${tag}: step keys must be unique`);
+        problem.steps.forEach((step, index) => validateStep(step, `step ${index + 1}`, true));
+      }
+    } else {
+      validateStep(problem, "problem");
+    }
+    if (game2.ranges) {
+      for (const [k, [min, max]] of Object.entries(game2.ranges)) {
+        const v = params[k];
+        if (typeof v !== "number" || v < min || v > max) errors.push(`${tag}: ${k}=${v} outside [${min}, ${max}]`);
+      }
+    }
+    if (typeof game2.check === "function") {
+      for (const msg of game2.check(problem) || []) errors.push(`${tag}: ${msg}`);
+    }
+    const again = game2.build(JSON.parse(JSON.stringify(params)), createRng(seed + i));
+    const answerLabels = (p) => (p.steps || [p]).map((step) => step.choices.find((c) => c.id === step.answer)?.label);
+    if (JSON.stringify(answerLabels(again)) !== JSON.stringify(answerLabels(problem))) errors.push(`${tag}: rebuilding from params changed the correct answer`);
+    seenParams.add(JSON.stringify(params));
+  }
+  return { count, distinct: seenParams.size, errors };
+}
+const REQUIRED_META = ["name", "lesson", "title", "subtitle", "emoji"];
+function defineGame(spec) {
+  for (const k of REQUIRED_META) if (!spec.meta || spec.meta[k] == null) throw new Error(`defineGame: meta.${k} is required`);
+  for (const f of ["generate", "build"]) if (typeof spec[f] !== "function") throw new Error(`defineGame: ${f}() is required`);
+  return Object.freeze({ ...spec });
+}
+const ROWS = Object.freeze([2, 5]);
+const COLS = Object.freeze([2, 7]);
+const MAX_PRODUCT = 30;
+const PRODUCT_FACTORS = Object.freeze([3, 9]);
+const FORMS = Object.freeze(["select", "complete", "product"]);
+const LAYOUTS = Object.freeze(["whole2", "factor1", "factor2", "mixed3"]);
+const TIMES = "×";
+const PROMPTS = Object.freeze({
+  select: "Tap all expressions that represent the array.",
+  modeled: "Write two expressions that match the array.",
+  complete: "Write two expressions that represent the array.",
+  product: "Select 2 expressions with the same product."
+});
+const ROW_LABELS = Object.freeze(["expression 1:", "expression 2:"]);
+const expression = (a, b) => `${a} ${TIMES} ${b}`;
+const caption = (rows, cols) => `${rows} rows of ${cols}`;
+const numId = (n) => `n:${n}`;
+const exprId = (a, b) => `e:${expression(a, b)}`;
+function shuffleWith(rng, list) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = rng.int(0, i);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+function permutation(rng, n) {
+  return shuffleWith(rng, Array.from({ length: n }, (_, i) => i));
+}
+function applyOrder(list, order) {
+  return order.map((i) => list[i]);
+}
+function pickArray(rng) {
+  for (; ; ) {
+    const rows = rng.int(ROWS[0], ROWS[1]);
+    const cols = rng.int(COLS[0], COLS[1]);
+    if (rows !== cols && rows * cols <= MAX_PRODUCT) return [rows, cols];
+  }
+}
+function inRange([r, c]) {
+  return r >= 1 && c >= 1 && r <= 10 && c <= 10;
+}
+function represents(a, b, rows, cols) {
+  return a === rows && b === cols || a === cols && b === rows;
+}
+function expressionDistractors(rng, rows, cols, count = 2) {
+  const candidates = [];
+  const push = (pair) => {
+    if (!inRange(pair)) return;
+    if (represents(pair[0], pair[1], rows, cols)) return;
+    const label = expression(pair[0], pair[1]);
+    if (candidates.some((c) => expression(c[0], c[1]) === label)) return;
+    candidates.push(pair);
+  };
+  const offs = [[rows + 1, cols], [rows - 1, cols], [rows, cols + 1], [rows, cols - 1]];
+  offs.forEach((p) => {
+    push(p);
+    push([p[1], p[0]]);
+  });
+  push([rows, rows]);
+  push([cols, cols]);
+  const product = rows * cols;
+  for (let a = 2; a <= 10; a += 1) {
+    for (const target of [product, product + 1, product + 2, product - 1, product - 2]) {
+      if (target % a === 0) {
+        const b = target / a;
+        if (b >= 2 && b <= 10 && a !== rows && a !== cols) push([a, b]);
+      }
+    }
+  }
+  const picked = shuffleWith(rng, candidates).slice(0, count);
+  if (picked.length < count) throw new Error(`not enough distractors for ${rows} x ${cols}`);
+  return picked;
+}
+function productDistractors(a, b) {
+  const first = a - 1 >= 2 ? [b, a - 1] : [b, a + 2];
+  const second = a + 1 <= 10 && a + 1 !== b ? [a + 1, b] : [a - 2, b];
+  return [first, second];
+}
+function generate(rng) {
+  const form = FORMS[rng.int(0, FORMS.length - 1)];
+  return generateForm(rng, form);
+}
+function generateForm(rng, form, layout) {
+  if (form === "select") {
+    const [rows, cols] = pickArray(rng);
+    return { form, rows, cols, d: expressionDistractors(rng, rows, cols), order: permutation(rng, 4) };
+  }
+  if (form === "complete") {
+    const [rows, cols] = pickArray(rng);
+    const chosen = layout || LAYOUTS[rng.int(0, LAYOUTS.length - 1)];
+    const params = { form, rows, cols, layout: chosen, order: permutation(rng, chosen === "mixed3" ? 6 : 4) };
+    if (chosen === "whole2") params.d = expressionDistractors(rng, rows, cols, 2);
+    if (chosen === "mixed3") params.d = expressionDistractors(rng, rows, cols, 1);
+    return params;
+  }
+  if (form === "product") {
+    for (; ; ) {
+      const a = rng.int(PRODUCT_FACTORS[0], PRODUCT_FACTORS[1]);
+      const b = rng.int(PRODUCT_FACTORS[0], PRODUCT_FACTORS[1]);
+      if (a === b) continue;
+      const d = productDistractors(a, b);
+      if (d.every((pair) => pair[0] * pair[1] !== a * b && pair[0] >= 2 && pair[1] >= 2)) {
+        return { form, a, b, d, order: permutation(rng, 4) };
+      }
+    }
+  }
+  throw new Error(`unknown form ${form}`);
+}
+const exprChoice = (a, b, correct) => ({ id: exprId(a, b), label: expression(a, b), kind: "expr", correct, a, b, value: a * b });
+const numChoice = (n, correct) => ({ id: numId(n), label: String(n), kind: "num", correct, value: n });
+function selectProblem(params) {
+  const { rows, cols, d, order } = params;
+  const base = [exprChoice(rows, cols, true), exprChoice(cols, rows, true), ...d.map(([a, b]) => exprChoice(a, b, false))];
+  const choices = applyOrder(base, order);
+  const answers = choices.filter((c) => c.correct).map((c) => c.id);
+  return {
+    params,
+    form: "select",
+    rows,
+    cols,
+    caption: caption(rows, cols),
+    prompt: PROMPTS.select,
+    choices,
+    answer: exprId(rows, cols),
+    answers,
+    multi: true
+  };
+}
+function rowsFor(layout, rows, cols) {
+  const fixed = (text) => ({ type: "fixed", text });
+  const times = () => ({ type: "times" });
+  const blank = (part, wide = false) => ({ type: "blank", part, wide });
+  if (layout === "whole2") {
+    return [
+      { label: ROW_LABELS[0], slots: [blank(0, true)] },
+      { label: ROW_LABELS[1], slots: [blank(1, true)] }
+    ];
+  }
+  if (layout === "factor1") {
+    return [
+      { label: ROW_LABELS[0], slots: [fixed(rows), times(), blank(0)] },
+      { label: ROW_LABELS[1], slots: [fixed(cols), times(), fixed(rows)] }
+    ];
+  }
+  if (layout === "factor2") {
+    return [
+      { label: ROW_LABELS[0], slots: [fixed(rows), times(), fixed(cols)] },
+      { label: ROW_LABELS[1], slots: [blank(0), times(), blank(1)] }
+    ];
+  }
+  if (layout === "mixed3") {
+    return [
+      { label: ROW_LABELS[0], slots: [blank(0), times(), blank(1)] },
+      { label: ROW_LABELS[1], slots: [blank(2, true)] }
+    ];
+  }
+  throw new Error(`unknown layout ${layout}`);
+}
+function partsFor(layout) {
+  if (layout === "whole2") return [{ kind: "expr" }, { kind: "expr" }];
+  if (layout === "factor1") return [{ kind: "num" }];
+  if (layout === "factor2") return [{ kind: "num" }, { kind: "num" }];
+  if (layout === "mixed3") return [{ kind: "num" }, { kind: "num" }, { kind: "expr" }];
+  throw new Error(`unknown layout ${layout}`);
+}
+function completeChoices(params) {
+  const { rows, cols, layout, d = [] } = params;
+  if (layout === "whole2") {
+    return [exprChoice(rows, cols, true), exprChoice(cols, rows, true), ...d.map(([a, b]) => exprChoice(a, b, false))];
+  }
+  if (layout === "factor1" || layout === "factor2") {
+    return [numChoice(cols, true), numChoice(rows, layout === "factor2"), numChoice(rows + cols, false), numChoice(rows * cols, false)];
+  }
+  return [
+    numChoice(rows, true),
+    numChoice(cols, true),
+    numChoice(rows + cols, false),
+    exprChoice(rows, cols, true),
+    exprChoice(cols, rows, true),
+    ...d.map(([a, b]) => exprChoice(a, b, false))
+  ];
+}
+function acceptable(problem, partIndex, picks = []) {
+  const { rows, cols, layout } = problem;
+  if (layout === "whole2") {
+    const both = [exprId(rows, cols), exprId(cols, rows)];
+    return partIndex === 0 ? both : both.filter((id) => id !== picks[0]);
+  }
+  if (layout === "factor1") return [numId(cols)];
+  if (layout === "factor2") return partIndex === 0 ? [numId(cols)] : [numId(rows)];
+  if (layout === "mixed3") {
+    if (partIndex === 0) return [numId(rows), numId(cols)];
+    const first = picks[0] === numId(rows) ? rows : cols;
+    const second = first === rows ? cols : rows;
+    if (partIndex === 1) return [numId(second)];
+    return [exprId(second, first)];
+  }
+  throw new Error(`unknown layout ${layout}`);
+}
+function completeProblem(params) {
+  const { rows, cols, layout, order, modeled } = params;
+  const choices = applyOrder(completeChoices(params), order);
+  const parts = partsFor(layout);
+  const answers = choices.filter((c) => c.correct).map((c) => c.id);
+  const problem = {
+    params,
+    form: "complete",
+    layout,
+    rows,
+    cols,
+    caption: caption(rows, cols),
+    prompt: modeled ? PROMPTS.modeled : PROMPTS.complete,
+    choices,
+    parts,
+    expressionRows: rowsFor(layout, rows, cols),
+    answers,
+    multi: true
+  };
+  problem.answer = acceptable(problem, 0, [])[0];
+  return problem;
+}
+function productProblem(params) {
+  const { a, b, d, order } = params;
+  const base = [exprChoice(a, b, true), exprChoice(b, a, true), ...d.map(([x, y]) => exprChoice(x, y, false))];
+  const choices = applyOrder(base, order);
+  return {
+    params,
+    form: "product",
+    rows: a,
+    cols: b,
+    prompt: PROMPTS.product,
+    choices,
+    answer: exprId(a, b),
+    answers: choices.filter((c) => c.correct).map((c) => c.id),
+    multi: true
+  };
+}
+function build(params) {
+  if (params.form === "select") return selectProblem(params);
+  if (params.form === "complete") return completeProblem(params);
+  if (params.form === "product") return productProblem(params);
+  throw new Error(`unknown form ${params?.form}`);
+}
+function checkArray(rows, cols, errors, label) {
+  if (rows < ROWS[0] || rows > ROWS[1]) errors.push(`${label} rows ${rows} outside range`);
+  if (cols < COLS[0] || cols > COLS[1]) errors.push(`${label} cols ${cols} outside range`);
+  if (cols === rows) errors.push(`${label} must not be square`);
+  if (rows * cols > MAX_PRODUCT) errors.push(`${label} product ${rows * cols} above ${MAX_PRODUCT}`);
+}
+function checkExpressionGrid(problem, errors, label) {
+  const exprs = problem.choices.filter((c) => c.kind === "expr");
+  const ids = new Set(problem.choices.map((c) => c.id));
+  if (ids.size !== problem.choices.length) errors.push(`${label} choices must be distinct`);
+  const correct = exprs.filter((c) => c.correct);
+  if (!correct.every((c) => represents(c.a, c.b, problem.rows, problem.cols))) errors.push(`${label} correct expressions must be both factor orders`);
+  if (exprs.some((c) => !c.correct && represents(c.a, c.b, problem.rows, problem.cols))) errors.push(`${label} distractor equals the array`);
+}
+function walkParts(problem, partIndex, picks, errors) {
+  if (partIndex >= problem.parts.length) {
+    return;
+  }
+  const ids = acceptable(problem, partIndex, picks);
+  if (!ids.length) errors.push(`complete ${problem.layout} part ${partIndex} has no accepted answer after ${picks.join(",")}`);
+  ids.forEach((id) => {
+    const choice = problem.choices.find((c) => c.id === id);
+    if (!choice) errors.push(`complete ${problem.layout} part ${partIndex} accepts ${id} which is not a choice`);
+    else if (choice.kind !== problem.parts[partIndex].kind) errors.push(`complete ${problem.layout} part ${partIndex} accepts the wrong kind`);
+    else if (!choice.correct) errors.push(`complete ${problem.layout} part ${partIndex} accepts a distractor`);
+    walkParts(problem, partIndex + 1, [...picks, id], errors);
+  });
+}
+function check(problem) {
+  const errors = [];
+  if (problem.form === "select") {
+    checkArray(problem.rows, problem.cols, errors, "select");
+    if (problem.choices.length !== 4) errors.push("select needs four expressions");
+    if (problem.choices.filter((c) => c.correct).length !== 2) errors.push("select needs exactly two correct expressions");
+    checkExpressionGrid(problem, errors, "select");
+    if (problem.answers.length !== 2 || !problem.answers.includes(problem.answer)) errors.push("select answers must list both orders");
+  } else if (problem.form === "complete") {
+    checkArray(problem.rows, problem.cols, errors, "complete");
+    if (!LAYOUTS.includes(problem.layout)) errors.push(`unknown layout ${problem.layout}`);
+    const expected = { whole2: 2, factor1: 1, factor2: 2, mixed3: 3 }[problem.layout];
+    if (problem.parts.length !== expected) errors.push(`complete ${problem.layout} needs ${expected} parts`);
+    const blanks = problem.expressionRows.flatMap((row) => row.slots.filter((s) => s.type === "blank").map((s) => s.part)).sort();
+    if (blanks.join() !== problem.parts.map((_, i) => i).join()) errors.push("complete blanks must number the parts in order");
+    if (problem.choices.length !== (problem.layout === "mixed3" ? 6 : 4)) errors.push(`complete ${problem.layout} has the wrong grid size`);
+    checkExpressionGrid(problem, errors, "complete");
+    const nums = problem.choices.filter((c) => c.kind === "num");
+    nums.forEach((c) => {
+      if (c.correct && c.value !== problem.rows && c.value !== problem.cols) errors.push("complete correct number must be a factor");
+    });
+    walkParts(problem, 0, [], errors);
+    if (!problem.choices.some((c) => c.id === problem.answer)) errors.push("complete answer must be a choice");
+  } else if (problem.form === "product") {
+    const { rows: a, cols: b } = problem;
+    if (a === b) errors.push("product factors must differ");
+    if (problem.choices.length !== 4) errors.push("product needs four expressions");
+    const correct = problem.choices.filter((c) => c.correct);
+    if (correct.length !== 2) errors.push("product needs exactly two correct expressions");
+    if (!correct.every((c) => represents(c.a, c.b, a, b))) errors.push("product correct expressions must be both orders");
+    if (problem.choices.some((c) => !c.correct && c.value === a * b)) errors.push("product distractor shares the product");
+    if (new Set(problem.choices.map((c) => c.id)).size !== 4) errors.push("product choices must be distinct");
+  } else {
+    errors.push(`unknown form ${problem.form}`);
+  }
+  return errors;
+}
+function identity(params) {
+  if (params.form === "product") return `product:${Math.min(params.a, params.b)}x${Math.max(params.a, params.b)}`;
+  return `${params.form}:${params.rows}x${params.cols}`;
+}
+const BETA_PLAN = Object.freeze([
+  { form: "complete", layout: "whole2", rows: 4, cols: 3, modeled: true, d: [[4, 4], [2, 6]], order: [2, 0, 3, 1] },
+  { form: "select", rows: 4, cols: 5, d: [[4, 2], [5, 5]], order: [0, 2, 3, 1] },
+  { form: "select", rows: 2, cols: 6, d: [[2, 5], [3, 5]], order: [2, 1, 0, 3] },
+  { form: "complete", layout: "factor1", rows: 2, cols: 5, order: [1, 0, 3, 2] },
+  { form: "complete", layout: "factor2", rows: 5, cols: 3, order: [3, 1, 0, 2] },
+  { form: "complete", layout: "mixed3", rows: 4, cols: 6, d: [[4, 5]], order: [1, 4, 0, 5, 2, 3] },
+  { form: "complete", layout: "whole2", rows: 3, cols: 4, d: [[3, 3], [2, 6]], order: [1, 3, 0, 2] },
+  { form: "complete", layout: "whole2", rows: 3, cols: 7, d: [[3, 6], [4, 7]], order: [0, 3, 1, 2] },
+  { form: "product", a: 6, b: 8, d: [[8, 5], [7, 8]], order: [0, 2, 3, 1] }
+]);
+const RANDOM_FORMS = Object.freeze(["select", "complete"]);
+function sessionQuestions(rng, { fixed = BETA_PLAN, randomCount = 1, randomForms = RANDOM_FORMS } = {}) {
+  const seen = /* @__PURE__ */ new Set();
+  const questions = [];
+  const add = (params) => {
+    const id = identity(params);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    questions.push(build(params));
+    return true;
+  };
+  fixed.forEach((params) => add(params));
+  let guard = 0;
+  let added = 0;
+  while (added < randomCount && guard < 500) {
+    guard += 1;
+    if (add(generateForm(rng, randomForms[rng.int(0, randomForms.length - 1)]))) added += 1;
+  }
+  return questions;
+}
+const gen = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
+  __proto__: null,
+  BETA_PLAN,
+  COLS,
+  FORMS,
+  LAYOUTS,
+  MAX_PRODUCT,
+  PRODUCT_FACTORS,
+  PROMPTS,
+  RANDOM_FORMS,
+  ROWS,
+  ROW_LABELS,
+  TIMES,
+  acceptable,
+  build,
+  caption,
+  check,
+  exprId,
+  expression,
+  expressionDistractors,
+  generate,
+  generateForm,
+  identity,
+  numId,
+  pickArray,
+  productDistractors,
+  sessionQuestions
+}, Symbol.toStringTag, { value: "Module" }));
+const THEME = Object.freeze({
+  key: "sticker_album",
+  title: "ARRAY FLIP",
+  worldName: "Sticker Album",
+  subtitle: "Write two expressions for every sticker array.",
+  tag: "ML 1.09 · TWO EXPRESSIONS FOR AN ARRAY",
+  startIcon: "⟳",
+  endIcon: "★",
+  endTitle: "ALBUM PAGE COMPLETE!",
+  // Countable unit noun, used in accessible descriptions and help copy.
+  unit: "sticker",
+  units: "stickers",
+  // Shell palette. The dark blue ink keeps the shared frame's outline rule.
+  palette: Object.freeze({
+    bgA: "#6B3FA0",
+    bgB: "#2A1E5C",
+    bgMid: "#4D5FD0",
+    card: "#FFF4D6",
+    ink: "#13213F",
+    accent: "#F29B38",
+    good: "#37C8C5",
+    warm: "#E8A838",
+    dottedBorder: "#4D9DE0",
+    picture: "#F3F6FF",
+    pictureAlt: "#fffdf4",
+    page: "#FFFFFF",
+    pageLine: "#DCE3F7",
+    sticker: "#FFD45A",
+    stickerAlt: "#6BCBFF",
+    stickerThird: "#FF8FAB",
+    stickerInk: "#13213F"
+  }),
+  // Three sticker shapes cycle across an array so a row still reads as one
+  // row: every unit is the same size on the same page grid.
+  shapes: Object.freeze(["star", "circle", "diamond"]),
+  // Celebration pieces that fall on a streak tier.
+  confettiColors: Object.freeze(["#FFD45A", "#6BCBFF", "#FF8FAB", "#B28DFF", "#37C8C5", "#F29B38"]),
+  praise: Object.freeze(["NICE!", "YES!", "GOT IT!", "GREAT JOB!", "WELL DONE!", "YOU DID IT!"])
+});
+function cssVariables(theme = THEME) {
+  const out = {};
+  for (const [key, value] of Object.entries(theme.palette)) {
+    out[`--af-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`] = value;
+  }
+  return out;
+}
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+  return node;
+}
+function starPoints(cx, cy, outer, inner) {
+  const points = [];
+  for (let i = 0; i < 10; i += 1) {
+    const radius = i % 2 === 0 ? outer : inner;
+    const angle = Math.PI / 5 * i - Math.PI / 2;
+    points.push(`${(cx + radius * Math.cos(angle)).toFixed(2)},${(cy + radius * Math.sin(angle)).toFixed(2)}`);
+  }
+  return points.join(" ");
+}
+function stickerSvg(shape = "star", { size = 40, color } = {}) {
+  const { palette } = THEME;
+  const fill = color || { star: palette.sticker, circle: palette.stickerAlt, diamond: palette.stickerThird }[shape] || palette.sticker;
+  const root = svg("svg", { viewBox: "0 0 40 40", width: size, height: size, "aria-hidden": "true", focusable: "false", class: `af-sticker af-sticker--${shape}` });
+  root.append(svg("rect", { x: 2, y: 2, width: 36, height: 36, rx: 8, fill: "#fff", stroke: palette.stickerInk, "stroke-width": 2.5 }));
+  if (shape === "star") {
+    root.append(svg("polygon", { points: starPoints(20, 21, 13, 5.6), fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+  } else if (shape === "circle") {
+    root.append(svg("circle", { cx: 20, cy: 20, r: 11.5, fill, stroke: palette.stickerInk, "stroke-width": 2 }));
+    root.append(svg("circle", { cx: 16, cy: 16, r: 3, fill: "#fff", opacity: 0.85 }));
+  } else {
+    root.append(svg("polygon", { points: "20,7 33,20 20,33 7,20", fill, stroke: palette.stickerInk, "stroke-width": 2, "stroke-linejoin": "round" }));
+    root.append(svg("polygon", { points: "20,12 27,20 20,22 13,20", fill: "#fff", opacity: 0.55 }));
+  }
+  return root;
+}
+function shapeFor(rowIndex, colIndex) {
+  return THEME.shapes[rowIndex % THEME.shapes.length];
+}
+function arrayLabel(rows, cols) {
+  return `${rows} rows of ${cols} ${THEME.units}, ${rows * cols} in all`;
+}
+function fillGrid(grid, rows, cols, shapeAt = shapeFor) {
+  grid.replaceChildren();
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const cell = document.createElement("span");
+      cell.className = "af-cell";
+      cell.style.setProperty("--af-r", r);
+      cell.style.setProperty("--af-c", c);
+      cell.style.setProperty("--af-i", r * cols + c);
+      const shape = shapeAt(r, c);
+      cell.dataset.shape = shape;
+      cell.append(stickerSvg(shape));
+      grid.append(cell);
+    }
+  }
+}
+function arrayDisplay(rows, cols, { size = "card", braces = false, peel = false, label, shapeAt = shapeFor } = {}) {
+  const wrap = document.createElement("div");
+  wrap.className = `af-array af-array--${size}${braces ? " af-array--braced" : ""}${peel ? " af-array--peel" : ""}`;
+  wrap.setAttribute("role", "img");
+  wrap.setAttribute("aria-label", label || arrayLabel(rows, cols));
+  wrap.style.setProperty("--af-rows", rows);
+  wrap.style.setProperty("--af-cols", cols);
+  wrap.dataset.rows = String(rows);
+  wrap.dataset.cols = String(cols);
+  const page = document.createElement("div");
+  page.className = "af-page";
+  const grid = document.createElement("div");
+  grid.className = "af-grid";
+  fillGrid(grid, rows, cols, shapeAt);
+  page.append(grid);
+  if (braces) {
+    const rowBrace = document.createElement("span");
+    rowBrace.className = "af-brace af-brace--rows";
+    rowBrace.textContent = `${rows} rows`;
+    const colBrace = document.createElement("span");
+    colBrace.className = "af-brace af-brace--cols";
+    colBrace.textContent = `${cols} in each row`;
+    wrap.append(rowBrace, page, colBrace);
+  } else {
+    wrap.append(page);
+  }
+  return wrap;
+}
+const FLIP_MS = 460;
+const LAND_MS = 340;
+function flipArray(arrayNode, { reduced = false, onTurn, onLand } = {}) {
+  const rows = Number(arrayNode.dataset.rows) || 1;
+  const cols = Number(arrayNode.dataset.cols) || 1;
+  const page = arrayNode.querySelector(".af-page");
+  const grid = arrayNode.querySelector(".af-grid");
+  const swap = () => {
+    arrayNode.classList.remove("af-array--peel");
+    const currentShapes = Array.from(grid.children).map((cell) => cell.dataset.shape || cell.querySelector(".af-sticker")?.getAttribute("class")?.match(/af-sticker--(\w+)/)?.[1] || "star");
+    fillGrid(grid, cols, rows, (r2, c2) => currentShapes[(rows - 1 - c2) * cols + r2]);
+    arrayNode.style.setProperty("--af-rows", cols);
+    arrayNode.style.setProperty("--af-cols", rows);
+    arrayNode.dataset.rows = String(cols);
+    arrayNode.dataset.cols = String(rows);
+    arrayNode.setAttribute("aria-label", arrayLabel(cols, rows));
+    arrayNode.querySelectorAll(".af-brace--rows").forEach((b) => {
+      b.textContent = `${cols} rows`;
+    });
+    arrayNode.querySelectorAll(".af-brace--cols").forEach((b) => {
+      b.textContent = `${rows} in each row`;
+    });
+  };
+  if (reduced) {
+    swap();
+    onTurn?.();
+    onLand?.();
+    return 0;
+  }
+  page.classList.remove("af-page--land");
+  page.classList.add("af-page--flip");
+  onTurn?.();
+  setTimeout(() => {
+    swap();
+    page.classList.remove("af-page--flip");
+    void page.offsetWidth;
+    page.classList.add("af-page--land");
+    setTimeout(() => {
+      page.classList.remove("af-page--land");
+      onLand?.();
+    }, LAND_MS);
+  }, FLIP_MS);
+  return FLIP_MS + LAND_MS;
+}
+function shineCols(arrayNode, { colMs = 80 } = {}) {
+  const cells = arrayNode.querySelectorAll(".af-cell");
+  const cols = Number(arrayNode.style.getPropertyValue("--af-cols")) || 1;
+  cells.forEach((cell) => {
+    const c = Number(cell.style.getPropertyValue("--af-c")) || 0;
+    cell.style.setProperty("--af-shine-delay", `${c * colMs}ms`);
+    cell.classList.remove("af-cell--shine");
+    void cell.offsetWidth;
+    cell.classList.add("af-cell--shine");
+  });
+  return cols * colMs + 400;
+}
+function shineRows(arrayNode, { rowMs = 140 } = {}) {
+  const cells = arrayNode.querySelectorAll(".af-cell");
+  const rows = Number(arrayNode.style.getPropertyValue("--af-rows")) || 1;
+  cells.forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--af-r")) || 0;
+    cell.style.setProperty("--af-shine-delay", `${r * rowMs}ms`);
+    cell.classList.remove("af-cell--shine");
+    void cell.offsetWidth;
+    cell.classList.add("af-cell--shine");
+  });
+  return rows * rowMs + 500;
+}
+function highlightRow(arrayNode, rowIndex) {
+  arrayNode.querySelectorAll(".af-cell").forEach((cell) => {
+    const r = Number(cell.style.getPropertyValue("--af-r")) || 0;
+    cell.classList.toggle("af-cell--lit", rowIndex === null ? false : r <= rowIndex);
+    cell.classList.toggle("af-cell--current", r === rowIndex);
+  });
+}
+function albumPage(rows, cols, expressionText) {
+  const item = document.createElement("div");
+  item.className = "af-album-item";
+  item.style.setProperty("--af-rows", rows);
+  item.style.setProperty("--af-cols", cols);
+  const mini = document.createElement("div");
+  mini.className = "af-album-mini";
+  for (let r = 0; r < rows; r += 1) {
+    for (let c = 0; c < cols; c += 1) {
+      const dot = document.createElement("i");
+      dot.className = `af-album-dot af-album-dot--${shapeFor(r)}`;
+      mini.append(dot);
+    }
+  }
+  const text = document.createElement("span");
+  text.className = "af-album-text";
+  text.textContent = expressionText;
+  item.append(mini, text);
+  return item;
+}
+const MUTE_KEY = "array_flip_109.muted";
+function readMuted(storage) {
+  try {
+    return storage?.getItem?.(MUTE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+function createSound({ storage = null } = {}) {
+  let muted = readMuted(storage);
+  let ctx2 = null;
+  let gate = null;
+  let hidden = false;
+  const nodes = /* @__PURE__ */ new Set();
+  const ready = () => Boolean(ctx2 && gate);
+  const tone = ({ freq, to = freq, type = "square", at = 0, dur = 0.12, gain = 0.14 }) => {
+    if (!ready() || muted) return;
+    const t0 = ctx2.currentTime + at;
+    const osc = ctx2.createOscillator();
+    const g = ctx2.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (to !== freq) osc.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(1e-3, t0 + dur);
+    osc.connect(g).connect(gate);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    const entry = { osc, g };
+    nodes.add(entry);
+    osc.onended = () => {
+      nodes.delete(entry);
+      try {
+        osc.disconnect();
+        g.disconnect();
+      } catch {
+      }
+    };
+  };
+  const SOUNDS = {
+    // The engine's canonical set, same frequencies and shapes.
+    correct: () => [523, 659, 784].forEach((f, i) => tone({ freq: f, at: i * 0.09, gain: 0.18 })),
+    wrong: () => tone({ freq: 200, to: 100, type: "sawtooth", dur: 0.15, gain: 0.12 }),
+    complete: () => [523, 659, 784, 1047].forEach((f, i) => tone({ freq: f, at: i * 0.11, dur: 0.16, gain: 0.18 })),
+    tier: () => [784, 988, 1175, 1568].forEach((f, i) => tone({ freq: f, at: i * 0.06, dur: 0.1, type: "triangle", gain: 0.18 })),
+    tap: () => tone({ freq: 880, dur: 0.05, gain: 0.08 }),
+    // Sticker sounds shared with Game 108's album.
+    // A sticker peeling onto the page, one per row while the array appears.
+    peel: (row = 0) => tone({ freq: 392 * 2 ** (row * 2 / 12), to: 392 * 2 ** ((row * 2 + 3) / 12), type: "triangle", dur: 0.11, gain: 0.07 }),
+    // Toggling an expression on or off.
+    pick: () => [660, 880].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.07 })),
+    unpick: () => [880, 660].forEach((f, i) => tone({ freq: f, at: i * 0.04, dur: 0.06, gain: 0.06 })),
+    // The shine sweep after a correct answer, one note per row.
+    shine: (row = 0) => tone({ freq: 1047 * 2 ** (row * 2 / 12), type: "triangle", dur: 0.12, gain: 0.06 }),
+    // Counting a row in the teaching help.
+    count: (index = 0) => tone({ freq: 330 * 2 ** (index / 12), type: "triangle", dur: 0.14, gain: 0.08 }),
+    // A page turn in the matching set.
+    page: () => {
+      tone({ freq: 300, to: 620, type: "sawtooth", dur: 0.14, gain: 0.05 });
+      tone({ freq: 1200, dur: 0.05, at: 0.12, gain: 0.05, type: "triangle" });
+    },
+    // Game 109's signature: the album page turning a quarter turn so rows
+    // become columns, then landing.
+    flip: () => {
+      tone({ freq: 260, to: 720, type: "sawtooth", dur: 0.32, gain: 0.05 });
+      tone({ freq: 720, to: 420, type: "triangle", dur: 0.14, at: 0.32, gain: 0.07 });
+    },
+    land: () => [523, 784].forEach((f, i) => tone({ freq: f, at: i * 0.05, dur: 0.1, type: "triangle", gain: 0.1 })),
+    // A number or expression dropping into its writing line.
+    slot: () => {
+      tone({ freq: 740, to: 988, type: "triangle", dur: 0.09, gain: 0.08 });
+      tone({ freq: 1320, dur: 0.05, at: 0.08, gain: 0.05, type: "square" });
+    },
+    fanfare: () => [523, 659, 784, 1047, 1319].forEach((f, i) => tone({ freq: f, at: i * 0.1, dur: 0.18, type: "triangle", gain: 0.1 }))
+  };
+  function stopAll() {
+    if (!ctx2) return;
+    const now = ctx2.currentTime;
+    nodes.forEach(({ osc, g }) => {
+      try {
+        g.gain.cancelScheduledValues(now);
+        g.gain.setValueAtTime(0, now);
+      } catch {
+      }
+      try {
+        osc.stop(now);
+      } catch {
+      }
+    });
+    nodes.clear();
+  }
+  function applyGate() {
+    if (!ready()) return;
+    const now = ctx2.currentTime;
+    gate.gain.cancelScheduledValues(now);
+    gate.gain.setValueAtTime(muted ? 0 : 1, now);
+    if (muted || hidden) ctx2.suspend?.()?.catch?.(() => {
+    });
+    else ctx2.resume?.()?.catch?.(() => {
+    });
+  }
+  return {
+    get muted() {
+      return muted;
+    },
+    unlock() {
+      ctx2 = initAudio();
+      if (ctx2 && !gate) {
+        gate = ctx2.createGain();
+        gate.gain.value = muted ? 0 : 1;
+        gate.connect(ctx2.destination);
+      }
+      applyGate();
+      return ctx2;
+    },
+    setMuted(value) {
+      muted = Boolean(value);
+      try {
+        storage?.setItem?.(MUTE_KEY, muted ? "1" : "0");
+      } catch {
+      }
+      if (muted) stopAll();
+      applyGate();
+    },
+    toggle() {
+      this.setMuted(!muted);
+      return muted;
+    },
+    setHidden(value) {
+      hidden = Boolean(value);
+      if (hidden) stopAll();
+      applyGate();
+    },
+    play(name, ...args) {
+      if (muted || hidden) return;
+      SOUNDS[name]?.(...args);
+    },
+    stopAll,
+    destroy() {
+      stopAll();
+      try {
+        gate?.disconnect();
+      } catch {
+      }
+      gate = null;
+    }
+  };
+}
+const SHAPES = ["star", "circle", "diamond"];
+function reducedMotion() {
+  return Boolean(globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+}
+function stickerConfetti(root, count = 24) {
+  if (reducedMotion()) return;
+  for (let i = 0; i < count; i += 1) {
+    const piece = document.createElement("i");
+    piece.className = `af-confetti af-confetti--${SHAPES[i % SHAPES.length]}`;
+    piece.style.left = `${Math.random() * 100}%`;
+    piece.style.setProperty("--af-piece", THEME.confettiColors[i % THEME.confettiColors.length]);
+    piece.style.setProperty("--af-sway", `${(Math.random() - 0.5) * 120}px`);
+    piece.style.animationDelay = `${Math.random() * 0.4}s`;
+    piece.style.animationDuration = `${1.4 + Math.random() * 1.2}s`;
+    piece.style.transform = `rotate(${Math.random() * 360}deg)`;
+    root.append(piece);
+    piece.addEventListener("animationend", () => piece.remove());
+  }
+}
+const FLY_LABEL_MS = 340;
+function flyLabel(root, from, to, text) {
+  if (reducedMotion() || !from?.getBoundingClientRect || !to?.getBoundingClientRect || !root?.animate) return 0;
+  const base = root.getBoundingClientRect();
+  const a = from.getBoundingClientRect();
+  const b = to.getBoundingClientRect();
+  const ghost = document.createElement("span");
+  ghost.className = "af-fly-label";
+  ghost.textContent = text;
+  ghost.style.left = `${a.left - base.left + a.width / 2}px`;
+  ghost.style.top = `${a.top - base.top + a.height / 2}px`;
+  root.append(ghost);
+  const dx = b.left + b.width / 2 - (a.left + a.width / 2);
+  const dy = b.top + b.height / 2 - (a.top + a.height / 2);
+  const run = ghost.animate([
+    { transform: "translate(-50%, -50%) scale(1)", opacity: 1 },
+    { transform: `translate(calc(-50% + ${dx * 0.5}px), calc(-50% + ${dy * 0.5 - 28}px)) scale(1.15)`, opacity: 1, offset: 0.5 },
+    { transform: `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(.9)`, opacity: 0.9 }
+  ], { duration: FLY_LABEL_MS, easing: "cubic-bezier(.3,.7,.3,1)", fill: "forwards" });
+  run.onfinish = () => ghost.remove();
+  run.oncancel = () => ghost.remove();
+  return FLY_LABEL_MS;
+}
+function flyStars(root, from, count = 4) {
+  if (reducedMotion() || !from?.getBoundingClientRect) return;
+  const r = from.getBoundingClientRect();
+  const base = root.getBoundingClientRect();
+  for (let i = 0; i < count; i += 1) {
+    const star = document.createElement("span");
+    star.className = "af-fly";
+    star.textContent = "★";
+    star.style.left = `${r.left - base.left + r.width / 2 + (Math.random() - 0.5) * r.width}px`;
+    star.style.top = `${r.top - base.top + r.height / 2}px`;
+    star.style.setProperty("--dx", `${(Math.random() - 0.5) * 160}px`);
+    star.style.animationDelay = `${i * 0.05}s`;
+    root.append(star);
+    star.addEventListener("animationend", () => star.remove());
+  }
+}
+function replay(node, className, animationName = className) {
+  if (!node || reducedMotion()) return;
+  node.classList.remove(className);
+  void node.offsetWidth;
+  const done = (event) => {
+    if (event.animationName !== animationName) return;
+    node.removeEventListener("animationend", done);
+    node.classList.remove(className);
+  };
+  node.addEventListener("animationend", done);
+  node.classList.add(className);
+}
+const game = defineGame({
+  meta: {
+    name: "array_flip",
+    lesson: "109",
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    emoji: THEME.startIcon,
+    tag: THEME.tag,
+    questions: 0
+  },
+  ...gen
+});
+const GROWTH = [
+  "Almost! Try again!",
+  "Great effort! Keep going!",
+  "Mistakes help your brain grow!",
+  "Look again. You got this!",
+  "So close! One more try!"
+];
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== void 0 && text !== null) node.textContent = String(text);
+  return node;
+}
+const commutes = (a, b) => `${expression(a, b)} = ${expression(b, a)}`;
+const COVER_OPEN_MS = 420;
+const TIER_AT_MS = 900;
+const TIER_HOLD_MS = 1150;
+function mount(element, options = {}) {
+  if (!element) throw new Error("array_flip.mount needs a DOM element");
+  const gameFile = options.gameFile ?? "array_flip_109.html";
+  const tracker = connectTracker({ gameFile, interval: options.autoSaveInterval ?? 3 });
+  const storage = options.storage ?? (() => {
+    try {
+      return globalThis.localStorage;
+    } catch {
+      return null;
+    }
+  })();
+  const sound = createSound({ storage });
+  const seedBase = options.seed ?? Date.now();
+  let session = 0;
+  let questions = [];
+  let album = [];
+  const timers = /* @__PURE__ */ new Set();
+  const later = (fn, ms) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const clearTimers = () => {
+    timers.forEach((id) => clearTimeout(id));
+    timers.clear();
+  };
+  function planSession() {
+    session += 1;
+    const rng = createRng(Number(seedBase) + session * 7919);
+    questions = sessionQuestions(rng, { fixed: options.fixed ?? BETA_PLAN, randomCount: options.randomCount ?? 1 });
+    album = [];
+  }
+  planSession();
+  function frameProblem(index) {
+    const problem = questions[index];
+    if (!problem) throw new Error(`no question at ${index}`);
+    return { ...problem, id: `${session}-${index}` };
+  }
+  let currentArray = null;
+  let currentCard = null;
+  let slots = [];
+  function peelIn(arrayNode, rows) {
+    if (reducedMotion()) return;
+    for (let r = 0; r < rows; r += 1) later(() => sound.play("peel", r), 120 + r * 170);
+  }
+  function renderSelectCard(problem, host) {
+    const card = el("div", "af-card af-card--select");
+    const array = arrayDisplay(problem.rows, problem.cols, { size: "card", peel: !reducedMotion() });
+    card.append(array);
+    host.append(card);
+    currentArray = array;
+    currentCard = card;
+    peelIn(array, problem.rows);
+  }
+  function renderExpressionRows(problem) {
+    const rows = el("div", "af-rows");
+    rows.setAttribute("role", "group");
+    rows.setAttribute("aria-label", "Two expressions");
+    slots = [];
+    problem.expressionRows.forEach((row) => {
+      const line = el("div", "af-row");
+      line.append(el("span", "af-row-label", row.label));
+      const parts = el("span", "af-row-line");
+      row.slots.forEach((slot) => {
+        if (slot.type === "fixed") parts.append(el("span", "af-slot af-slot--fixed", slot.text));
+        else if (slot.type === "times") parts.append(el("span", "af-slot af-slot--times", TIMES));
+        else {
+          const blank = el("span", `af-slot af-slot--blank${slot.wide ? " af-slot--wide" : ""}`, slot.wide ? "0 × 0" : "0");
+          blank.dataset.part = String(slot.part);
+          blank.setAttribute("aria-label", `blank ${slot.part + 1}`);
+          slots[slot.part] = blank;
+          parts.append(blank);
+        }
+      });
+      line.append(parts);
+      rows.append(line);
+    });
+    return rows;
+  }
+  function renderCompleteCard(problem, host) {
+    const card = el("div", `af-card af-card--complete${problem.rows > problem.cols ? " af-card--tall" : ""}`);
+    const array = arrayDisplay(problem.rows, problem.cols, { size: "card", peel: !reducedMotion() });
+    card.append(array, renderExpressionRows(problem));
+    host.append(card);
+    currentArray = array;
+    currentCard = card;
+    peelIn(array, problem.rows);
+  }
+  function renderProductCard(problem, host) {
+    const card = el("div", "af-card af-card--product");
+    const cover = el("div", "af-cover");
+    cover.setAttribute("role", "img");
+    cover.setAttribute("aria-label", "A closed album page");
+    const inner = el("div");
+    inner.append(el("div", "af-cover-sticker", "?"));
+    inner.append(el("p", "af-cover-copy", "Which two match?"));
+    cover.append(inner);
+    card.append(cover);
+    host.append(card);
+    currentArray = null;
+    currentCard = card;
+    if (!reducedMotion()) sound.play("page");
+  }
+  function onPart({ problem, partIndex, part, picks, choice, button, api: api2 }) {
+    if (problem.form !== "complete") return;
+    slots.forEach((slot) => slot?.classList.remove("af-slot--active"));
+    if (choice && slots[partIndex - 1]) {
+      const filled = slots[partIndex - 1];
+      const fill = () => {
+        filled.textContent = choice.label;
+        filled.classList.add("af-slot--filled");
+        sound.play("slot");
+      };
+      const travel = flyLabel(api2.root.querySelector(".gf-fx"), button, filled, choice.label);
+      if (travel) later(fill, travel - 40);
+      else fill();
+    }
+    const active = slots[partIndex];
+    if (active) active.classList.add("af-slot--active");
+    api2.root.querySelectorAll(".gf-tile").forEach((tile) => {
+      const c = problem.choices.find((entry) => entry.id === tile.dataset.choiceId);
+      const muted = Boolean(part) && c && c.kind !== part.kind && tile.dataset.found !== "true";
+      tile.dataset.muted = muted ? "true" : "false";
+      if (tile.dataset.found === "true") return;
+      tile.disabled = muted;
+      if (muted) tile.setAttribute("aria-disabled", "true");
+      else tile.removeAttribute("aria-disabled");
+    });
+  }
+  function sameOrderMiss(problem, choice, picks) {
+    if (problem.form !== "complete" || choice.kind !== "expr" || !choice.correct) return false;
+    return !acceptable(problem, picks.length, picks).includes(choice.id);
+  }
+  function firstMissCopy(problem, choice, picks) {
+    const partIndex = picks.length;
+    if (problem.form === "select") {
+      return "Read the array two ways: rows × in each row, then the other way round. Both expressions belong.";
+    }
+    if (problem.form === "product") {
+      return "Two expressions with the same two numbers, the other way round, have the same product. Look for that pair.";
+    }
+    if (sameOrderMiss(problem, choice, picks)) {
+      return "Use the same two numbers. Switch their places.";
+    }
+    const { layout } = problem;
+    if (layout === "factor1") return "Use the same two numbers. Switch their places.";
+    if (layout === "factor2") return partIndex === 0 ? "Use the same two numbers. Switch their places." : "Use the same two numbers. Switch their places.";
+    if (layout === "mixed3" && partIndex < 2) return "Count the rows, then count how many are in each row. Those two numbers make expression 1.";
+    if (partIndex === 0) return "Count the rows,\nthen count how many are in each row.\nRows × in each row is one expression.";
+    return "Use the same two numbers. Switch their places.";
+  }
+  function firstMiss(problem, { choices }) {
+    const box = el("div", "af-help");
+    const picks = frameApi ? frameApi.picks : [];
+    const growth = GROWTH[(frameApi ? frameApi.problemIndex : 0) % GROWTH.length];
+    const choice = choices?.[0];
+    const picked = choice ? `You tapped ${choice.label}. ` : "";
+    const copy2 = el("p", "af-help-copy", `${picked}${firstMissCopy(problem, choice, picks)}`);
+    copy2.style.whiteSpace = "pre-line";
+    box.append(copy2);
+    box.append(el("p", "af-help-growth", growth));
+    return box;
+  }
+  function exampleArrayFor(rows, cols) {
+    const exRows = rows === 2 ? 3 : 2;
+    const exCols = cols === 4 || rows === 4 ? 5 : 4;
+    return [exRows, exCols];
+  }
+  function teaching(problem) {
+    const [exRows, exCols] = exampleArrayFor(problem.rows, problem.cols);
+    const box = el("div", "af-help af-help--teach");
+    const copy2 = problem.form === "product" ? "Turn an array and you count the same stickers the other way. Both expressions have the same product. Here is another example." : "Count the rows, then count how many are in one row. Turn the page and count again: the same stickers give the other expression. Here is another example.";
+    box.append(el("p", "af-help-copy", copy2));
+    const picture = arrayDisplay(exRows, exCols, { size: "help", braces: true });
+    picture.style.setProperty("--af-turn-side", Math.max(exRows, exCols));
+    box.append(picture);
+    const line = el("p", "af-help-line");
+    const rowsNode = el("span", "af-help-rows", `${exRows} rows`);
+    const colsNode = el("span", "af-help-cols", `${exCols} in each row`);
+    line.append(rowsNode, el("span", "af-help-times", TIMES), colsNode);
+    box.append(line);
+    const both = el("p", "af-help-both", expression(exRows, exCols));
+    box.append(both);
+    const next = el("p", "af-help-next", problem.form === "product" ? "Now find two expressions with the same numbers the other way round." : "Now count your array the same way.");
+    box.append(next);
+    const reduced = reducedMotion();
+    const perRow = reduced ? 0 : 420;
+    let t = 350;
+    const countRows = (count, per) => {
+      later(() => {
+        colsNode.textContent = `${per} in each row`;
+      }, t - 50);
+      for (let r = 0; r < count; r += 1) {
+        later(() => {
+          highlightRow(picture, r);
+          sound.play("count", r);
+          rowsNode.textContent = `${r + 1} row${r ? "s" : ""}`;
+          replay(rowsNode, "af-bump-once");
+        }, t + r * perRow);
+      }
+      t += count * perRow + 300;
+      later(() => {
+        highlightRow(picture, null);
+        rowsNode.textContent = `${count} rows`;
+        colsNode.textContent = `${per} in each row`;
+        line.classList.add("af-help-line--done");
+      }, t);
+    };
+    countRows(exRows, exCols);
+    t += 500;
+    later(() => {
+      sound.play("flip");
+      flipArray(picture, { reduced, onLand: () => sound.play("land") });
+      line.classList.remove("af-help-line--done");
+    }, t);
+    t += reduced ? 0 : FLIP_MS + LAND_MS + 200;
+    countRows(exCols, exRows);
+    later(() => {
+      both.textContent = `${expression(exRows, exCols)} and ${expression(exCols, exRows)}`;
+      both.classList.add("af-help-both--done");
+    }, t);
+    if (reduced) {
+      highlightRow(picture, null);
+      both.textContent = `${expression(exRows, exCols)} and ${expression(exCols, exRows)}`;
+    }
+    return box;
+  }
+  function showTierToast(fx, word) {
+    const t = el("div", "gf-toast gf-toast--tier", word);
+    fx.append(t);
+    later(() => t.remove(), 900);
+  }
+  let equalsNode = null;
+  function clearEquals() {
+    equalsNode?.remove();
+    equalsNode = null;
+  }
+  function showEquals(a, b) {
+    if (!currentCard) return;
+    clearEquals();
+    const pill = el("p", "af-equals", commutes(a, b));
+    const compact = globalThis.matchMedia?.("(max-width: 560px)")?.matches;
+    const tall = currentCard.classList.contains("af-card--tall");
+    if (compact && !tall && frameApi) {
+      const fx = frameApi.root.querySelector(".gf-fx");
+      const tiles = frameApi.root.querySelector(".gf-tiles");
+      if (fx && tiles) {
+        const r = tiles.getBoundingClientRect();
+        const base = fx.getBoundingClientRect();
+        pill.classList.add("af-equals--float");
+        pill.style.left = `${r.left - base.left + r.width / 2}px`;
+        pill.style.top = `${r.top - base.top + r.height / 2}px`;
+        fx.append(pill);
+        equalsNode = pill;
+        return;
+      }
+    }
+    const host = currentCard.querySelector(".af-rows") || currentCard;
+    host.append(pill);
+    equalsNode = pill;
+  }
+  function flipAndState(problem, delay) {
+    const reduced = reducedMotion();
+    const { rows, cols } = problem;
+    if (!currentArray && problem.form !== "product") return delay;
+    later(() => {
+      if (!currentArray) return;
+      sound.play("flip");
+      flipArray(currentArray, {
+        reduced,
+        onLand: () => {
+          sound.play("land");
+          if (currentCard?.classList.contains("af-card--complete")) currentCard.classList.toggle("af-card--tall", cols > rows);
+          if (!reduced && currentArray) {
+            shineCols(currentArray);
+            for (let c = 0; c < rows; c += 1) later(() => sound.play("shine", c), 60 + c * 80);
+          }
+          showEquals(rows, cols);
+        }
+      });
+    }, delay);
+    return delay + (reduced ? 0 : FLIP_MS + LAND_MS) + 700;
+  }
+  function celebrate({ buttons, state, api: api2, problem }) {
+    sound.play("correct");
+    const fx = api2.root.querySelector(".gf-fx");
+    buttons.forEach((button) => flyStars(fx, button, 3));
+    const reduced = reducedMotion();
+    const { rows, cols } = problem;
+    let delay = 400;
+    if (problem.form === "product") {
+      const cover = currentCard?.querySelector(".af-cover");
+      if (cover) {
+        const array = arrayDisplay(rows, cols, { size: "card", peel: !reduced });
+        const openMs = reduced ? 0 : COVER_OPEN_MS;
+        if (!reduced) cover.classList.add("af-cover--open");
+        sound.play("page");
+        later(() => {
+          cover.replaceWith(array);
+          currentArray = array;
+          array.classList.add("af-array--solved");
+        }, openMs);
+        delay = openMs + (reduced ? 200 : 300 + rows * 170);
+      }
+    } else if (currentArray && !reduced) {
+      shineRows(currentArray);
+      for (let r = 0; r < rows; r += 1) later(() => sound.play("shine", r), 160 + r * 140);
+      delay = rows * 140 + 450;
+    }
+    if (currentArray) currentArray.classList.add("af-array--solved");
+    flipAndState(problem, delay);
+    const tier = STREAK_TIERS.find((t) => t.at === state.streak);
+    if (tier) {
+      later(() => {
+        sound.play("tier");
+        stickerConfetti(fx, tier.burst);
+        showTierToast(fx, tier.word);
+      }, TIER_AT_MS);
+    }
+    album.push({ rows, cols, text: commutes(rows, cols) });
+    return tier;
+  }
+  function advanceMs({ state, problem }) {
+    const tier = STREAK_TIERS.some((t) => t.at === state.streak);
+    if (reducedMotion()) return 1100 + (tier ? TIER_HOLD_MS : 0);
+    const rows = problem.rows;
+    const reveal = problem.form === "product" ? COVER_OPEN_MS + 300 + rows * 170 : rows * 140 + 450;
+    return reveal + FLIP_MS + LAND_MS + 900 + (tier ? TIER_HOLD_MS : 0);
+  }
+  let exampleTimer = null;
+  function startExample(host) {
+    const wrap = el("div", "af-example");
+    wrap.append(el("p", "af-example-label", "TURN THE PAGE, COUNT AGAIN"));
+    const rows = 2;
+    const cols = 3;
+    const array = arrayDisplay(rows, cols, { size: "example", braces: true, peel: !reducedMotion() });
+    wrap.append(array);
+    const line = el("p", "af-example-line");
+    const first = el("b", "af-example-expr", expression(rows, cols));
+    const second = el("b", "af-example-expr", expression(cols, rows));
+    line.append(first, el("span", null, " and "), second, el("span", null, " show the same stickers."));
+    wrap.append(line);
+    wrap.append(el("p", "af-example-copy", "Every sticker array has two expressions. Fill both writing lines from the tiles below."));
+    host.append(wrap);
+    if (reducedMotion()) return;
+    let flipped = false;
+    const tick = () => {
+      flipArray(array, {
+        onLand: () => {
+          flipped = !flipped;
+          first.classList.toggle("af-example-expr--lit", !flipped);
+          second.classList.toggle("af-example-expr--lit", flipped);
+          replay(flipped ? second : first, "af-bump-once");
+        }
+      });
+      exampleTimer = setTimeout(tick, 2600);
+    };
+    first.classList.add("af-example-expr--lit");
+    exampleTimer = setTimeout(tick, 2200);
+  }
+  function renderEnd(host) {
+    if (!album.length) return;
+    const title = el("p", "af-album-title", "YOUR ALBUM PAGE");
+    const grid = el("div", "af-album");
+    album.forEach((entry, i) => {
+      const page = albumPage(entry.rows, entry.cols, entry.text);
+      page.style.setProperty("--af-album-delay", `${i * 90}ms`);
+      grid.append(page);
+    });
+    host.append(title, grid);
+    stickerConfetti(element.querySelector(".gf-fx"), 36);
+  }
+  const publish = (state) => tracker.publish({
+    score: state.score,
+    streak: state.streak,
+    bestStreak: state.bestStreak,
+    questionsAnswered: state.questionsAnswered
+  });
+  const record = (problem, choices, correct, state) => {
+    tracker.recordQuestion({
+      question: problem.prompt,
+      params: problem.params,
+      answer: choices.map((c) => c.label).join(" + "),
+      correctAnswer: problem.answers.map((id) => problem.choices.find((c) => c.id === id)?.label).join(" + "),
+      correct,
+      firstTry: state.firstTry,
+      replay: false
+    });
+  };
+  let frameApi = null;
+  let hud = { score: 0, streak: 0 };
+  const onKey = (event) => {
+    if (event.ctrlKey && event.key.toLowerCase() === "t") {
+      event.preventDefault();
+      const result = checkGenerator(game, { count: 500, choiceCounts: [4, 6] });
+      console.log(`[${gameFile}] generator check: ${result.count} problems, ${result.distinct} distinct, ${result.errors.length} errors`, result.errors.slice(0, 20));
+    }
+  };
+  document.addEventListener("keydown", onKey);
+  frameApi = globalThis.GameFrameStarter.mount(element, {
+    title: THEME.title,
+    subtitle: THEME.subtitle,
+    tag: THEME.tag,
+    startIcon: THEME.startIcon,
+    endIcon: THEME.endIcon,
+    endTitle: THEME.endTitle,
+    ariaLabel: `${THEME.title} game`,
+    totalQuestions: questions.length,
+    basePoints: options.basePoints ?? 10,
+    streakBonus: options.streakBonus !== false,
+    hotStreak: 5,
+    theme: { bgA: THEME.palette.bgA, bgB: THEME.palette.bgB, card: THEME.palette.card, ink: THEME.palette.ink, accent: THEME.palette.accent, good: THEME.palette.good, warm: THEME.palette.warm, dottedBorder: THEME.palette.dottedBorder, picture: THEME.palette.picture, pictureAlt: THEME.palette.pictureAlt },
+    startButton: options.startButton ?? "START",
+    playAgain: options.playAgain ?? "PLAY AGAIN",
+    advanceMs,
+    praise: () => THEME.praise[Math.floor(Math.random() * THEME.praise.length)],
+    firstMissTitle: () => "TAKE ANOTHER LOOK",
+    teachingTitle: () => "LET’S TURN IT TOGETHER",
+    endMessage: ({ state }) => `You wrote two expressions for ${state.completed} sticker array${state.completed === 1 ? "" : "s"}.`,
+    getProblem: (index) => frameProblem(index),
+    acceptPick: ({ problem, partIndex, choice, picks }) => acceptable(problem, partIndex, picks).includes(choice.id),
+    onPart,
+    renderProblem: (problem, host) => {
+      clearEquals();
+      currentArray = null;
+      currentCard = null;
+      slots = [];
+      if (problem.form === "complete") renderCompleteCard(problem, host);
+      else if (problem.form === "product") renderProductCard(problem, host);
+      else renderSelectCard(problem, host);
+    },
+    renderAnswer: (choice, host) => {
+      host.textContent = choice.label;
+      if (choice.kind === "num") host.closest(".gf-tile")?.classList.add("gf-tile--num");
+    },
+    renderStartExample: (host) => startExample(host),
+    renderFirstMiss: (problem, context) => firstMiss(problem, context),
+    renderTeaching: (problem) => teaching(problem),
+    renderEnd: (host) => renderEnd(host),
+    onFound: ({ button, complete, api: api2, problem }) => {
+      if (complete) return;
+      sound.play("pick");
+      flyStars(api2.root.querySelector(".gf-fx"), button, 2);
+      if (problem.form === "select") replay(currentArray, "af-array--tick", "af-tick");
+    },
+    onStart: ({ state }) => {
+      sound.unlock();
+      sound.play("tap");
+      clearTimers();
+      if (exampleTimer) {
+        clearTimeout(exampleTimer);
+        exampleTimer = null;
+      }
+      album = [];
+      publish(state);
+    },
+    onStateChange: (state) => {
+      if (state.score !== hud.score) replay(element.querySelector(".gf-chip--score"), "af-bump-once");
+      if (state.streak !== hud.streak) replay(element.querySelector(".gf-chip--streak"), "af-bump-once");
+      hud = { score: state.score, streak: state.streak };
+      publish(state);
+    },
+    onCorrect: ({ choices, problem, buttons, state, api: api2 }) => {
+      record(problem, choices, true, state);
+      tracker.checkAutoSave();
+      if (!state.firstTry) tracker.markCorrected(problem.params);
+      celebrate({ buttons, state, api: api2, problem });
+    },
+    onWrong: ({ choices, problem, state }) => {
+      sound.play("wrong");
+      replay(currentCard, "af-card--nudge", "af-nudge");
+      record(problem, choices, false, state);
+      tracker.markMissed(problem.params);
+      tracker.checkAutoSave();
+    },
+    onSoundToggle: (muted, { state }) => {
+      sound.setMuted(muted);
+      if (!muted && state.phase !== "start") {
+        sound.unlock();
+        sound.play("tap");
+      }
+    },
+    onEnd: () => {
+      clearTimers();
+      clearEquals();
+      sound.play("complete");
+      later(() => sound.play("fanfare"), 500);
+      replay(element.querySelector(".gf-end-card"), "af-rise", "af-card-rise");
+      const finished = album;
+      planSession();
+      album = finished;
+    },
+    onDestroy: () => {
+      clearTimers();
+      if (exampleTimer) clearTimeout(exampleTimer);
+      sound.destroy();
+    }
+  });
+  element.classList.add("game-frame--af");
+  const soundButton = element.querySelector(".gf-sound");
+  if (soundButton && sound.muted) soundButton.click();
+  Object.entries(cssVariables()).forEach(([key, value]) => element.style.setProperty(key, value));
+  const onVisibility = () => sound.setHidden(document.visibilityState === "hidden");
+  document.addEventListener("visibilitychange", onVisibility);
+  const destroy = frameApi.destroy;
+  frameApi.destroy = () => {
+    document.removeEventListener("visibilitychange", onVisibility);
+    document.removeEventListener("keydown", onKey);
+    destroy();
+  };
+  tracker.requireLogin().then(() => tracker.startAutoSave());
+  const api = Object.assign(frameApi, { tracker, game, sound, get questions() {
+    return questions;
+  } });
+  return api;
+}
+({
+  lesson: [PROMPTS.select, PROMPTS.modeled, PROMPTS.complete, PROMPTS.product, ...ROW_LABELS],
+  game: [THEME.title, THEME.subtitle, THEME.tag, THEME.endTitle, "START", "PLAY AGAIN", "TAKE ANOTHER LOOK", "LET’S TURN IT TOGETHER", "TURN THE PAGE, COUNT AGAIN", "YOUR ALBUM PAGE", "Which two match?"]
+});
+function installHomeNavigation(root) {
+  const icon = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11 12 3l9 8v10h-6v-7H9v7H3Z" fill="currentColor"/></svg>';
+  function home(label) {
+    const link = document.createElement("a");
+    link.href = "./index.html";
+    link.className = "game-home" + (label ? " game-home-labeled" : "");
+    link.setAttribute("aria-label", "Go home to game menu");
+    link.title = "Go home";
+    link.innerHTML = icon;
+    if (label) link.append(document.createTextNode("HOME"));
+    return link;
+  }
+  const headers = /* @__PURE__ */ new Set();
+  function update() {
+    for (const header of root.querySelectorAll(".mg-hud, .gf-hud")) {
+      if (headers.has(header)) continue;
+      headers.add(header);
+      header.classList.add("game-home-header");
+      header.prepend(home(false));
+    }
+    for (const stats of root.querySelectorAll(".mg-stats, .gf-stats")) {
+      const card = stats.parentElement;
+      if (card.querySelector(".game-end-actions")) continue;
+      const again = card.querySelector(".mg-big-btn, .gf-big-btn");
+      if (!again) continue;
+      const actions = document.createElement("div");
+      actions.className = "game-end-actions";
+      again.replaceWith(actions);
+      actions.append(again, home(true));
+    }
+  }
+  const observer = new MutationObserver(update);
+  observer.observe(root, { childList: true, subtree: true });
+  update();
+  return () => {
+    observer.disconnect();
+  };
+}
+mount(document.getElementById("game"), { gameFile: "array_flip_109.html" });
+installHomeNavigation(document.getElementById("game"));</script>
+  <style rel="stylesheet" crossorigin>/* The shell is adapted from the approved Game 107 surrounding frame.
+   Lesson content belongs in the problem-card adapter. */
+:root {
+  --gf-bg-a: #3156D8;
+  --gf-bg-b: #13213F;
+  --gf-card: #FFF4D6;
+  --gf-ink: #13213F;
+  --gf-accent: #F29B38;
+  --gf-good: #37C8C5;
+  --gf-warm: #E8A838;
+  --gf-dotted-border: #37C8C5;
+  --gf-picture: #E5F8F5;
+  --gf-picture-alt: #fffdf4;
+  --gf-outline: 4px;
+  --gf-shadow: 0 6px 0 var(--gf-ink);
+  --gf-font-shout: 'Bangers', Impact, cursive;
+  --gf-font-read: 'Fredoka', Nunito, system-ui, sans-serif;
+  --gf-card-radius: 22px;
+  --gf-card-gap: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+  color: #fff;
+  font-family: var(--gf-font-read);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button { font: inherit; }
+
+.game-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+.gf-hidden { display: none !important; }
+
+/* Start and end overlays. */
+.gf-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: linear-gradient(155deg, var(--gf-bg-a) 0%, #243d9f 48%, var(--gf-bg-b) 100%);
+}
+.gf-card {
+  width: min(920px, 100%);
+  max-height: calc(100% - 32px);
+  overflow: auto;
+  padding: 24px 22px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 24px;
+  box-shadow: var(--gf-shadow);
+  text-align: center;
+}
+.gf-start-card, .gf-end-card { width: min(560px, 100%); }
+.gf-end-card { display: flex; flex-direction: column; overflow: hidden; }
+.gf-end-extra { min-height: 0; overflow-y: auto; }
+.gf-end-card .game-end-actions { flex: 0 0 auto; }
+.gf-emoji { font-size: 56px; line-height: 1; }
+.gf-title {
+  margin-top: 6px;
+  color: var(--gf-ink);
+  font-family: var(--gf-font-shout);
+  font-size: clamp(34px, 8vw, 52px);
+  letter-spacing: 2px;
+  text-shadow: 3px 3px 0 var(--gf-accent);
+}
+.gf-subtitle { margin-top: 4px; font-size: 20px; font-weight: 600; }
+.gf-tag {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 10px;
+  color: var(--gf-bg-b);
+  background: #f5f3ff;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+.gf-example {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+  font-size: 18px;
+}
+.gf-example-label, .gf-sample-kicker { color: #355080; font-size: 13px; font-weight: 800; letter-spacing: 1px; }
+.gf-example-body { font-weight: 600; }
+.gf-big-btn {
+  min-height: 64px;
+  padding: 14px 40px;
+  color: var(--gf-ink);
+  background: var(--gf-accent);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: 30px;
+  letter-spacing: 2px;
+  transition: transform .08s, box-shadow .08s;
+}
+.gf-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-big-btn:focus-visible, .gf-retry:focus-visible, .gf-tile:focus-visible, .gf-sound:focus-visible {
+  outline: 4px solid #ffd93d;
+  outline-offset: 4px;
+}
+
+/* Shared header and progress. */
+.gf-shell { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 32px)); margin-inline: auto; }
+.gf-hud {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 0;
+  font-family: var(--gf-font-shout);
+  letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgb(0 0 0 / 35%);
+}
+.gf-hud-title {
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: .15em;
+  font-size: clamp(15px, 4vw, 40px);
+  line-height: 1.2;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.gf-chips { display: flex; flex-shrink: 0; gap: 8px; }
+.gf-chip {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 12px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  font-size: 18px;
+  line-height: 1;
+  text-shadow: none;
+}
+.gf-chip--hot { background: var(--gf-accent); }
+.gf-progress {
+  height: 10px;
+  overflow: hidden;
+  background: rgb(0 0 0 / 25%);
+  border-radius: 999px;
+}
+.gf-progress > i { display: block; width: 0; height: 100%; background: var(--gf-good); transition: width .3s; }
+
+/* Prompt, lesson card slot and answer grid. */
+.gf-stage {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 20px;
+  padding: 10px 0 calc(60px + 6px + env(safe-area-inset-bottom, 0px));
+}
+.gf-prompt {
+  flex: 0 0 auto;
+  padding: 14px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: var(--gf-shadow);
+  font-size: 28px;
+  font-weight: 600;
+  text-align: center;
+}
+.gf-visual { display: flex; flex: 1 1 auto; min-height: 0; align-items: center; justify-content: center; }
+.gf-problem-card {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  padding: clamp(10px, 1.5vw, 16px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: var(--gf-card-radius);
+  box-shadow: 0 6px 0 var(--gf-ink);
+  text-align: center;
+}
+.gf-problem-slot {
+  display: grid;
+  width: min(720px, 100%);
+  min-height: 100px;
+  place-items: center;
+  padding: clamp(16px, 3vw, 30px);
+  background: var(--gf-picture);
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 16px;
+}
+.gf-sample-kicker { margin-bottom: 8px; }
+.gf-sample-title { font-size: clamp(24px, 5vw, 42px); }
+.gf-sample-detail { margin-top: 8px; font-size: clamp(16px, 3vw, 24px); font-weight: 600; }
+.gf-sound {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  padding: 0;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: 3px solid var(--gf-ink);
+  border-radius: 50%;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  cursor: pointer;
+  font-size: 20px;
+}
+.gf-sound:active { transform: translateY(2px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-tiles { display: grid; width: min(686px, 85%); align-self: center; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10.8px; }
+.gf-tile {
+  display: grid;
+  min-height: 104.85px;
+  place-items: center;
+  padding: 10px;
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 18px;
+  box-shadow: 0 6px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-read);
+  font-size: clamp(24px, 4vw, 32px);
+  font-weight: 700;
+  transition: transform .08s, box-shadow .08s, background .15s;
+}
+.gf-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--gf-ink); }
+.gf-tile:disabled { cursor: default; }
+.gf-tile.gf-right { background: var(--gf-good); }
+.gf-tile.gf-wrong { background: var(--gf-warm); }
+
+/* Toasts, modal feedback and end statistics. */
+.gf-fx { position: absolute; inset: 0; z-index: 30; overflow: hidden; pointer-events: none; }
+.gf-toast {
+  position: absolute;
+  top: 38%;
+  left: 50%;
+  color: #fff;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(45px, 9vw, 84px);
+  letter-spacing: 3px;
+  text-shadow: 4px 4px 0 var(--gf-ink);
+  transform: translate(-50%, -50%);
+  animation: gf-toast .9s ease-out forwards;
+}
+.gf-toast--warm { color: var(--gf-warm); font-size: clamp(28px, 7vw, 44px); }
+.gf-popup {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 4;
+  display: grid;
+  width: min(600px, calc(100% - 32px));
+  max-width: calc(100% - 32px);
+  max-height: calc(100% - 32px);
+  align-content: center;
+  justify-items: center;
+  gap: clamp(8px, 1.8vh, 16px);
+  overflow-y: auto;
+  padding: clamp(16px, 2.5vh, 24px) clamp(18px, 2.5vw, 30px);
+  color: var(--gf-ink);
+  background: var(--gf-card);
+  border: var(--gf-outline) solid var(--gf-ink);
+  border-radius: 20px;
+  box-shadow: 0 8px 0 var(--gf-ink);
+  pointer-events: auto;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  animation: gf-popup-in .24s ease-out;
+}
+.gf-popup-title { max-width: 30ch; font-size: 28px; font-weight: 800; line-height: 1.15; }
+.gf-popup-content { width: 100%; font-size: 24px; font-weight: 700; line-height: 1.2; }
+.gf-popup-content:empty { display: none; }
+.gf-popup--cue .gf-popup-title { width: 100%; padding: 12px 18px; background: var(--gf-picture); border: 3px solid var(--gf-dotted-border); border-radius: 15px; }
+.gf-retry {
+  min-height: 44px;
+  margin-top: 2px;
+  padding: 7px 20px;
+  color: var(--gf-ink);
+  background: #ffd93d;
+  border: 3px solid var(--gf-ink);
+  border-radius: 999px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+  cursor: pointer;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(18px, 2.2vw, 27px);
+  letter-spacing: 1px;
+}
+.gf-retry:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--gf-ink); }
+.gf-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.gf-stat { min-width: 110px; padding: 10px 18px; background: #f5f3ff; border: 3px solid var(--gf-ink); border-radius: 16px; }
+.gf-stat b { display: block; font-family: var(--gf-font-shout); font-size: 32px; letter-spacing: 1px; }
+@keyframes gf-popup-in { from { opacity: 0; transform: translate(-50%, -42%) scale(.9); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+@keyframes gf-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+
+@media (max-width: 560px) {
+  .gf-hud, .gf-progress, .gf-stage { width: min(920px, calc(100% - 20px)); }
+  .gf-hud { padding-block: 8px; }
+  .gf-chip { padding-inline: 9px; font-size: 16px; }
+  .gf-stage { gap: 14px; }
+  .gf-prompt { padding: 10px; font-size: 20px; }
+  .gf-tile { min-height: 66.6px; font-size: 24px; }
+  .gf-problem-card { padding: 8px; border-radius: 18px; }
+  .gf-popup { width: min(600px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 12px; }
+  .gf-popup-title { font-size: 24px; }
+  .gf-popup-content { font-size: 20px; }
+}
+@media (max-width: 360px) and (max-height: 600px) {
+  .gf-tile { min-height: 57.15px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-stage { gap: 14px; padding-top: 4px; }
+  .gf-prompt { font-size: 20px; }
+  .gf-tiles { width: min(686px, 85%); grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .gf-tile { min-height: 54px; padding: 4px 10px; line-height: 1; }
+  .gf-problem-card { padding: 4px; border-radius: 16px; }
+  .gf-popup { width: min(600px, calc(100% - 16px)); max-height: calc(100% - 16px); padding: 10px; }
+  .gf-popup-content { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .game-frame *, .game-frame { animation: none !important; transition: none !important; }
+}
+
+/* ============================================================
+   Game 109 (ML 1.09): Sticker Album arrays, two expressions each. Everything below is
+   lesson-owned; the shell above is the Game 107 starter copy.
+   Palette tokens (--af-*) are set from theme.js at mount.
+   ============================================================ */
+body { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+.gf-screen { background: linear-gradient(155deg, var(--gf-bg-a) 0%, #4D5FD0 52%, var(--gf-bg-b) 100%); }
+
+/* The Question Prompt is the frame's prompt bar above the Problem Card
+   (captain, 109: select-all cards hold only the Array Display). The card's
+   dashed slot becomes the full card interior so the lesson lays it out. */
+.game-frame--af .gf-stage { gap: 16px; }
+.game-frame--af .gf-prompt { font-size: clamp(20px, 2.4vw, 26px); padding: 12px 14px; line-height: 1.2; }
+.game-frame--af .gf-problem-card { grid-template-rows: minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); padding: clamp(12px, 2vw, 22px); }
+.game-frame--af .gf-problem-slot {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  place-items: stretch;
+}
+
+/* Problem Card contents. Select-all: the Array Display alone. Completion:
+   Array Display left, Expression Rows right. Product: a closed album page
+   that opens on the answer. */
+.af-card {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  row-gap: clamp(10px, 2.4vh, 22px);
+  padding: clamp(4px, 1vh, 10px) clamp(8px, 2vw, 24px);
+}
+.af-card--complete {
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  column-gap: clamp(14px, 3vw, 40px);
+  padding-right: clamp(40px, 5vw, 56px);
+}
+.af-card--complete .af-array--card { grid-column: 1; }
+.af-card--complete .af-rows { grid-column: 2; }
+
+/* Expression Rows: two writing lines, "expression 1:" and "expression 2:".
+   A blank is a writing line; the active one glows; a filled one pops in. */
+.af-rows { display: grid; gap: clamp(12px, 2.4vh, 24px); justify-items: start; width: 100%; max-width: 360px; }
+.af-row { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: clamp(8px, 1.2vw, 14px); width: 100%; }
+.af-row-label { font-size: clamp(17px, 1.9vw, 22px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); white-space: nowrap; }
+.af-row-line { display: flex; align-items: center; gap: clamp(6px, 1vw, 10px); min-height: 52px; }
+.af-slot { display: inline-grid; place-items: center; min-height: 48px; font-size: clamp(24px, 3vw, 34px); font-weight: 700; line-height: 1; }
+.af-slot--fixed { min-width: 1.4em; }
+.af-slot--times { font-size: clamp(22px, 2.6vw, 30px); }
+.af-slot--blank {
+  min-width: 2.1em;
+  padding: 4px 10px;
+  background: #fff;
+  border: 3px dashed var(--gf-dotted-border);
+  border-radius: 12px;
+  color: transparent;
+  transition: border-color .2s, box-shadow .2s, transform .2s;
+}
+.af-slot--wide { min-width: 5.2em; }
+.af-slot--active {
+  border-color: var(--gf-accent);
+  box-shadow: 0 0 0 4px rgb(242 155 56 / 35%);
+  animation: af-slot-pulse 1.1s ease-in-out infinite alternate;
+}
+@keyframes af-slot-pulse { from { box-shadow: 0 0 0 3px rgb(242 155 56 / 30%); } to { box-shadow: 0 0 0 7px rgb(255 212 90 / 55%); transform: translateY(-2px); } }
+.af-slot--filled { color: var(--gf-ink); }
+@keyframes af-slot-in { from { transform: translateY(-16px) scale(.6); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* The commutative statement that appears after the flip: under the
+   Expression Rows on a completion card, on its own row under the array on a
+   select-all or product card. */
+.af-equals {
+  justify-self: center;
+  padding: 6px 18px;
+  background: #fff;
+  border: 3px solid var(--gf-good);
+  border-radius: 999px;
+  font-size: clamp(20px, 2.6vw, 30px);
+  font-weight: 700;
+  color: var(--gf-ink);
+  animation: af-slot-in .36s cubic-bezier(.2,.9,.3,1.3) both;
+}
+.af-rows .af-equals { justify-self: start; margin-top: 4px; }
+/* On a select-all or product card the statement takes its own row under the
+   array, so no sticker is covered. */
+.af-card--select, .af-card--product { grid-template-rows: minmax(0, 1fr) auto; }
+.af-card--select .af-equals, .af-card--product .af-equals { grid-row: 2; }
+.af-equals--float {
+  position: absolute;
+  z-index: 2;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 4px 0 var(--gf-ink);
+  animation-name: af-equals-float;
+}
+@keyframes af-equals-float { from { transform: translate(-50%, -30%) scale(.7); opacity: 0; } to { transform: translate(-50%, -50%) scale(1); opacity: 1; } }
+
+/* Product form: a closed album page with a mystery sticker until solved. */
+.af-card--product .af-array--card { max-height: 100%; }
+.af-cover {
+  display: grid;
+  place-items: center;
+  width: min(100%, 420px);
+  height: 100%;
+  max-height: 260px;
+  padding: 12px;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 15px, var(--af-page-line, #DCE3F7) 15px 16px),
+    var(--af-page, #fff);
+  border: 3px solid var(--gf-ink);
+  border-radius: 14px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+}
+.af-cover-sticker {
+  display: grid;
+  place-items: center;
+  width: clamp(72px, 12vw, 110px);
+  height: clamp(72px, 12vw, 110px);
+  background: var(--af-sticker, #FFD45A);
+  border: 3px solid var(--gf-ink);
+  border-radius: 18px;
+  font-family: var(--gf-font-shout);
+  font-size: clamp(44px, 7vw, 66px);
+  color: var(--gf-ink);
+  animation: af-wobble 2.2s ease-in-out infinite;
+}
+@keyframes af-wobble { 0%, 100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg) translateY(-3px); } }
+.af-cover-copy { margin-top: 10px; font-size: clamp(15px, 1.8vw, 18px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+
+/* The quarter-turn flip: keyframes live in the motion block below. */
+.af-page { transform-origin: 50% 50%; }
+.af-prompt {
+  max-width: 40ch;
+  font-size: clamp(19px, 2.2vw, 26px);
+  font-weight: 600;
+  line-height: 1.2;
+}
+.af-caption {
+  padding: 4px 16px;
+  font-size: clamp(17px, 2.2vw, 22px);
+  font-weight: 700;
+  color: var(--gf-ink);
+  background: var(--af-picture, #F3F6FF);
+  border: 3px solid var(--gf-dotted-border);
+  border-radius: 999px;
+}
+
+/* Array Display: a white album page with a grid of stickers. Sticker size
+   follows the container so rows and columns stay countable. */
+.af-array {
+  --af-gap: clamp(3px, 0.8vw, 8px);
+  --af-cell: 40px;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+}
+.af-array--card {
+  width: 100%;
+  height: 100%;
+  container-type: size;
+}
+.af-page {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: clamp(6px, 1vw, 10px);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 15px, var(--af-page-line, #DCE3F7) 15px 16px),
+    var(--af-page, #fff);
+  border: 3px solid var(--gf-ink);
+  border-radius: 14px;
+  box-shadow: 0 4px 0 var(--gf-ink);
+}
+.af-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--af-cols), var(--af-cell));
+  grid-auto-rows: var(--af-cell);
+  gap: var(--af-gap);
+}
+/* Fit: the page's inner area is the container; each cell takes the largest
+   size that lets every column and every row fit with the gap. */
+.af-array--card .af-grid {
+  --af-cell: min(
+    calc((100cqw - 26px - (var(--af-cols) - 1) * var(--af-gap)) / var(--af-cols)),
+    calc((100cqh - 26px - (var(--af-rows) - 1) * var(--af-gap)) / var(--af-rows)),
+    72px
+  );
+}
+.af-cell {
+  position: relative;
+  display: grid;
+  width: var(--af-cell);
+  height: var(--af-cell);
+  place-items: center;
+}
+.af-cell > svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 2px 0 rgb(19 33 63 / 20%)); }
+.af-array--peel .af-cell {
+  animation: af-peel .38s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: calc(120ms + var(--af-r) * 170ms + var(--af-c) * 22ms);
+}
+@keyframes af-peel {
+  0% { opacity: 0; transform: translateY(-14px) rotate(-12deg) scale(.6); }
+  60% { opacity: 1; transform: translateY(2px) rotate(3deg) scale(1.08); }
+  100% { opacity: 1; transform: none; }
+}
+.af-cell--shine { animation: af-shine .5s ease-out both; animation-delay: var(--af-shine-delay, 0ms); }
+@keyframes af-shine {
+  0% { transform: scale(1); filter: brightness(1); }
+  40% { transform: scale(1.22) rotate(-6deg); filter: brightness(1.35) drop-shadow(0 0 6px #ffd45a); }
+  100% { transform: scale(1); filter: brightness(1); }
+}
+.af-array--solved .af-page { border-color: var(--gf-good); box-shadow: 0 4px 0 var(--gf-good); }
+
+/* Braced help/example pictures: "R rows" beside, "C in each row" below. */
+.af-array--braced {
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  gap: 6px 10px;
+  align-items: center;
+  justify-items: center;
+}
+.af-array--braced .af-page { grid-column: 2; grid-row: 1; }
+.af-brace {
+  font-size: clamp(14px, 1.8vw, 18px);
+  font-weight: 700;
+  color: var(--af-bg-a, #6B3FA0);
+}
+.af-brace--rows { grid-column: 1; grid-row: 1; max-width: 5ch; text-align: center; writing-mode: horizontal-tb; }
+.af-brace--cols { grid-column: 2; grid-row: 2; }
+.af-array--help { --af-cell: clamp(22px, 5vw, 34px); --af-gap: 4px; }
+.af-array--example {
+  --af-cell: clamp(26px, 6vw, 40px);
+  --af-gap: 5px;
+  /* Reserve the three-sticker extent in both orientations before the turn. */
+  --af-example-extent: calc(3 * var(--af-cell) + 2 * var(--af-gap) + 2 * clamp(6px, 1vw, 10px) + 6px);
+  grid-template-columns: auto var(--af-example-extent);
+  grid-template-rows: var(--af-example-extent) auto;
+}
+.af-cell--lit > svg { filter: drop-shadow(0 0 5px #ffd45a) brightness(1.15); }
+.af-cell--current { animation: af-bump .3s ease-out; }
+@keyframes af-bump { 50% { transform: scale(1.2); } }
+
+/* Answer Grid: select-all. A found expression locks in as a right tile.
+   Lesson-specific frame exception (recorded in REQUIREMENTS.md): select-all
+   tiles are shorter than the starter's 104.85px so the Array Display keeps
+   countable stickers for five-row arrays. */
+.gf-tiles--multi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.gf-tiles--multi .gf-tile { min-height: 84px; }
+.gf-tile[data-found="true"] { background: var(--gf-good); }
+.gf-tile[data-found="true"] .gf-answer-content::before {
+  content: '\2713';
+  margin-right: 8px;
+}
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  margin-right: 10px;
+  place-items: center;
+  background: var(--af-sticker, #FFD45A);
+  border: 2px solid var(--gf-ink);
+  border-radius: 50%;
+  font-size: 20px;
+  vertical-align: middle;
+}
+.gf-answer-content { display: inline-flex; align-items: center; justify-content: center; }
+
+/* A tile of the wrong kind for the active writing line stays visible but
+   muted (a number while an expression line is active, and the reverse). */
+.gf-tile[data-muted="true"] { opacity: .38; box-shadow: 0 3px 0 var(--gf-ink); transform: translateY(3px); cursor: default; }
+.gf-tiles[data-count="6"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.gf-tile--num { font-size: clamp(28px, 4.4vw, 36px); }
+
+/* Help content inside the frame popups. */
+.af-help { display: grid; justify-items: center; gap: 10px; width: 100%; }
+.af-help-copy { max-width: 34ch; font-size: clamp(18px, 2.2vw, 22px); font-weight: 600; line-height: 1.3; }
+.af-help-growth { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+/* Keep the teaching array's largest orientation reserved during its turn. */
+.af-help--teach .af-array {
+  background: #fff;
+  padding: 10px;
+  border-radius: 12px;
+  --af-turn-extent: calc(var(--af-turn-side) * var(--af-cell) + (var(--af-turn-side) - 1) * var(--af-gap) + 2 * clamp(6px, 1vw, 10px) + 6px);
+  grid-template-columns: auto var(--af-turn-extent);
+  grid-template-rows: var(--af-turn-extent) auto;
+  justify-self: center;
+}
+.af-help-line { display: flex; align-items: center; gap: 10px; font-size: clamp(18px, 2.4vw, 24px); font-weight: 700; }
+.af-help-line span { padding: 4px 12px; background: var(--af-picture, #F3F6FF); border: 2px solid var(--gf-dotted-border); border-radius: 12px; }
+.af-help-line .af-help-times { padding: 0; background: none; border: 0; }
+.af-help-line--done span { border-color: var(--gf-good); }
+.af-help-next { font-size: clamp(16px, 2vw, 20px); font-weight: 700; color: var(--af-bg-a, #6B3FA0); }
+.af-help-both--done { border-color: var(--gf-accent); }
+.af-help-both { padding: 6px 16px; background: #fff; border: 3px solid var(--gf-good); border-radius: 999px; font-size: clamp(20px, 2.8vw, 28px); font-weight: 700; }
+
+/* Start Lesson. */
+.af-example { display: grid; justify-items: center; gap: 10px; }
+.af-example-label { font-family: var(--gf-font-shout); font-size: 20px; letter-spacing: 1px; color: var(--af-bg-a, #6B3FA0); }
+.af-example-line { font-size: 17px; font-weight: 600; }
+.af-example-expr { display: inline-block; padding: 2px 10px; background: #fff; border: 2px solid var(--gf-good); border-radius: 10px; transition: background .3s, transform .3s; }
+.af-example-expr--lit { background: var(--af-sticker, #FFD45A); transform: scale(1.08); }
+.af-array--example .af-page { transform-origin: 50% 50%; }
+.af-example-copy { max-width: 46ch; font-size: 17px; font-weight: 600; line-height: 1.3; }
+
+/* End Screen album. */
+.af-album-title { margin-top: 4px; font-family: var(--gf-font-shout); font-size: 22px; letter-spacing: 1px; color: var(--af-bg-a, #6B3FA0); }
+.af-album { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 8px 0 14px; }
+.af-album-item {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 8px;
+  background: #fff;
+  border: 3px solid var(--gf-ink);
+  border-radius: 12px;
+  box-shadow: 0 3px 0 var(--gf-ink);
+  animation: af-album-in .4s cubic-bezier(.2,.9,.3,1.2) both;
+  animation-delay: var(--af-album-delay, 0ms);
+}
+@keyframes af-album-in { from { opacity: 0; transform: scale(.5) rotate(-8deg); } to { opacity: 1; transform: none; } }
+.af-album-mini { display: grid; grid-template-columns: repeat(var(--af-cols), 9px); gap: 2px; }
+.af-album-dot { display: block; width: 9px; height: 9px; border: 1px solid var(--gf-ink); border-radius: 2px; }
+.af-album-dot--star { background: var(--af-sticker, #FFD45A); }
+.af-album-dot--circle { background: var(--af-sticker-alt, #6BCBFF); border-radius: 50%; }
+.af-album-dot--diamond { background: var(--af-sticker-third, #FF8FAB); transform: rotate(45deg) scale(.8); }
+.af-album-text { font-size: 15px; font-weight: 700; }
+
+/* Celebration pieces. */
+.af-confetti {
+  position: absolute;
+  top: -20px;
+  width: 14px;
+  height: 14px;
+  background: var(--af-piece, #ffd45a);
+  border: 2px solid var(--gf-ink);
+  border-radius: 3px;
+  animation: af-fall linear forwards;
+}
+.af-confetti--circle { border-radius: 50%; }
+.af-confetti--diamond { transform: rotate(45deg); }
+@keyframes af-fall { to { transform: translateY(110vh) rotate(720deg); opacity: .85; } }
+.af-fly { position: absolute; font-size: 28px; color: #ffd45a; text-shadow: 2px 2px 0 var(--gf-ink); animation: af-fly .9s ease-out forwards; }
+@keyframes af-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+.gf-toast--tier { color: #ffd45a; font-size: clamp(36px, 8vw, 64px); }
+
+/* Compact phones. */
+@media (max-width: 560px) {
+  .af-card { row-gap: 6px; padding: 2px 0; }
+  .game-frame--af .gf-prompt { padding: 8px 10px; font-size: 17px; }
+  .game-frame--af .gf-stage { gap: 10px; }
+  .game-frame--af .gf-problem-card { padding: 8px 8px 6px; }
+  /* Completion: a wide array sits above the Expression Rows; a tall array
+     (more rows than columns) keeps the rows beside it, labels stacked, so
+     five-row arrays stay countable. */
+  .af-card--complete { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; column-gap: 0; padding-right: 0; row-gap: 6px; }
+  .af-card--complete .af-array--card { grid-column: 1; grid-row: 1; }
+  .af-card--complete .af-rows { grid-column: 1; grid-row: 2; grid-template-columns: 1fr 1fr; max-width: none; justify-items: center; gap: 4px; }
+  .af-card--complete .af-row { grid-template-columns: 1fr; justify-items: center; gap: 2px; }
+  .af-card--complete.af-card--tall { grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: minmax(0, 1fr); column-gap: 8px; padding-right: 4px; }
+  .af-card--complete.af-card--tall .af-rows { grid-column: 2; grid-row: 1; grid-template-columns: 1fr; justify-items: start; gap: 10px; padding-top: 44px; }
+  .af-card--complete.af-card--tall .af-row { grid-template-columns: 1fr; justify-items: start; gap: 2px; }
+  .af-card--complete.af-card--tall .af-rows .af-equals { justify-self: start; }
+  /* Keep the page clear of the 44px sound control in the card's top-right
+     corner: the array (or the closed cover) centers in the room to its left. */
+  .af-card--select .af-array--card, .af-card--product .af-array--card, .af-card--complete:not(.af-card--tall) .af-array--card, .af-cover { width: calc(100% - 44px); justify-self: start; }
+  .af-rows .af-equals { justify-self: center; margin-top: 0; }
+  .af-row-label { font-size: 14px; }
+  .af-row-line { min-height: 34px; gap: 4px; }
+  .af-slot { min-height: 32px; font-size: 20px; }
+  .af-slot--blank { padding: 2px 8px; border-width: 2px; }
+  .af-slot--times { font-size: 18px; }
+  .af-equals { padding: 3px 12px; font-size: 17px; border-width: 2px; }
+  .af-cover { max-height: 150px; padding: 8px; }
+  .af-cover-sticker { width: 56px; height: 56px; font-size: 34px; }
+  .af-cover-copy { font-size: 13px; margin-top: 6px; }
+  .gf-tiles[data-count="6"] .gf-tile { padding: 6px 4px; font-size: 19px; }
+  .gf-tile--num { font-size: 26px; }
+  .af-caption { padding: 3px 12px; font-size: 15px; border-width: 2px; }
+  .af-page { padding: 4px; border-width: 2px; box-shadow: 0 2px 0 var(--gf-ink); }
+  .af-array--card .af-grid {
+    --af-gap: 2px;
+    --af-cell: min(
+      calc((100cqw - 12px - (var(--af-cols) - 1) * var(--af-gap)) / var(--af-cols)),
+      calc((100cqh - 12px - (var(--af-rows) - 1) * var(--af-gap)) / var(--af-rows)),
+      72px
+    );
+  }
+  .gf-tiles--multi { gap: 8px; }
+  .gf-tiles--multi .gf-tile { min-height: 50px; }
+  .gf-stats { gap: 8px; margin: 10px 0; }
+  .gf-stat { min-width: 78px; padding: 6px 8px; font-size: 14px; }
+  .gf-stat b { font-size: 24px; }
+  .af-album { gap: 6px; }
+  .af-album-item { padding: 5px; }
+  .af-help-copy { font-size: 16px; }
+  .af-help-line { font-size: 16px; gap: 6px; }
+  .af-help-both { font-size: 20px; }
+  .af-array--help { --af-cell: 20px; --af-gap: 3px; }
+  .af-brace { font-size: 13px; }
+  .af-example-copy, .af-example-line { font-size: 17px; }
+}
+@media (orientation: landscape) and (max-height: 500px) {
+  .gf-tiles--multi { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .gf-tiles[data-count="6"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .af-card { row-gap: 6px; }
+}
+/* Motion pass 1 (2026-09-12): feel only, no layout or copy change. Every
+   rule below is disabled by the reduced-motion block at the end. */
+
+/* Problem Card and Answer Grid enter like a page turning in, tiles staggered. */
+.af-card { animation: af-page-in .32s cubic-bezier(.2,.8,.3,1) both; transform-origin: left center; }
+@keyframes af-page-in {
+  0% { opacity: 0; transform: perspective(1200px) rotateY(-14deg) translateX(-10px); }
+  100% { opacity: 1; transform: none; }
+}
+.gf-tiles .gf-tile { animation: af-tile-in .34s cubic-bezier(.2,.9,.3,1.25) backwards; }
+.gf-tiles .gf-tile:nth-child(2) { animation-delay: 50ms; }
+.gf-tiles .gf-tile:nth-child(3) { animation-delay: 100ms; }
+.gf-tiles .gf-tile:nth-child(4) { animation-delay: 150ms; }
+.gf-tiles .gf-tile:nth-child(5) { animation-delay: 200ms; }
+.gf-tiles .gf-tile:nth-child(6) { animation-delay: 250ms; }
+@keyframes af-tile-in { 0% { opacity: 0; transform: translateY(14px) scale(.94); } 100% { opacity: 1; transform: none; } }
+
+/* Wrong tap: one short shake, amber. The page (or closed cover) gives a
+   small wobble too, so the miss reads as "look here". */
+.gf-tile.gf-wrong { animation: af-shake .4s ease-in-out; }
+@keyframes af-shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-7px); }
+  40% { transform: translateX(7px); }
+  60% { transform: translateX(-5px); }
+  80% { transform: translateX(5px); }
+}
+.af-card--nudge .af-page, .af-card--nudge .af-cover { animation: af-nudge .5s ease-in-out; }
+@keyframes af-nudge { 25% { transform: rotate(-1.2deg); } 60% { transform: rotate(1deg); } 100% { transform: none; } }
+
+/* Found expression or number: the tile pops and the check stamps on; on a
+   select-all card the page ticks up. */
+.gf-tile.gf-right { animation: af-tile-pop .45s cubic-bezier(.2,.9,.3,1.3); }
+@keyframes af-tile-pop { 0% { transform: scale(1); } 45% { transform: scale(1.07); } 100% { transform: none; } }
+.gf-tile[data-found="true"] .gf-answer-content::before { display: inline-block; animation: af-stamp .38s cubic-bezier(.2,.9,.3,1.2) both; }
+@keyframes af-stamp { 0% { opacity: 0; transform: scale(1.9) rotate(-12deg); } 60% { opacity: 1; transform: scale(.9); } 100% { opacity: 1; transform: none; } }
+.af-array--tick .af-page { animation: af-tick .3s ease-out; }
+@keyframes af-tick { 40% { transform: translateY(-3px); } 100% { transform: none; } }
+
+/* The tapped label on its way to the writing line. */
+.af-fly-label {
+  position: absolute;
+  z-index: 3;
+  color: var(--gf-ink);
+  font-size: clamp(22px, 3vw, 32px);
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* The quarter turn: the page lifts off the album (its shadow grows), turns,
+   then lands with a small overshoot while its stickers settle one by one. */
+.af-page--flip { animation: af-flip .46s cubic-bezier(.45,0,.75,.35) both; }
+@keyframes af-flip {
+  0% { transform: rotate(0) scale(1) translateY(0); }
+  35% { transform: rotate(18deg) scale(1.04) translateY(-10px); box-shadow: 0 16px 0 rgb(19 33 63 / 35%); }
+  100% { transform: rotate(90deg) scale(.55) translateY(-6px); box-shadow: 0 16px 0 rgb(19 33 63 / 35%); }
+}
+.af-page--land { animation: af-land .34s cubic-bezier(.2,.9,.3,1.35) both; }
+@keyframes af-land {
+  0% { transform: rotate(-10deg) scale(.55) translateY(-6px); box-shadow: 0 16px 0 rgb(19 33 63 / 35%); }
+  70% { transform: rotate(2deg) scale(1.04); }
+  100% { transform: none; }
+}
+.af-page--land .af-cell { animation: af-settle .36s cubic-bezier(.2,.9,.3,1.3) both; animation-delay: calc(var(--af-i, 0) * 14ms); }
+@keyframes af-settle { 0% { transform: scale(.8) rotate(-8deg); } 100% { transform: none; } }
+
+/* The commutative statement stamps on. */
+.af-equals { animation: af-stamp-in .42s cubic-bezier(.2,.9,.3,1.3) both; }
+@keyframes af-stamp-in {
+  0% { opacity: 0; transform: scale(1.6) rotate(-6deg); }
+  55% { opacity: 1; transform: scale(.94) rotate(1deg); box-shadow: 0 0 0 8px rgb(55 200 197 / 30%); }
+  100% { opacity: 1; transform: none; box-shadow: 0 0 0 0 rgb(55 200 197 / 0%); }
+}
+.af-equals--float { animation-name: af-equals-float; }
+
+/* Product form: the closed album cover swings open before its page appears. */
+.af-cover { transform-origin: left center; }
+.af-cover--open { animation: af-cover-open .42s cubic-bezier(.5,0,.6,1) both; }
+@keyframes af-cover-open {
+  0% { transform: perspective(1600px) rotateY(0); opacity: 1; }
+  70% { opacity: .5; }
+  100% { transform: perspective(1600px) rotateY(-80deg); opacity: 0; }
+}
+.af-cover--open .af-cover-sticker { animation: none; }
+
+/* HUD chips bump when their number changes; hot streak glows. */
+.gf-chip { transition: background .3s; }
+.af-bump-once { animation: af-bump-once .4s cubic-bezier(.2,.9,.3,1.3); }
+@keyframes af-bump-once { 40% { transform: scale(1.18); } 100% { transform: none; } }
+.gf-chip--hot { animation: af-hot 1.6s ease-in-out infinite alternate; }
+@keyframes af-hot { from { box-shadow: 0 3px 0 var(--gf-ink); } to { box-shadow: 0 3px 0 var(--gf-ink), 0 0 12px 3px rgb(255 212 90 / 70%); } }
+.gf-chip--hot.af-bump-once { animation: af-bump-once .4s cubic-bezier(.2,.9,.3,1.3), af-hot 1.6s ease-in-out infinite alternate; }
+
+/* Teaching help: the row count bumps as each row lights (af-bump-once), and
+   both expressions pulse once when the second count finishes. */
+.af-help-rows.af-bump-once { display: inline-block; }
+.af-help-both--done { animation: af-both-pulse .6s ease-out; }
+@keyframes af-both-pulse { 30% { transform: scale(1.08); box-shadow: 0 0 0 6px rgb(55 200 197 / 35%); } 100% { transform: none; } }
+.af-example-expr.af-bump-once { display: inline-block; }
+
+/* Confetti pieces are real sticker shapes and sway as they fall. */
+.af-confetti--star { border: 0; border-radius: 0; width: 18px; height: 18px; clip-path: polygon(50% 0, 62% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 38% 35%); }
+.af-confetti { animation-timing-function: ease-in; }
+@keyframes af-fall { 0% { transform: translateY(0) rotate(0) translateX(0); } 50% { transform: translateY(55vh) rotate(360deg) translateX(var(--af-sway, 0px)); } 100% { transform: translateY(110vh) rotate(720deg) translateX(0); opacity: .85; } }
+
+/* Start and End Screens: the card rises in; end stats stagger. */
+.gf-start-card { animation: af-card-rise .45s cubic-bezier(.2,.9,.3,1.2) both; }
+.gf-end-card.af-rise { animation: af-card-rise .45s cubic-bezier(.2,.9,.3,1.2) both; }
+@keyframes af-card-rise { 0% { opacity: 0; transform: translateY(28px) scale(.96); } 100% { opacity: 1; transform: none; } }
+.gf-end-card .gf-stat { animation: af-tile-in .4s cubic-bezier(.2,.9,.3,1.25) backwards; animation-delay: calc(200ms + var(--af-i, 0) * 90ms); }
+.gf-end-card .gf-stat:nth-child(2) { --af-i: 1; }
+.gf-end-card .gf-stat:nth-child(3) { --af-i: 2; }
+
+@media (prefers-reduced-motion: reduce) {
+  .af-array--peel .af-cell, .af-cell--shine, .af-album-item, .af-card, .gf-tiles .gf-tile, .gf-tile.gf-wrong, .gf-tile.gf-right, .gf-tile[data-found="true"] .gf-answer-content::before, .af-page, .af-page--flip, .af-page--land, .af-page--land .af-cell, .af-card--nudge .af-page, .af-card--nudge .af-cover, .af-array--tick .af-page, .af-equals, .af-cover, .af-cover--open, .af-cover-sticker, .gf-chip, .gf-chip--hot, .af-bump-once, .af-help-both--done, .af-slot--active, .af-slot--filled, .af-example-expr, .gf-screen .gf-card, .gf-end-card .gf-stat { animation: none !important; transition: none !important; }
+  .af-cover--open { opacity: 0; }
+}
+/* 90s style kit shared by every game. Bangers for shouting, Fredoka for
+   reading. Saturated gradients from Eric's palette, white cards, thick
+   outlines, chunky shadows, confetti. Games override the --mg-* tokens
+   through mount options (theme) rather than writing their own chrome. */
+
+:root {
+  --mg-bg-a: #667eea;
+  --mg-bg-b: #764ba2;
+  --mg-ink: #1a1a2e;
+  --mg-card: #ffffff;
+  --mg-accent: #ffd93d;
+  --mg-good: #2ed573;
+  --mg-warm: #E8A838;
+  --mg-sky: #6bcbff;
+  --mg-outline: 4px;
+  --mg-shadow: 0 6px 0 rgba(0, 0, 0, 0.25);
+  --mg-font-shout: 'Bangers', 'Impact', cursive;
+  --mg-font-read: 'Fredoka', 'Nunito', system-ui, sans-serif;
+  /* Header. The game name is capped at --mg-hud-title-max, a flat ceiling:
+     40px normal, 30px on compact widths. Bangers caps measure
+     --mg-title-cap-ratio of the font size, so the name stands about 30px
+     against the --mg-chip-box-height chip beside it. The name never
+     truncates: session.js measures the header space left after the chips and
+     shrinks the name to fit one line, down to --mg-hud-title-min, the shell's
+     15px kid-readable floor. A name that still does not fit at the floor
+     wraps to two lines inside the chip height instead of ellipsising. */
+  --mg-chip-box-height: 44px;
+  --mg-title-cap-ratio: 0.75;
+  --mg-hud-title-max: 40px;
+  --mg-hud-title-min: 15px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--mg-font-read);
+  color: #fff;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mg-root { position: relative; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.mg-root.cc-game { overflow: visible; }
+.mg-hidden { display: none !important; }
+
+/* start + end overlays */
+.mg-screen {
+  position: absolute; inset: 0; z-index: 20;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  background: linear-gradient(135deg, var(--mg-bg-a) 0%, var(--mg-bg-b) 100%);
+}
+.mg-card {
+  width: min(560px, 100%); max-height: calc(100% - 32px); overflow: auto;
+  background: var(--mg-card); color: var(--mg-ink);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 24px;
+  box-shadow: var(--mg-shadow); padding: 24px 22px; text-align: center;
+}
+.mg-emoji { font-size: 56px; line-height: 1; }
+.mg-title {
+  font-family: var(--mg-font-shout); font-size: clamp(34px, 8vw, 52px); letter-spacing: 2px;
+  color: var(--mg-ink); text-shadow: 3px 3px 0 var(--mg-accent); margin-top: 6px;
+}
+.mg-subtitle { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.mg-tag {
+  display: inline-block; margin-top: 8px; padding: 4px 10px;
+  border-radius: 999px; background: #f5f3ff; color: var(--mg-bg-b);
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+}
+.mg-example {
+  margin: 16px 0; padding: 14px; border-radius: 16px;
+  background: #f5f3ff; border: 3px dashed var(--mg-bg-a); font-size: 18px;
+}
+.mg-big-btn {
+  font-family: var(--mg-font-shout); font-size: 30px; letter-spacing: 2px;
+  color: var(--mg-ink); background: var(--mg-accent);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 999px;
+  padding: 14px 40px; min-height: 64px; cursor: pointer;
+  box-shadow: 0 6px 0 var(--mg-ink); transition: transform 0.08s, box-shadow 0.08s;
+}
+.mg-big-btn:active { transform: translateY(4px); box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* HUD */
+.mg-hud {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; font-family: var(--mg-font-shout); letter-spacing: 1px;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+}
+.cc-game .mg-hud,
+.cc-game .mg-progress,
+.cc-game .mg-stage { width: min(900px, calc(100% - 32px)); margin-left: auto; margin-right: auto; }
+.cc-game .mg-hud { padding-left: 0; padding-right: 0; }
+.cc-game .mg-progress { margin-top: 0; }
+/* The size resolves on this element: it starts at the ceiling, and session.js
+   writes the fitted size back into --mg-hud-title-size when the ceiling does
+   not fit the header on one line. */
+.mg-hud-title {
+  --mg-hud-title-size: var(--mg-hud-title-max);
+  font-size: var(--mg-hud-title-size);
+  /* overflow: hidden is the last-ditch guard, and it clips both axes, so the
+     line box has to hold the whole Bangers glyph box plus the header
+     text-shadow. line-height: 1 cut the caps at the top and the tails at the
+     bottom. */
+  line-height: 1.35; overflow: hidden; white-space: nowrap; min-width: 0;
+}
+/* At the floor a long name wraps to two lines rather than truncating. Two
+   lines at the 15px floor stand 36px, inside the 44px chip box. */
+.mg-hud-title[data-hud-title-lines="2"] {
+  white-space: normal; line-height: 1.2; overflow-wrap: break-word;
+}
+/* Compact widths take the ceiling down in proportion, 40px to 30px. */
+@media (max-width: 560px) {
+  :root { --mg-hud-title-max: 30px; }
+}
+/* Leave room for Bangers glyph overhang and the header shadow. */
+:is(.cc-game, .eb-game, .ct-game, .reb-game) .mg-hud-title { padding-inline: 0.15em; }
+.mg-chips { display: flex; gap: 8px; flex-shrink: 0; }
+.mg-chip {
+  background: var(--mg-card); color: var(--mg-ink); border: 3px solid var(--mg-ink);
+  border-radius: 999px; padding: 4px 12px; font-size: 18px; text-shadow: none;
+  box-shadow: 0 3px 0 var(--mg-ink);
+}
+.mg-chip-score { display: flex; align-items: center; justify-content: center; min-height: var(--mg-chip-box-height); line-height: 1; }
+.cc-game .mg-card { width: min(900px, 100%); }
+.mg-chip-streak.mg-hot { background: var(--mg-accent); animation: mg-pulse 0.8s infinite alternate; }
+.mg-progress { height: 10px; margin: 0 14px; background: rgba(0, 0, 0, 0.25); border-radius: 999px; overflow: hidden; }
+.mg-progress > i { display: block; height: 100%; width: 0; background: var(--mg-good); transition: width 0.3s; }
+
+/* play area */
+.mg-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px 14px 14px; gap: 10px; }
+.cc-game .mg-stage { flex: none; height: calc(100vh - 124px); min-height: 0; max-height: calc(100vh - 50px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); padding: clamp(6px, 1vh, 10px) 0 50px; gap: 0; overflow: hidden; }
+.mg-prompt {
+  background: var(--mg-card); color: var(--mg-ink); border: var(--mg-outline) solid var(--mg-ink);
+  border-radius: 20px; box-shadow: var(--mg-shadow); padding: 14px; text-align: center;
+  font-size: clamp(20px, 4vw, 28px); font-weight: 600;
+}
+.mg-visual { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.cc-game .mg-visual { flex: none; min-height: 0; align-items: flex-start; margin-top: var(--cc-prompt-tray-gap); margin-bottom: var(--cc-tray-answers-gap); }
+.mg-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.mg-tiles[data-count="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.mg-tile {
+  min-height: 72px; font-family: var(--mg-font-read); font-weight: 700; font-size: 24px;
+  color: var(--mg-ink); background: var(--mg-card);
+  border: var(--mg-outline) solid var(--mg-ink); border-radius: 18px;
+  box-shadow: 0 5px 0 var(--mg-ink); cursor: pointer; padding: 10px;
+  transition: transform 0.08s, box-shadow 0.08s, background 0.15s;
+}
+.mg-tile:active { transform: translateY(3px); box-shadow: 0 2px 0 var(--mg-ink); }
+.mg-tile[disabled] { cursor: default; }
+.mg-tile.mg-right { background: var(--mg-good); }
+.mg-tile.mg-wrong { background: var(--mg-warm); }
+.cc-game .mg-tiles { width: 100%; min-height: 0; gap: var(--cc-answer-gap); grid-auto-rows: minmax(clamp(64px, 15vh, 180px), 1fr); }
+.cc-game .mg-tile { min-height: 0; height: 100%; }
+
+/* feedback */
+.mg-fx { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 30; }
+.mg-toast {
+  position: absolute; left: 50%; top: 38%; transform: translate(-50%, -50%);
+  font-family: var(--mg-font-shout); font-size: clamp(36px, 9vw, 64px); letter-spacing: 3px;
+  color: #fff; text-shadow: 4px 4px 0 var(--mg-ink); animation: mg-toast 0.9s ease-out forwards;
+}
+.mg-toast-good { font-size: clamp(45px, 9vw, 84px); }
+.mg-toast-warm { color: var(--mg-warm); font-size: clamp(28px, 7vw, 44px); }
+.mg-toast-tier { color: var(--mg-accent); top: 30%; }
+.mg-confetti {
+  position: absolute; top: -12px; width: 10px; height: 14px; border-radius: 2px;
+  animation: mg-fall linear forwards;
+}
+.mg-fly { position: absolute; font-size: 28px; animation: mg-fly 0.9s ease-out forwards; }
+.mg-shake { animation: mg-shake 0.35s; }
+.mg-stats { display: flex; justify-content: center; gap: 14px; margin: 14px 0; flex-wrap: wrap; }
+.mg-stat { background: #f5f3ff; border: 3px solid var(--mg-ink); border-radius: 16px; padding: 10px 18px; min-width: 110px; }
+.mg-stat b { display: block; font-family: var(--mg-font-shout); font-size: 32px; letter-spacing: 1px; }
+.mg-hint { font-size: 14px; opacity: 0.7; margin-top: 10px; }
+
+@media (max-width: 560px) {
+  .cc-game .mg-tiles { gap: clamp(7px, 2vw, 12px); }
+  .cc-game .mg-tile { min-height: clamp(64px, 15vw, 88px); --cc-pad: 7px; }
+}
+
+@media (max-height: 850px) {
+  .cc-game .mg-tile { --cc-pad: clamp(7px, 1vh, 10px); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-toast-good { font-size: 45px; }
+}
+
+/* Standard Shell v1. Opt in with game.layout = 'standard'; legacy games keep
+   the base shell above. Games add the semantic classes below to their own
+   content without changing the shared stage DOM. */
+.mg-shell-standard {
+  --mg-standard-max-width: 920px;
+  --mg-standard-gutter: 16px;
+  --mg-standard-compact-gutter: 10px;
+  --mg-standard-answer-shadow-depth: 6px;
+  --mg-standard-answer-clearance: 60px;
+  --mg-standard-answer-min-height: 104.85px;
+  --mg-standard-answer-compact-min-height: 66.6px;
+  --mg-standard-answer-narrow-min-height: 57.15px;
+  --mg-standard-answer-landscape-height: 54px;
+  /* Expression row. Sizes come from the ML 1.04 original: the label is a
+     small line over a big value, and the value always leads. Games set
+     colours only, through the --mg-expression-slot-* properties below. */
+  --mg-expression-label-size: 32px;
+  --mg-expression-value-size: clamp(26px, 5vw, 38px);
+  --mg-expression-operator-size: 42px;
+  --mg-expression-slot-min-height: 92px;
+  --mg-expression-slot-padding: 6px 10px;
+  --mg-expression-gap: 8px;
+  --mg-expression-slot-radius: 12px;
+  --mg-expression-slot-border-width: 3px;
+  --mg-expression-slot-border-color: var(--mg-ink);
+  --mg-expression-slot-bg: transparent;
+  --mg-expression-slot-bg-filled: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-hud,
+.mg-shell-standard .mg-progress,
+.mg-shell-standard .mg-stage {
+  width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-gutter) * 2)));
+  margin-left: auto;
+  margin-right: auto;
+}
+.mg-shell-standard .mg-hud { padding: 10px 0; }
+.mg-shell-standard .mg-hud-title { font-size: var(--mg-hud-title-size); }
+.mg-shell-standard .mg-chip { font-size: 18px; }
+.mg-shell-standard .mg-progress { height: 10px; }
+.mg-shell-standard .mg-stage {
+  gap: 20px;
+  padding: 10px 0 calc(var(--mg-standard-answer-clearance) + var(--mg-standard-answer-shadow-depth) + env(safe-area-inset-bottom, 0px));
+}
+.mg-shell-standard .mg-prompt { font-size: 28px; }
+.mg-shell-standard .mg-visual { flex: 1 1 auto; }
+.mg-shell-standard .mg-problem-card {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+.mg-shell-standard .mg-problem-card .mg-expression-row { min-width: 0; }
+.mg-shell-standard .mg-tiles {
+  width: min(686px, 85%);
+  align-self: center;
+  gap: 10.8px;
+}
+.mg-shell-standard .mg-tile {
+  min-height: var(--mg-standard-answer-min-height);
+  font-size: clamp(24px, 4vw, 32px);
+  box-shadow: 0 var(--mg-standard-answer-shadow-depth) 0 var(--mg-ink);
+}
+.mg-shell-standard .mg-tile:active { box-shadow: 0 2px 0 var(--mg-ink); }
+
+/* Semantic content classes. Games own their content layout and add these
+   alongside local class names to receive the shared type floors. */
+/* No :where() here: the shell's type declarations must beat a game's local
+   class on specificity, so these carry the full .mg-shell-standard .mg-class
+   weight and win over a single game class. */
+.mg-shell-standard :is(.mg-problem-body, .mg-card-stem) {
+  font-size: 32px;
+  line-height: 1.3;
+}
+/* An instruction stem inside the problem card is story copy: `.mg-card-stem`
+   is typed identically to `.mg-problem-body` at every breakpoint, so a stem
+   reads at the story size in the card's own ink colour. */
+/* The same rule outside the Standard Shell, where the card is the prompt
+   itself: the stem takes the story's own size, weight and colour by
+   inheriting them, and drops to the shell's 15px story floor on compact
+   widths so two sentences still hold two lines on a phone. The Standard
+   Shell rules above and below outrank this on specificity, so they keep
+   their own sizes. */
+.mg-card-stem { font-size: inherit; font-weight: inherit; color: inherit; }
+@media (max-width: 560px) {
+  .mg-card-stem { font-size: 15px; }
+}
+/* Expression row: slots across the card, each a small label line over a big
+   value line, with the operator between. The unknown slot is dashed. The
+   value line reserves its height so the geometry never shifts. */
+.mg-shell-standard .mg-expression-row {
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--mg-expression-gap);
+}
+.mg-shell-standard .mg-expression-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  row-gap: 2px;
+  min-height: var(--mg-expression-slot-min-height);
+  padding: var(--mg-expression-slot-padding);
+  border: var(--mg-expression-slot-border-width) solid var(--mg-expression-slot-border-color);
+  border-radius: var(--mg-expression-slot-radius);
+  background: var(--mg-expression-slot-bg-filled);
+}
+.mg-shell-standard .mg-expression-slot--unknown {
+  border-style: dashed;
+  background: var(--mg-expression-slot-bg);
+}
+.mg-shell-standard .mg-expression-label {
+  max-width: 100%;
+  font-family: var(--mg-font-read);
+  font-size: var(--mg-expression-label-size);
+  font-weight: 700;
+  line-height: var(--mg-expression-label-line-height, 1.05);
+}
+.mg-shell-standard .mg-expression-value {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  flex-wrap: nowrap;
+  gap: 0.18em;
+  max-width: 100%;
+  min-height: 1.15em;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-value-size);
+  font-weight: 400;
+  line-height: var(--mg-expression-value-line-height, 1.15);
+}
+.mg-shell-standard .mg-expression-row--readable-numerals .mg-expression-value {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+}
+.mg-shell-standard .mg-expression-value .mg-expression-operator { font-size: 1em; }
+.mg-shell-standard .mg-expression-operator {
+  align-self: center;
+  font-family: var(--mg-font-shout);
+  font-size: var(--mg-expression-operator-size);
+  font-weight: 400;
+  line-height: 1.15;
+}
+.mg-shell-standard .mg-feedback-line,
+.mg-shell-standard .mg-help-copy,
+.mg-shell-standard .mg-toast-warm {
+  font-size: clamp(15px, 3vw, 28px);
+  line-height: 1.1;
+}
+.mg-shell-standard .mg-toast-good { line-height: 1.1; }
+.mg-shell-standard .mg-feedback-line {
+  font-family: var(--mg-font-read);
+  font-weight: 700;
+  min-height: 31px;
+  overflow: hidden;
+}
+.mg-shell-standard .mg-feedback-line:empty { visibility: hidden; }
+.mg-shell-standard .mg-help-panel { min-width: 0; }
+.mg-shell-standard .mg-kid-label:not(.mg-expression-label):not(.mg-expression-value):not(.mg-expression-operator),
+.mg-shell-standard .mg-stat {
+  font-size: max(15px, 1em);
+}
+.mg-shell-standard .mg-tag,
+.mg-shell-standard .mg-hint {
+  font-size: 15px;
+}
+
+/* Problem card interior + Expression row. Opt in with `mg-card-column` on the
+   problem card (and `mg-card-picture` on its picture child), paired with
+   `mg-expression-row` on equation rows. The shell owns every value below; a
+   game overrides nothing. 103 and 104 do not opt in, so these selectors never
+   match their DOM. Values track docs/game-guidelines.md. */
+.mg-shell-standard .mg-card-column {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 12px; /* floor, normal; space-evenly grows gaps equally above it */
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture {
+  max-height: 40vh; /* normal; keeps the picture from absorbing the slack */
+  min-height: 0;
+}
+.mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall {
+  max-height: 55vh;
+}
+/* Ceiling: on tall viewports the even share would exceed 32px, so stop
+   stretching, let the card size to its content, and centre it in the stage. */
+@media (min-height: 900px) {
+  .mg-shell-standard .mg-card-column {
+    flex: 0 1 auto;
+    height: auto;
+    margin-top: auto;
+    margin-bottom: auto;
+  }
+}
+
+@media (max-width: 560px) {
+  .mg-shell-standard .mg-hud,
+  .mg-shell-standard .mg-progress,
+  .mg-shell-standard .mg-stage {
+    width: min(var(--mg-standard-max-width), calc(100% - (var(--mg-standard-compact-gutter) * 2)));
+  }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-stage { gap: 14px; }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-compact-min-height); }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 18px; line-height: 1.3; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem).mg-problem-body--fit2 { font-size: 15px; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 18px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 68px;
+    --mg-expression-slot-padding: 4px 6px;
+    --mg-expression-gap: 6px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (max-width: 360px) and (max-height: 600px) {
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 26px;
+    --mg-expression-operator-size: 30px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 4px;
+    --mg-expression-gap: 4px;
+  }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-narrow-min-height); }
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .mg-shell-standard .mg-stage { gap: 14px; padding-top: 4px; }
+  .mg-shell-standard .mg-prompt { font-size: 20px; }
+  .mg-shell-standard .mg-tiles { flex: 0 0 var(--mg-standard-answer-landscape-height); }
+  .mg-shell-standard .mg-tiles[data-count="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mg-shell-standard .mg-tile { min-height: var(--mg-standard-answer-landscape-height); padding: 4px 10px; line-height: 1; }
+  .mg-card-stem { font-size: 15px; }
+  .mg-shell-standard :is(.mg-problem-body, .mg-card-stem) { font-size: 15px; line-height: 1.1; }
+  .mg-shell-standard {
+    --mg-expression-label-size: 15px;
+    --mg-expression-value-size: 31.5px;
+    --mg-expression-operator-size: 37.8px;
+    --mg-expression-slot-min-height: 52px;
+    --mg-expression-slot-padding: 2px 5px;
+    --mg-expression-gap: 4px;
+    --mg-expression-slot-radius: 10px;
+    --mg-expression-slot-border-width: 2px;
+  }
+  .mg-shell-standard .mg-feedback-line,
+  .mg-shell-standard .mg-help-copy,
+  .mg-shell-standard .mg-toast-warm { font-size: 15px; }
+  .mg-shell-standard .mg-card-column { gap: 8px; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture { max-height: 30vh; }
+  .mg-shell-standard .mg-card-column > .mg-card-picture.mg-card-picture--tall { max-height: 40vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mg-shell-standard :is(.mg-toast, .mg-fly, .mg-confetti, .mg-shake, .mg-chip-streak.mg-hot) {
+    animation: none !important;
+  }
+  .mg-shell-standard :is(.mg-big-btn, .mg-tile) { transition: none !important; }
+  .mg-shell-standard .mg-progress > i { transition: none !important; }
+}
+
+@keyframes mg-toast { 0% { opacity: 0; transform: translate(-50%, -30%) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%) scale(1); } }
+@keyframes mg-fall { to { transform: translateY(110vh) rotate(720deg); opacity: 0.8; } }
+@keyframes mg-fly { to { transform: translate(var(--dx), -140px) scale(1.4); opacity: 0; } }
+@keyframes mg-shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(8px); } 60% { transform: translateX(-6px); } 80% { transform: translateX(6px); } }
+@keyframes mg-pulse { to { transform: scale(1.08); } }
+/* Equal side columns keep the title centered across the complete header. */
+.game-home-header:is(.mg-hud, .gf-hud) {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  align-items: center; gap: 8px;
+}
+.game-home-header > :is(.mg-hud-title, .gf-hud-title) { text-align: center; min-width: 0; width: 100%; }
+.game-home-header > :is(.mg-chips, .gf-chips) { justify-self: end; }
+.game-home {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  box-sizing: border-box; width: 48px; min-height: 48px; flex-shrink: 0;
+  background: var(--mg-card, #fff5d6); color: var(--mg-ink, #142343);
+  border: 3px solid var(--mg-ink, #142343); border-radius: 14px;
+  box-shadow: 0 4px 0 var(--mg-ink, #142343); text-shadow: none; text-decoration: none;
+  font: 700 20px var(--mg-font-read, 'Fredoka', sans-serif);
+}
+.game-home svg { width: 25px; height: 25px; }
+.game-home:focus-visible { outline: 4px solid #ffd93d; outline-offset: 4px; }
+.game-home:active { transform: translateY(3px); box-shadow: 0 1px 0 var(--mg-ink, #142343); }
+.game-end-actions { display: flex; justify-content: center; align-items: stretch; gap: 12px; margin-top: 12px; }
+.game-end-actions > .game-home-labeled { width: auto; min-height: 64px; padding: 10px 20px; }
+.game-end-actions > :is(.mg-big-btn, .gf-big-btn) { margin: 0; }
+.game-home-header > .gf-hud-title { font-size: clamp(15px, 2.6vw, 40px); white-space: normal; overflow-wrap: anywhere; }
+.game-home-header > :is(.mg-chips, .gf-chips) { width: max-content; white-space: nowrap; }
+.gf-root .game-home, .gf-game .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }
+.game-home-header > .mg-hud-title { white-space: normal; overflow-wrap: anywhere; }
+.gf-hud .game-home, .gf-end-card .game-home { background: var(--gf-card, #fff5d6); color: var(--gf-ink, #142343); }</style>
+</head>
+<body>
+  <div id="game"></div>
+</body>
+</html>
